@@ -1076,6 +1076,8 @@ function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {[
                   { label: '后端核心', status: backendStatus === 'online', val: backendStatus },
+                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.1.0' },
+                  { label: '运行模式', status: true, val: systemCheck?.runtimeMode === 'packaged' ? '桌面安装版' : '源码模式' },
                   { label: 'ffmpeg', status: !!systemCheck?.ffmpegAvailable, val: systemCheck?.ffmpegAvailable ? '已启用' : '未检测到' },
                   { label: '本地数据库', status: !!systemCheck?.libraryDbAvailable, val: systemCheck?.libraryDbAvailable ? 'SQLite 已连接' : '未初始化' },
                   { label: '前端构建', status: !!systemCheck?.frontendBuilt, val: systemCheck?.frontendBuilt ? '生产模式' : '开发模式' },

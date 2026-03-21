@@ -1,6 +1,6 @@
 ﻿from io import BytesIO
-from pathlib import Path
 from typing import Optional
+from pathlib import Path
 from urllib.parse import quote
 import platform
 import shutil
@@ -23,14 +23,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
-FRONTEND_INDEX = FRONTEND_DIST / "index.html"
-LOCAL_FFMPEG_BINARY = BASE_DIR / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
-LIBRARY_DB = DATA_DIR / "nas_local.db"
+from app_meta import APP_BRAND_NAME, APP_VERSION, BACKEND_HOST, BACKEND_PORT, UPDATE_CHANNEL
+from app_paths import (
+    DATA_DIR,
+    FRONTEND_DIST,
+    FRONTEND_INDEX,
+    IS_FROZEN,
+    LIBRARY_DB,
+    LOCAL_FFMPEG_BINARY,
+    ensure_runtime_directories,
+)
 
-app = FastAPI(title="NAS Local", description="NAS local music visualize and stream API")
+app = FastAPI(title=APP_BRAND_NAME, description=f"{APP_BRAND_NAME} local music visualize and stream API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -150,7 +154,7 @@ def utc_now_iso() -> str:
 
 
 def get_db_connection() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_runtime_directories()
     connection = sqlite3.connect(LIBRARY_DB)
     connection.row_factory = sqlite3.Row
     return connection
@@ -396,6 +400,10 @@ def get_system_check() -> dict:
         issues.append("未检测到 Node.js，当前无法构建前端页面。")
 
     return {
+        "appVersion": APP_VERSION,
+        "runtimeMode": "packaged" if IS_FROZEN else "source",
+        "packaged": IS_FROZEN,
+        "updateChannel": UPDATE_CHANNEL,
         "pythonVersion": sys.version.split()[0],
         "platform": platform.platform(),
         "ytDlpVersion": yt_dlp.version.__version__,
@@ -406,6 +414,7 @@ def get_system_check() -> dict:
         "frontendBuilt": frontend_built,
         "frontendDist": str(FRONTEND_DIST),
         "devFrontendRunning": dev_frontend_running,
+        "dataDir": str(DATA_DIR),
         "libraryDb": str(LIBRARY_DB),
         "libraryDbAvailable": LIBRARY_DB.is_file(),
         "libraryStats": library_stats,
@@ -459,6 +468,7 @@ def format_duration(seconds: Optional[int]) -> Optional[str]:
 
 def safe_download_filename(filename: str) -> str:
     cleaned = (filename or "music.m4a").replace('"', "").replace("/", "").replace("\\", "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned or "music.m4a"
 
 
@@ -528,9 +538,9 @@ def audio_format_score(fmt: dict) -> int:
         score += 40
 
     if ext == "m4a":
-        score += 240
+        score += 280
     elif ext == "webm":
-        score += 210
+        score += 190
     elif ext == "mp4":
         score += 150
     elif ext == "mp3":
@@ -1601,6 +1611,11 @@ async def serve_frontend_resource(resource_path: str):
     return HTMLResponse(setup_page(), status_code=503)
 
 
+def run_backend_server() -> None:
+    ensure_runtime_directories()
+    uvicorn.run(app, host=BACKEND_HOST, port=BACKEND_PORT, reload=False)
+
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8010, reload=False)
+    run_backend_server()
 

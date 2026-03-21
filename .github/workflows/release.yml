@@ -1,0 +1,72 @@
+name: Release Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          $version = python -c "from app_meta import APP_VERSION; print(APP_VERSION)"
+          Add-Content -Path $env:GITHUB_ENV -Value "APP_VERSION=$version"
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Git tag $env:GITHUB_REF_NAME does not match APP_VERSION v$version."
+          }
+
+      - name: Build desktop bundle
+        shell: pwsh
+        run: ./scripts/build-desktop.ps1
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: ./scripts/build-installer.ps1 -SkipDesktopBuild
+
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
+          Compress-Archive -Path dist/NASMusicBox/* -DestinationPath dist/release/NASMusicBox-portable-v${env:APP_VERSION}.zip -Force
+
+      - name: Upload workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NASMusicBox-release-v${{ env.APP_VERSION }}
+          path: dist/release/*
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/release/NASMusicBox-Setup-${{ env.APP_VERSION }}.exe
+            dist/release/NASMusicBox-portable-v${{ env.APP_VERSION }}.zip

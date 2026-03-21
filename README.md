@@ -1,131 +1,125 @@
 # NAS音乐器
 
-本仓库是 NAS音乐器 的本地版，和线上版本完全隔离，目标是把它打造成稳定可用的个人桌面音乐终端。
+NAS音乐器是一个面向个人使用的本地音乐播放器与下载器，提供搜索、播放、歌词、收藏、桌面壳、迷你播放器和本地资料库能力。
 
-## 启动方式
+## 本地启动
 
-### 桌面模式（推荐）
+推荐使用桌面模式：
 
-在仓库根目录双击：
-
-```bash
+```powershell
 start-desktop.bat
 ```
 
-它会：
+如果希望直接以沉浸式全屏进入桌面端：
 
-1. 检查并按需构建前端。
-2. 拉起本地后端或复用已经健康的 NAS 后端。
-3. 打开 NAS 桌面壳，提供托盘、迷你播放器、全局快捷键和开机自启开关。
+```powershell
+start-desktop.bat --fullscreen
+```
 
-### 浏览器模式（备用）
+浏览器备用模式：
 
-如果你更想继续用浏览器访问：
-
-```bash
+```powershell
 start-local.bat
 ```
 
-这会转到浏览器模式并打开 `http://localhost:8010`。
+## 开发依赖
 
-## 常用参数
+后端：
 
-```bash
-start-desktop.bat --rebuild
-start-desktop.bat --kill-port
-start-desktop.bat --browser
-```
-
-- `--rebuild`：强制重新构建前端。
-- `--kill-port`：清理占用 `8010` 端口的进程后再启动。
-- `--browser`：不打开桌面壳，直接用浏览器模式启动。
-
-## 首次安装
-
-### Backend
-
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
-### Frontend
+前端：
 
-```bash
+```powershell
 cd frontend
 npm install
 ```
 
-## 桌面能力
+开发测试与打包工具：
 
-桌面壳默认包含：
-
-- 系统托盘菜单
-- 迷你播放器窗口
-- 全局快捷键
-- 开机自启开关
-
-默认快捷键：
-
-- `Ctrl + Alt + Space`：播放 / 暂停
-- `Ctrl + Alt + Left`：上一首
-- `Ctrl + Alt + Right`：下一首
-- `Ctrl + Alt + Up`：音量增加
-- `Ctrl + Alt + Down`：音量减小
-- `Ctrl + Alt + M`：显示或隐藏迷你播放器
-
-开机自启可在托盘菜单里的 `Launch at Login` 切换。
-
-## 手动启动
-
-只启动后端：
-
-```bash
-python main.py
+```powershell
+pip install -r requirements-dev.txt
 ```
 
-然后访问：
+## 核心能力
 
-```bash
-http://localhost:8010
+- YouTube 搜索容错与排序增强
+- 本地 SQLite 收藏、历史、搜索、下载记录
+- 多源歌词与歌词偏移持久化
+- 桌面托盘、迷你播放器、全局快捷键、开机启动
+- GitHub Release 自动更新检查
+- 沉浸式全屏模式，可通过托盘菜单或 `Ctrl + Alt + Enter` 切换
+
+## 桌面打包
+
+先生成图标并构建桌面包：
+
+```powershell
+.\scripts\build-desktop.ps1
 ```
 
-只启动桌面壳：
+输出目录：
 
-```bash
-python desktop_app.py
+```text
+dist\NASMusicBox
 ```
 
-## API
+如果只想刷新图标资源：
 
-- `GET /health`
-- `GET /system-check`
-- `POST /search`
-- `POST /visualize`
-- `GET /proxy-stream?url=...`
-- `GET /library`
-- `GET /lyrics`
-- `GET /lyrics-offset`
-
-## 常见问题
-
-### 页面提示前端未构建
-
-运行：
-
-```bash
-start-desktop.bat --rebuild
+```powershell
+python scripts\generate_app_assets.py
 ```
 
-### 端口 8010 被占用
+## Windows 安装包
 
-运行：
+需要先安装 Inno Setup 6。
 
-```bash
-start-desktop.bat --kill-port
+```powershell
+.\scripts\build-installer.ps1
 ```
 
-### 播放失败或中断
+输出目录：
 
-- 先暂停再播放一次。
-- 换一个搜索结果重试。
-- 确认 `tools/ffmpeg/bin/ffmpeg.exe` 存在，或者系统 PATH 已包含 ffmpeg。
+```text
+dist\release
+```
+
+## GitHub Actions
+
+项目内置了两条工作流：
+
+- `CI`：运行 Python 编译检查、`pytest`、前端构建、桌面打包冒烟
+- `Release Desktop`：在 `v*` tag 或手动触发时构建便携版 zip 和安装包 exe
+
+发布建议流程：
+
+1. 更新 `app_meta.py` 和 `frontend/package.json` 中的版本号
+2. 提交代码并推送
+3. 创建形如 `v1.1.0` 的 Git tag
+4. GitHub Actions 自动生成 Release 产物
+
+## 声明
+
+本项目公开仅供学习交流与个人技术研究使用。
+
+项目中的搜索、播放、歌词与下载相关代码，仅用于演示桌面应用、前后端协作、媒体处理与本地资料库管理等技术方案。我们不对任何人滥用本项目代码进行牟利、批量爬取、侵犯版权、绕过平台规则，或从事其他非法活动承担任何责任。
+
+使用者应自行遵守所在地区的法律法规、平台服务条款以及相关版权要求。
+
+## 测试
+
+```powershell
+python -m pytest
+```
+
+## 目录说明
+
+- `main.py`：FastAPI 后端
+- `desktop_app.py`：桌面壳入口，支持 `--backend`
+- `app_meta.py`：版本、品牌、仓库与端口元数据
+- `app_paths.py`：开发态与打包态共享路径
+- `desktop_updater.py`：GitHub Release 检查与下载
+- `packaging/`：PyInstaller 与 Inno Setup 配置
+- `tests/`：核心后端与更新逻辑测试

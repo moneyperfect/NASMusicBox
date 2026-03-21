@@ -2,20 +2,33 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import ctypes
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
-import ctypes
+import webbrowser
 from pathlib import Path
 from typing import Optional
 
 import requests
 import webview
-from PIL import Image, ImageDraw
 from pystray import Icon, Menu, MenuItem
+
+from app_meta import APP_BRAND_NAME, APP_ID, APP_VERSION, BACKEND_URL, GITHUB_RELEASES_URL
+from app_paths import (
+    DESKTOP_ENTRYPOINT,
+    ICON_CACHE_DIR,
+    IS_FROZEN,
+    LOCAL_FFMPEG_BINARY,
+    UPDATE_CACHE_DIR,
+    WEBVIEW_STORAGE_DIR,
+    ensure_runtime_directories,
+)
+from desktop_assets import create_app_icon_image, write_icon_assets
+from desktop_updater import ReleaseInfo, download_release_asset, fetch_latest_release, is_newer_version
 
 try:
     import keyboard
@@ -28,17 +41,13 @@ except Exception:  # pragma: no cover - non-Windows fallback
     winreg = None
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-ICON_DIR = DATA_DIR / "desktop-assets"
-BACKEND_URL = "http://127.0.0.1:8010"
 HEALTH_URL = f"{BACKEND_URL}/health"
-STARTUP_VALUE_NAME = "NASLocalDesktop"
-DESKTOP_ENTRYPOINT = BASE_DIR / "desktop_app.py"
+STARTUP_VALUE_NAME = f"{APP_ID}Desktop"
 
 
 class DesktopApp:
-    def __init__(self) -> None:
+    def __init__(self, *, start_fullscreen: bool = False) -> None:
+        ensure_runtime_directories()
         self.backend_process: Optional[subprocess.Popen] = None
         self.owns_backend_process = False
         self.main_window = None
@@ -47,65 +56,25 @@ class DesktopApp:
         self.hotkeys_registered = False
         self.quitting = False
         self.lock = threading.RLock()
-        self.icon_image = self.create_icon_image()
-        self.icon_png_path, self.icon_ico_path = self.write_icon_assets()
+        self.update_lock = threading.RLock()
+        self.icon_image = create_app_icon_image()
+        self.icon_png_path, self.icon_ico_path = write_icon_assets(ICON_CACHE_DIR)
+        self.available_release: ReleaseInfo | None = None
+        self.update_error = ""
+        self.update_check_in_progress = False
+        self.update_download_in_progress = False
+        self.start_fullscreen = start_fullscreen
 
     @property
     def storage_path(self) -> str:
-        path = DATA_DIR / "webview-storage"
-        path.mkdir(parents=True, exist_ok=True)
-        return str(path)
-
-    def create_icon_image(self, size: int = 256) -> Image.Image:
-        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image, "RGBA")
-        padding = max(12, size // 18)
-        radius = size // 4
-
-        draw.rounded_rectangle(
-            (padding, padding, size - padding, size - padding),
-            radius=radius,
-            fill=(7, 14, 26, 255),
-            outline=(101, 193, 255, 130),
-            width=max(3, size // 64),
-        )
-
-        glow_box = (size * 0.54, size * 0.08, size * 0.90, size * 0.44)
-        draw.ellipse(glow_box, fill=(69, 220, 177, 175))
-        draw.ellipse((size * 0.62, size * 0.16, size * 0.82, size * 0.36), fill=(255, 255, 255, 52))
-
-        disc_box = (size * 0.12, size * 0.34, size * 0.78, size * 1.00)
-        draw.ellipse(disc_box, fill=(13, 29, 52, 255), outline=(116, 204, 255, 145), width=max(3, size // 64))
-        draw.ellipse((size * 0.23, size * 0.45, size * 0.67, size * 0.89), outline=(84, 167, 236, 110), width=max(3, size // 72))
-        draw.ellipse((size * 0.34, size * 0.56, size * 0.56, size * 0.78), fill=(9, 18, 32, 255), outline=(191, 236, 255, 110), width=max(2, size // 96))
-
-        bar_width = max(10, size // 20)
-        bars = [
-            (size * 0.58, size * 0.50, size * 0.58 + bar_width, size * 0.75),
-            (size * 0.67, size * 0.42, size * 0.67 + bar_width, size * 0.79),
-            (size * 0.76, size * 0.55, size * 0.76 + bar_width, size * 0.73),
-        ]
-        bar_colors = [(255, 255, 255, 235), (96, 211, 255, 240), (69, 220, 177, 240)]
-        for box, color in zip(bars, bar_colors):
-            draw.rounded_rectangle(box, radius=bar_width // 2, fill=color)
-
-        draw.ellipse((size * 0.21, size * 0.43, size * 0.31, size * 0.53), fill=(255, 255, 255, 230))
-        return image
-
-    def write_icon_assets(self) -> tuple[str, str]:
-        ICON_DIR.mkdir(parents=True, exist_ok=True)
-        png_path = ICON_DIR / "nas-app-icon.png"
-        ico_path = ICON_DIR / "nas-app-icon.ico"
-        self.icon_image.save(png_path, format="PNG")
-        self.icon_image.save(
-            ico_path,
-            format="ICO",
-            sizes=[(256, 256), (128, 128), (96, 96), (64, 64), (48, 48), (32, 32), (16, 16)],
-        )
-        return str(png_path), str(ico_path)
+        WEBVIEW_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        return str(WEBVIEW_STORAGE_DIR)
 
     def build_startup_command(self) -> str:
-        python_exe = Path(sys.executable)
+        if IS_FROZEN:
+            return f'"{Path(sys.executable).resolve()}"'
+
+        python_exe = Path(sys.executable).resolve()
         pythonw_exe = python_exe.with_name("pythonw.exe")
         launcher = pythonw_exe if pythonw_exe.exists() else python_exe
         return f'"{launcher}" "{DESKTOP_ENTRYPOINT}"'
@@ -121,7 +90,7 @@ class DesktopApp:
         if os.name != "nt":
             return
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NAS.Local.Desktop")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"{APP_ID}.Desktop")
         except Exception:
             pass
 
@@ -176,14 +145,19 @@ class DesktopApp:
             return
 
         env = os.environ.copy()
-        ffmpeg_dir = BASE_DIR / "tools" / "ffmpeg" / "bin"
-        if ffmpeg_dir.exists():
+        if LOCAL_FFMPEG_BINARY.exists():
+            ffmpeg_dir = LOCAL_FFMPEG_BINARY.parent
             env["PATH"] = f"{ffmpeg_dir}{os.pathsep}{env.get('PATH', '')}"
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if IS_FROZEN:
+            command = [str(Path(sys.executable).resolve()), "--backend"]
+        else:
+            command = [str(Path(sys.executable).resolve()), str(DESKTOP_ENTRYPOINT), "--backend"]
+
         self.backend_process = subprocess.Popen(
-            [sys.executable, "main.py"],
-            cwd=str(BASE_DIR),
+            command,
+            cwd=str(DESKTOP_ENTRYPOINT.parent),
             env=env,
             creationflags=creationflags,
             stdin=subprocess.DEVNULL,
@@ -191,7 +165,7 @@ class DesktopApp:
         self.owns_backend_process = True
 
         deadline = time.time() + 25
-        last_error = None
+        last_error: Exception | None = None
         while time.time() < deadline:
             if self.backend_process.poll() is not None:
                 raise RuntimeError("Backend process exited before it became healthy.")
@@ -236,6 +210,7 @@ class DesktopApp:
             keyboard.add_hotkey("ctrl+alt+up", lambda: self.dispatch_shell_action("volume-up"))
             keyboard.add_hotkey("ctrl+alt+down", lambda: self.dispatch_shell_action("volume-down"))
             keyboard.add_hotkey("ctrl+alt+m", lambda: self.toggle_mini_window())
+            keyboard.add_hotkey("ctrl+alt+enter", lambda: self.toggle_main_fullscreen())
             self.hotkeys_registered = True
         except Exception:
             self.hotkeys_registered = False
@@ -281,12 +256,29 @@ class DesktopApp:
         except Exception:
             pass
 
+    def main_window_is_fullscreen(self) -> bool:
+        if not self.main_window:
+            return False
+        try:
+            return self.main_window.state == "fullscreen"
+        except Exception:
+            return False
+
+    def toggle_main_fullscreen(self, *_args) -> None:
+        if not self.main_window:
+            return
+        try:
+            self.main_window.toggle_fullscreen()
+        except Exception:
+            return
+        self.refresh_tray_menu()
+
     def create_mini_window(self) -> None:
         if self.mini_window is not None:
             return
 
         self.mini_window = webview.create_window(
-            "NAS Mini Player",
+            f"{APP_BRAND_NAME} Mini Player",
             f"{BACKEND_URL}/?mini=1",
             width=420,
             height=220,
@@ -343,10 +335,104 @@ class DesktopApp:
         else:
             self.show_mini_window()
 
+    def update_status_label(self, _item=None) -> str:
+        if self.update_download_in_progress:
+            return "Updates: downloading..."
+        if self.update_check_in_progress:
+            return "Updates: checking..."
+        if self.update_error:
+            return "Updates: check failed"
+        if self.available_release and is_newer_version(self.available_release.version, APP_VERSION):
+            return f"Update ready: v{self.available_release.version}"
+        return f"Updates: current v{APP_VERSION}"
+
+    def download_update_label(self, _item=None) -> str:
+        if self.update_download_in_progress:
+            return "Downloading update..."
+        asset = self.available_release.preferred_asset if self.available_release else None
+        if asset:
+            return f"Download {asset.name}"
+        return "Download Latest Installer"
+
+    def trigger_update_check(self, *_args, background: bool = False) -> None:
+        with self.update_lock:
+            if self.update_check_in_progress:
+                return
+            self.update_check_in_progress = True
+            self.update_error = ""
+        self.refresh_tray_menu()
+
+        worker = threading.Thread(
+            target=self._check_for_updates_worker,
+            name="nas-update-check",
+            kwargs={"background": background},
+            daemon=True,
+        )
+        worker.start()
+
+    def _check_for_updates_worker(self, *, background: bool = False) -> None:
+        try:
+            release = fetch_latest_release()
+            if release and is_newer_version(release.version, APP_VERSION):
+                self.available_release = release
+            else:
+                self.available_release = None
+        except Exception as exc:
+            self.available_release = None
+            self.update_error = str(exc)
+            if not background:
+                print(f"[WARN] Update check failed: {exc}")
+        finally:
+            with self.update_lock:
+                self.update_check_in_progress = False
+            self.refresh_tray_menu()
+
+    def open_releases_page(self, *_args) -> None:
+        release_url = self.available_release.html_url if self.available_release else GITHUB_RELEASES_URL
+        webbrowser.open(release_url)
+
+    def download_latest_update(self, *_args) -> None:
+        if not self.available_release:
+            self.open_releases_page()
+            return
+
+        asset = self.available_release.preferred_asset
+        if not asset or self.update_download_in_progress:
+            self.open_releases_page()
+            return
+
+        self.update_download_in_progress = True
+        self.refresh_tray_menu()
+        worker = threading.Thread(target=self._download_update_worker, name="nas-update-download", daemon=True)
+        worker.start()
+
+    def _download_update_worker(self) -> None:
+        try:
+            if not self.available_release or not self.available_release.preferred_asset:
+                return
+
+            asset = self.available_release.preferred_asset
+            downloaded_path = download_release_asset(asset, UPDATE_CACHE_DIR)
+            if os.name == "nt":
+                os.startfile(downloaded_path)  # type: ignore[attr-defined]
+            else:  # pragma: no cover - desktop shell targets Windows first
+                webbrowser.open(downloaded_path.as_uri())
+        except Exception as exc:
+            self.update_error = str(exc)
+            print(f"[WARN] Update download failed: {exc}")
+        finally:
+            self.update_download_in_progress = False
+            self.refresh_tray_menu()
+
     def create_tray_menu(self) -> Menu:
         return Menu(
             MenuItem("Show NAS", lambda icon, item: self.show_main_window(), default=True),
             MenuItem("Hide NAS", lambda icon, item: self.hide_main_window()),
+            MenuItem(
+                "Immersive Fullscreen",
+                lambda icon, item: self.toggle_main_fullscreen(),
+                checked=lambda item: self.main_window_is_fullscreen(),
+            ),
             MenuItem(
                 "Mini Player",
                 lambda icon, item: self.toggle_mini_window(),
@@ -356,6 +442,14 @@ class DesktopApp:
             MenuItem("Previous", lambda icon, item: self.dispatch_shell_action("previous")),
             MenuItem("Next", lambda icon, item: self.dispatch_shell_action("next")),
             MenuItem("Toggle Vibe", lambda icon, item: self.dispatch_shell_action("toggle-vibe")),
+            MenuItem(self.update_status_label, lambda icon, item: None, enabled=False),
+            MenuItem("Check for Updates", lambda icon, item: self.trigger_update_check()),
+            MenuItem(
+                self.download_update_label,
+                lambda icon, item: self.download_latest_update(),
+                enabled=lambda item: self.available_release is not None and not self.update_download_in_progress,
+            ),
+            MenuItem("Open Releases Page", lambda icon, item: self.open_releases_page()),
             MenuItem(
                 "Launch at Login",
                 lambda icon, item: self.toggle_startup(),
@@ -369,9 +463,9 @@ class DesktopApp:
             return
 
         self.tray_icon = Icon(
-            "nas_local",
+            APP_ID,
             self.icon_image.resize((64, 64)),
-            "NAS Local",
+            APP_BRAND_NAME,
             self.create_tray_menu(),
         )
         self.tray_icon.run_detached()
@@ -408,6 +502,7 @@ class DesktopApp:
     def on_webview_ready(self) -> None:
         self.start_tray()
         self.register_hotkeys()
+        self.trigger_update_check(background=True)
 
     def run(self) -> None:
         self.set_windows_app_id()
@@ -415,11 +510,12 @@ class DesktopApp:
         atexit.register(self.stop_backend)
 
         self.main_window = webview.create_window(
-            "NAS Local",
+            APP_BRAND_NAME,
             f"{BACKEND_URL}/",
             width=1440,
             height=900,
             min_size=(1100, 720),
+            fullscreen=self.start_fullscreen,
             background_color="#08111d",
         )
         self.main_window.events.closed += lambda *_args: self.on_main_window_closed()
@@ -432,11 +528,22 @@ class DesktopApp:
         )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Launch NAS Local desktop shell")
-    parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=f"Launch {APP_BRAND_NAME} desktop shell")
+    parser.add_argument("--backend", action="store_true", help="Run the bundled FastAPI backend only")
+    parser.add_argument("--fullscreen", action="store_true", help="Launch the desktop shell in immersive fullscreen")
+    return parser.parse_args()
 
-    app = DesktopApp()
+
+def main() -> int:
+    args = parse_args()
+    if args.backend:
+        from main import run_backend_server
+
+        run_backend_server()
+        return 0
+
+    app = DesktopApp(start_fullscreen=args.fullscreen)
     try:
         app.run()
         return 0

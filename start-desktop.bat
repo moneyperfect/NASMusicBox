@@ -12,11 +12,13 @@ if exist ".venv\Scripts\python.exe" (
 set "NEED_BUILD=0"
 set "KILL_PORT=0"
 set "BROWSER_MODE=0"
+set "FULLSCREEN_MODE=0"
 
 for %%A in (%*) do (
   if /I "%%~A"=="--rebuild" set "NEED_BUILD=1"
   if /I "%%~A"=="--kill-port" set "KILL_PORT=1"
   if /I "%%~A"=="--browser" set "BROWSER_MODE=1"
+  if /I "%%~A"=="--fullscreen" set "FULLSCREEN_MODE=1"
 )
 
 if not exist "frontend\dist\index.html" set "NEED_BUILD=1"
@@ -92,7 +94,11 @@ if "%BROWSER_MODE%"=="1" (
 )
 
 echo [INFO] Launching NAS desktop shell...
-"%PYTHON_EXE%" desktop_app.py
+if "%FULLSCREEN_MODE%"=="1" (
+  "%PYTHON_EXE%" desktop_app.py --fullscreen
+) else (
+  "%PYTHON_EXE%" desktop_app.py
+)
 exit /b %errorlevel%
 
 :check_port_state

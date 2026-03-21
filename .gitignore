@@ -25,9 +25,12 @@ mcs_server_manager/
 *.zip
 *.resolved
 *.bak
+build/
 data/nas_local.db
 data/webview-storage/
 data/desktop-assets/
+assets/app-icon.ico
+assets/app-icon.png
 frontend/build_output.log
 frontend/build_raw.txt
 frontend/debug_build.js
