@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env
+.env.local
+frontend/.env
+frontend/.env.local
+tools/ffmpeg/
+tools/ffmpeg.zip
+
+# Node.js
+node_modules/
+dist/
+.DS_Store
+
+# User specific - Data & Temp
+downloads/
+mcs_server_manager/
+*.mp3
+*.mp4
+*.log
+*.zip
+*.resolved
+*.bak
+data/nas_local.db
+data/webview-storage/
+data/desktop-assets/
+frontend/build_output.log
+frontend/build_raw.txt
+frontend/debug_build.js
+frontend/dist_build_error.log
+frontend/full_error.txt
+frontend/eslint.json
+frontend/eslint_out.json
+test_lyrics.py
+
+# Old & Helper Scripts (Exclude from Repo)
+qishui_music_downloader.py
+qishui_auto_downloader.py
+try_full_version.py
+analyze_html.py
+check_duration.py
+二版.txt
+
+# IDE
+.vscode/
+.idea/
