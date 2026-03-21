@@ -26,6 +26,12 @@ import {
   ExternalLink,
   ChevronRight,
   Download,
+  RefreshCw,
+  Clock3,
+  CheckCircle2,
+  AlertTriangle,
+  Trash2,
+  FolderDown,
 } from 'lucide-react';
 
 import VibeOverlay from './components/VibeOverlay';
@@ -33,6 +39,8 @@ import VibeOverlay from './components/VibeOverlay';
 const HISTORY_STORAGE_KEY = 'nsrl_local_history_v2';
 const FAVORITES_STORAGE_KEY = 'nsrl_local_favorites_v2';
 const LIBRARY_MIGRATION_KEY = 'nas_library_db_migrated_v1';
+const DOWNLOAD_HISTORY_STORAGE_KEY = 'nas_recent_downloads_v1';
+const DOWNLOAD_CENTER_STORAGE_KEY = 'nas_download_center_v1';
 
 const NAV_ITEMS = [
   { id: 'search', label: '搜索', icon: Search },
@@ -49,6 +57,7 @@ const LIBRARY_ITEMS = [
 ];
 
 const PLAYLIST_ITEMS = [
+  { id: 'downloads', label: '下载中心', icon: FolderDown },
   { id: 'system', label: '系统检测', icon: ShieldCheck },
 ];
 
@@ -154,6 +163,75 @@ const formatTime = (seconds) => {
 
 const makeQuery = (song, artist) => [song?.trim(), artist?.trim()].filter(Boolean).join(' ').trim();
 const trackKey = (videoId, title, artist) => videoId ? `vid:${videoId}` : `${(title || '').trim().toLowerCase()}::${(artist || '').trim().toLowerCase()}`;
+const downloadTaskId = () => `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+const formatBytes = (bytes) => {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  return `${(value / 1024 ** 3).toFixed(1)} GB`;
+};
+
+const formatRelativeTime = (timestamp) => {
+  if (!timestamp) return '刚刚';
+  const target = new Date(timestamp).getTime();
+  if (!Number.isFinite(target)) return '刚刚';
+  const diff = Date.now() - target;
+  const minutes = Math.max(0, Math.floor(diff / 60000));
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  return `${days} 天前`;
+};
+
+const normalizeDownloadHistoryItem = (item) => ({
+  key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+  title: item?.title || '',
+  artist: item?.artist || '',
+  filename: item?.filename || '',
+  sourceUrl: item?.sourceUrl || '',
+  downloadedAt: item?.downloadedAt || new Date().toISOString(),
+});
+
+const mergeDownloadHistory = (primary, secondary, limit = 30) => {
+  const merged = new Map();
+  [...primary, ...secondary].forEach((rawItem) => {
+    const item = normalizeDownloadHistoryItem(rawItem);
+    const dedupeKey = `${item.filename}::${item.sourceUrl}::${item.downloadedAt}`;
+    if (!merged.has(dedupeKey)) {
+      merged.set(dedupeKey, item);
+    }
+  });
+  return Array.from(merged.values())
+    .sort((a, b) => (b.downloadedAt || '').localeCompare(a.downloadedAt || ''))
+    .slice(0, limit);
+};
+
+const normalizeDownloadTask = (item) => ({
+  id: item?.id || downloadTaskId(),
+  key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+  title: item?.title || '',
+  artist: item?.artist || '',
+  cover: item?.cover || '',
+  query: item?.query || makeQuery(item?.title, item?.artist),
+  videoId: item?.videoId || null,
+  audioSrc: item?.audioSrc || '',
+  audioExt: item?.audioExt || 'm4a',
+  filename: item?.filename || '',
+  status: item?.status || 'queued',
+  progress: Number.isFinite(Number(item?.progress)) ? Number(item.progress) : 0,
+  bytesReceived: Number(item?.bytesReceived || 0),
+  totalBytes: Number(item?.totalBytes || 0),
+  createdAt: item?.createdAt || new Date().toISOString(),
+  startedAt: item?.startedAt || null,
+  completedAt: item?.completedAt || null,
+  error: item?.error || '',
+  sourceUrl: item?.sourceUrl || '',
+});
 
 const buildLibraryRecord = (item, timestampField) => {
   const key = item?.key || trackKey(item?.videoId, item?.title, item?.artist);
@@ -211,6 +289,18 @@ function App() {
 
   const [historyItems, setHistoryItems] = useState(() => readStorage(HISTORY_STORAGE_KEY, []).map(toHistoryRecord));
   const [favorites, setFavorites] = useState(() => readStorage(FAVORITES_STORAGE_KEY, []).map(toFavoriteRecord));
+  const [downloadHistory, setDownloadHistory] = useState(() => readStorage(DOWNLOAD_HISTORY_STORAGE_KEY, []).map(normalizeDownloadHistoryItem));
+  const [downloadTasks, setDownloadTasks] = useState(() => readStorage(DOWNLOAD_CENTER_STORAGE_KEY, []).map((item) => {
+    const task = normalizeDownloadTask(item);
+    if (task.status === 'downloading' || task.status === 'resolving') {
+      return {
+        ...task,
+        status: 'failed',
+        error: '应用已重新打开，请重试下载',
+      };
+    }
+    return task;
+  }));
 
   const [vibeModeEnabled, setVibeModeEnabled] = useState(false);
 
@@ -236,6 +326,8 @@ function App() {
   const lastHandledActionIdRef = useRef('');
   const libraryMigrationRef = useRef(readBooleanStorage(LIBRARY_MIGRATION_KEY));
   const librarySyncInFlightRef = useRef(false);
+  const downloadRunnerRef = useRef(false);
+  const downloadAbortControllersRef = useRef(new Map());
   const [isPlaying, setIsPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
@@ -292,18 +384,22 @@ function App() {
 
     const localFavorites = readStorage(FAVORITES_STORAGE_KEY, []).map(toFavoriteRecord);
     const localHistory = readStorage(HISTORY_STORAGE_KEY, []).map(toHistoryRecord);
+    const localDownloads = readStorage(DOWNLOAD_HISTORY_STORAGE_KEY, []).map(normalizeDownloadHistoryItem);
 
     try {
       const data = await apiRequest('/library', { cache: 'no-store' });
       const remoteFavorites = Array.isArray(data?.favorites) ? data.favorites.map(toFavoriteRecord) : [];
       const remoteHistory = Array.isArray(data?.history) ? data.history.map(toHistoryRecord) : [];
+      const remoteDownloads = Array.isArray(data?.recentDownloads) ? data.recentDownloads.map(normalizeDownloadHistoryItem) : [];
 
       if (bootstrapLocal && !libraryMigrationRef.current) {
         const mergedFavorites = mergeLibraryRecords(remoteFavorites, localFavorites, 100, 'savedAt');
         const mergedHistory = mergeLibraryRecords(remoteHistory, localHistory, 50, 'playedAt');
+        const mergedDownloads = mergeDownloadHistory(remoteDownloads, localDownloads, 30);
 
         setFavorites(mergedFavorites);
         setHistoryItems(mergedHistory);
+        setDownloadHistory(mergedDownloads);
 
         const remoteFavoriteKeys = new Set(remoteFavorites.map((item) => item.key));
         const remoteHistoryKeys = new Set(remoteHistory.map((item) => item.key));
@@ -329,6 +425,7 @@ function App() {
 
       setFavorites(remoteFavorites);
       setHistoryItems(remoteHistory);
+      setDownloadHistory(mergeDownloadHistory(remoteDownloads, localDownloads, 30));
 
       if (!libraryMigrationRef.current) {
         markLibraryMigrated();
@@ -337,6 +434,7 @@ function App() {
       if (bootstrapLocal && !libraryMigrationRef.current) {
         setFavorites(localFavorites);
         setHistoryItems(localHistory);
+        setDownloadHistory(localDownloads);
       }
     } finally {
       librarySyncInFlightRef.current = false;
@@ -350,6 +448,14 @@ function App() {
   useEffect(() => {
     localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favorites));
   }, [favorites]);
+
+  useEffect(() => {
+    localStorage.setItem(DOWNLOAD_HISTORY_STORAGE_KEY, JSON.stringify(downloadHistory));
+  }, [downloadHistory]);
+
+  useEffect(() => {
+    localStorage.setItem(DOWNLOAD_CENTER_STORAGE_KEY, JSON.stringify(downloadTasks));
+  }, [downloadTasks]);
 
   useEffect(() => {
     void refreshLibraryState({ bootstrapLocal: true });
@@ -418,55 +524,220 @@ function App() {
     }
   };
 
-  const handleDownload = async (item) => {
-    if (!item) return;
-    setNoticeText('准备下载中...');
+  const updateDownloadTask = (taskId, updater) => {
+    setDownloadTasks((prev) => prev.map((task) => {
+      if (task.id !== taskId) return task;
+      const patch = typeof updater === 'function' ? updater(task) : updater;
+      return normalizeDownloadTask({ ...task, ...(patch || {}) });
+    }));
+  };
+
+  const addCompletedDownloadHistory = (entry) => {
+    setDownloadHistory((prev) => mergeDownloadHistory([normalizeDownloadHistoryItem(entry)], prev, 30));
+  };
+
+  const triggerBlobDownload = (blob, filename) => {
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = filename;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 15_000);
+  };
+
+  const resolveDownloadPlan = async (item) => {
+    let downloadUrl = item.audioSrc;
+    let audioExt = item.audioExt || 'm4a';
+    if (!downloadUrl) {
+      const query = item.query || makeQuery(item.title, item.artist);
+      const data = await apiRequest('/visualize', {
+        method: 'POST',
+        body: JSON.stringify({ query, videoId: item.videoId || null }),
+      });
+      downloadUrl = data.audioSrc;
+      audioExt = data.audioExt || audioExt;
+    }
+
+    if (!downloadUrl) throw new Error('未能解析到可下载音源');
+
+    const resolvedUrl = resolveAudioUrl(downloadUrl);
+    const parsedUrl = new URL(resolvedUrl);
+    const rawUrl = parsedUrl.searchParams.get('url');
+    if (!rawUrl) throw new Error('未能提取上游音频地址');
+
+    const normalizedExt = String(audioExt || 'm4a').replace(/^\./, '') || 'm4a';
+    const filename = `${item.title || '未命名曲目'} - ${item.artist || '未知歌手'}.${normalizedExt}`;
+    const requestUrl = apiUrl(`/download?url=${encodeURIComponent(rawUrl)}&filename=${encodeURIComponent(filename)}`);
+
+    return {
+      requestUrl,
+      filename,
+      rawUrl,
+      audioExt: normalizedExt,
+    };
+  };
+
+  const processDownloadTask = async (task) => {
+    const controller = new AbortController();
+    downloadAbortControllersRef.current.set(task.id, controller);
+
     try {
-      let downloadUrl = item.audioSrc;
-      let audioExt = item.audioExt || 'm4a';
-      if (!downloadUrl) {
-        const query = item.query || makeQuery(item.title, item.artist);
-        const res = await fetch(apiUrl('/visualize'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query })
-        });
-        const data = await res.json();
-        downloadUrl = data.audioSrc;
-        audioExt = data.audioExt || audioExt;
+      updateDownloadTask(task.id, {
+        status: 'resolving',
+        startedAt: new Date().toISOString(),
+        error: '',
+        progress: 0,
+        bytesReceived: 0,
+        totalBytes: 0,
+      });
+
+      const plan = await resolveDownloadPlan(task);
+      updateDownloadTask(task.id, {
+        status: 'downloading',
+        filename: plan.filename,
+        sourceUrl: plan.rawUrl,
+        audioExt: plan.audioExt,
+      });
+
+      const response = await fetch(plan.requestUrl, {
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`下载请求失败 (${response.status})`);
       }
 
-      if (!downloadUrl) throw new Error('Could not resolve audio');
+      const totalBytes = Number(response.headers.get('content-length') || 0);
+      const contentType = response.headers.get('content-type') || 'application/octet-stream';
+      const reader = response.body?.getReader();
+      const chunks = [];
+      let received = 0;
 
-      const rawUrl = new URLSearchParams(downloadUrl.split('?')[1]).get('url');
-      if (!rawUrl) throw new Error('Could not resolve upstream audio URL');
-      const normalizedExt = String(audioExt || 'm4a').replace(/^\./, '') || 'm4a';
-      const filename = `${item.title} - ${item.artist}.${normalizedExt}`;
-      const finalDownloadUrl = apiUrl(`/download?url=${encodeURIComponent(rawUrl)}&filename=${encodeURIComponent(filename)}`);
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            chunks.push(value);
+            received += value.length;
+            updateDownloadTask(task.id, {
+              status: 'downloading',
+              bytesReceived: received,
+              totalBytes,
+              progress: totalBytes > 0 ? received / totalBytes : 0,
+            });
+          }
+        }
+      } else {
+        const blob = await response.blob();
+        received = blob.size;
+        chunks.push(blob);
+      }
 
-      const link = document.createElement('a');
-      link.href = finalDownloadUrl;
-      link.download = filename;
-      link.rel = 'noopener';
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setNoticeText('已开始下载');
+      const blob = chunks[0] instanceof Blob
+        ? chunks[0]
+        : new Blob(chunks, { type: contentType });
+
+      triggerBlobDownload(blob, plan.filename);
+      const downloadedAt = new Date().toISOString();
+
+      updateDownloadTask(task.id, {
+        status: 'completed',
+        progress: 1,
+        bytesReceived: received || totalBytes,
+        totalBytes: totalBytes || received,
+        completedAt: downloadedAt,
+        error: '',
+        filename: plan.filename,
+        sourceUrl: plan.rawUrl,
+      });
+
+      const historyEntry = {
+        key: task.key || trackKey(task.videoId, task.title, task.artist),
+        title: task.title || '',
+        artist: task.artist || '',
+        filename: plan.filename,
+        sourceUrl: plan.rawUrl,
+        downloadedAt,
+      };
+      addCompletedDownloadHistory(historyEntry);
       void apiRequest('/library/downloads', {
         method: 'POST',
-        body: JSON.stringify({
-          key: item.key || trackKey(item.videoId, item.title, item.artist),
-          title: item.title || '',
-          artist: item.artist || '',
-          filename,
-          sourceUrl: rawUrl || downloadUrl,
-          downloadedAt: new Date().toISOString(),
-        }),
+        body: JSON.stringify(historyEntry),
       }).catch(() => {});
+
+      setNoticeText(`已完成下载: ${task.title || '音频文件'}`);
     } catch (err) {
-      console.error(err);
-      setNoticeText('下载失败');
+      if (err?.name === 'AbortError') {
+        updateDownloadTask(task.id, {
+          status: 'failed',
+          error: '下载已取消',
+        });
+        setNoticeText('已取消当前下载');
+      } else {
+        console.error(err);
+        updateDownloadTask(task.id, {
+          status: 'failed',
+          error: err instanceof Error ? err.message : '下载失败',
+        });
+        setNoticeText('下载失败，可在下载中心重试');
+      }
+    } finally {
+      downloadAbortControllersRef.current.delete(task.id);
+      downloadRunnerRef.current = false;
     }
+  };
+
+  const enqueueDownload = (item) => {
+    if (!item) return;
+    const task = normalizeDownloadTask({
+      ...item,
+      id: downloadTaskId(),
+      status: 'queued',
+      progress: 0,
+      createdAt: new Date().toISOString(),
+    });
+    setDownloadTasks((prev) => [task, ...prev].slice(0, 40));
+    setActivePage('downloads');
+    setNoticeText('已加入下载队列');
+  };
+
+  const retryDownloadTask = (taskId) => {
+    updateDownloadTask(taskId, {
+      status: 'queued',
+      progress: 0,
+      bytesReceived: 0,
+      totalBytes: 0,
+      error: '',
+      startedAt: null,
+      completedAt: null,
+    });
+    setNoticeText('已重新加入下载队列');
+  };
+
+  const removeDownloadTask = (taskId) => {
+    const controller = downloadAbortControllersRef.current.get(taskId);
+    if (controller) {
+      controller.abort();
+    }
+    setDownloadTasks((prev) => prev.filter((task) => task.id !== taskId));
+  };
+
+  const clearFinishedDownloads = () => {
+    downloadTasks
+      .filter((task) => task.status === 'completed' || task.status === 'failed')
+      .forEach((task) => {
+        const controller = downloadAbortControllersRef.current.get(task.id);
+        if (controller) controller.abort();
+      });
+    setDownloadTasks((prev) => prev.filter((task) => task.status !== 'completed' && task.status !== 'failed'));
+    setNoticeText('已清理已完成与失败任务');
+  };
+
+  const handleDownload = async (item) => {
+    enqueueDownload(item);
   };
 
 
@@ -498,6 +769,23 @@ function App() {
     checkBackend();
     const timer = setInterval(checkBackend, 15000);
     return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (downloadRunnerRef.current) return undefined;
+    const activeTask = downloadTasks.find((task) => task.status === 'resolving' || task.status === 'downloading');
+    if (activeTask) return undefined;
+    const nextTask = downloadTasks.find((task) => task.status === 'queued');
+    if (!nextTask) return undefined;
+
+    downloadRunnerRef.current = true;
+    void processDownloadTask(nextTask);
+    return undefined;
+  }, [downloadTasks]);
+
+  useEffect(() => () => {
+    downloadAbortControllersRef.current.forEach((controller) => controller.abort());
+    downloadAbortControllersRef.current.clear();
   }, []);
 
   const runSearch = async (overrideQuery) => {
@@ -792,6 +1080,10 @@ function App() {
   const miniCurrentTime = Number(remotePlayerState?.currentTime || 0);
   const miniDuration = Number(remotePlayerState?.duration || 0);
   const miniProgress = miniDuration > 0 ? Math.min(100, (miniCurrentTime / miniDuration) * 100) : 0;
+  const activeDownloadTask = downloadTasks.find((taskItem) => taskItem.status === 'resolving' || taskItem.status === 'downloading') || null;
+  const queuedDownloadCount = downloadTasks.filter((taskItem) => taskItem.status === 'queued').length;
+  const failedDownloadCount = downloadTasks.filter((taskItem) => taskItem.status === 'failed').length;
+  const completedDownloadCount = downloadTasks.filter((taskItem) => taskItem.status === 'completed').length;
 
   if (isMiniMode) {
     return (
@@ -1070,13 +1362,183 @@ function App() {
             </div>
           )}
 
+          {activePage === 'downloads' && (
+            <div className="animate-slide-up">
+              <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-6">
+                <div>
+                  <h2 className="section-title mb-2 border-b-0 pb-0">下载中心</h2>
+                  <p className="text-sm text-white/45">单任务顺序下载，支持进度跟踪、失败重试和最近下载记录。</p>
+                </div>
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/70 hover:bg-white/10 transition-colors"
+                    onClick={() => void refreshLibraryState()}
+                  >
+                    刷新记录
+                  </button>
+                  <button
+                    className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/70 hover:bg-white/10 transition-colors disabled:opacity-40"
+                    onClick={clearFinishedDownloads}
+                    disabled={completedDownloadCount === 0 && failedDownloadCount === 0}
+                  >
+                    清理已结束任务
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+                {[
+                  { label: '进行中', value: activeDownloadTask ? '1' : '0', accent: 'text-cyan-400' },
+                  { label: '等待中', value: String(queuedDownloadCount), accent: 'text-amber-300' },
+                  { label: '已完成', value: String(completedDownloadCount), accent: 'text-emerald-400' },
+                  { label: '失败', value: String(failedDownloadCount), accent: 'text-rose-400' },
+                ].map((stat) => (
+                  <div key={stat.label} className="rounded-2xl border border-white/10 bg-white/5 px-5 py-4">
+                    <div className="text-xs uppercase tracking-[0.24em] text-white/35 mb-2">{stat.label}</div>
+                    <div className={`text-3xl font-black ${stat.accent}`}>{stat.value}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
+                <div className="rounded-3xl border border-white/10 bg-white/5 p-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="flex items-center gap-2 text-white/85">
+                      <Download size={18} className="text-cyan-400" />
+                      <span className="font-semibold">下载任务</span>
+                    </div>
+                    {activeDownloadTask && (
+                      <span className="text-xs px-3 py-1 rounded-full bg-cyan-500/10 text-cyan-300">
+                        {activeDownloadTask.status === 'resolving' ? '解析中' : '下载中'}
+                      </span>
+                    )}
+                  </div>
+
+                  {downloadTasks.length > 0 ? (
+                    <div className="space-y-4">
+                      {downloadTasks.map((taskItem) => {
+                        const progressPercent = Math.max(0, Math.min(100, Math.round((taskItem.progress || 0) * 100)));
+                        const isRunning = taskItem.status === 'resolving' || taskItem.status === 'downloading';
+                        const isFinished = taskItem.status === 'completed';
+                        const isFailed = taskItem.status === 'failed';
+
+                        return (
+                          <div key={taskItem.id} className="rounded-2xl border border-white/8 bg-black/20 p-4">
+                            <div className="flex items-start justify-between gap-4">
+                              <div className="min-w-0">
+                                <div className="font-semibold text-white truncate">{taskItem.title || '未命名曲目'}</div>
+                                <div className="text-sm text-white/45 truncate">{taskItem.artist || '未知歌手'}</div>
+                              </div>
+                              <div className="flex items-center gap-2 shrink-0">
+                                {isRunning && <LoaderCircle size={16} className="text-cyan-400 animate-spin" />}
+                                {isFinished && <CheckCircle2 size={16} className="text-emerald-400" />}
+                                {isFailed && <AlertTriangle size={16} className="text-rose-400" />}
+                                {taskItem.status === 'queued' && <Clock3 size={16} className="text-amber-300" />}
+                              </div>
+                            </div>
+
+                            <div className="mt-3">
+                              <div className="h-2 rounded-full bg-white/8 overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full transition-all ${isFinished ? 'bg-emerald-400' : isFailed ? 'bg-rose-400' : 'bg-[var(--accent)]'}`}
+                                  style={{ width: `${isFailed ? 100 : progressPercent}%` }}
+                                />
+                              </div>
+                              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-white/45">
+                                <span>
+                                  {taskItem.status === 'queued' && '等待下载'}
+                                  {taskItem.status === 'resolving' && '正在解析音源'}
+                                  {taskItem.status === 'downloading' && `${progressPercent}% · ${formatBytes(taskItem.bytesReceived)} / ${taskItem.totalBytes > 0 ? formatBytes(taskItem.totalBytes) : '未知大小'}`}
+                                  {taskItem.status === 'completed' && `已完成 · ${formatRelativeTime(taskItem.completedAt)}`}
+                                  {taskItem.status === 'failed' && (taskItem.error || '下载失败')}
+                                </span>
+                                <span>{taskItem.filename || '等待生成文件名'}</span>
+                              </div>
+                            </div>
+
+                            <div className="mt-4 flex flex-wrap gap-2">
+                              {isFailed && (
+                                <button
+                                  className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
+                                  onClick={() => retryDownloadTask(taskItem.id)}
+                                >
+                                  <span className="inline-flex items-center gap-2"><RefreshCw size={14} /> 重试</span>
+                                </button>
+                              )}
+                              {taskItem.sourceUrl && (
+                                <button
+                                  className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
+                                  onClick={() => window.open(taskItem.sourceUrl, '_blank', 'noopener,noreferrer')}
+                                >
+                                  <span className="inline-flex items-center gap-2"><ExternalLink size={14} /> 源地址</span>
+                                </button>
+                              )}
+                              <button
+                                className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
+                                onClick={() => removeDownloadTask(taskItem.id)}
+                              >
+                                <span className="inline-flex items-center gap-2"><Trash2 size={14} /> 移除</span>
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="py-20 text-center text-white/45">
+                      <FolderDown size={56} className="mx-auto mb-4 opacity-30" />
+                      <p>还没有下载任务，试试从搜索结果或播放器里下载一首歌。</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded-3xl border border-white/10 bg-white/5 p-6">
+                  <div className="flex items-center gap-2 text-white/85 mb-4">
+                    <CheckCircle2 size={18} className="text-emerald-400" />
+                    <span className="font-semibold">最近下载</span>
+                  </div>
+
+                  {downloadHistory.length > 0 ? (
+                    <div className="space-y-3">
+                      {downloadHistory.map((entry, index) => (
+                        <div key={`${entry.filename}-${entry.downloadedAt}-${index}`} className="rounded-2xl border border-white/8 bg-black/20 px-4 py-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="font-medium text-white truncate">{entry.title || entry.filename}</div>
+                              <div className="text-sm text-white/45 truncate">{entry.artist || '未知歌手'}</div>
+                            </div>
+                            <span className="text-xs text-white/35 shrink-0">{formatRelativeTime(entry.downloadedAt)}</span>
+                          </div>
+                          <div className="mt-2 text-xs text-white/35 truncate">{entry.filename || '未记录文件名'}</div>
+                          {entry.sourceUrl && (
+                            <button
+                              className="mt-3 text-xs text-cyan-300 hover:text-cyan-200 transition-colors inline-flex items-center gap-1"
+                              onClick={() => window.open(entry.sourceUrl, '_blank', 'noopener,noreferrer')}
+                            >
+                              查看源地址 <ChevronRight size={14} />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="py-20 text-center text-white/45">
+                      <Download size={52} className="mx-auto mb-4 opacity-30" />
+                      <p>完成下载后，记录会显示在这里。</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {activePage === 'system' && (
             <div className="max-w-3xl">
               <h2 className="section-title">系统状态</h2>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {[
                   { label: '后端核心', status: backendStatus === 'online', val: backendStatus },
-                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.1.0' },
+                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.2.0' },
                   { label: '运行模式', status: true, val: systemCheck?.runtimeMode === 'packaged' ? '桌面安装版' : '源码模式' },
                   { label: 'ffmpeg', status: !!systemCheck?.ffmpegAvailable, val: systemCheck?.ffmpegAvailable ? '已启用' : '未检测到' },
                   { label: '本地数据库', status: !!systemCheck?.libraryDbAvailable, val: systemCheck?.libraryDbAvailable ? 'SQLite 已连接' : '未初始化' },
@@ -1084,6 +1546,7 @@ function App() {
                   { label: 'Python', status: true, val: systemCheck?.pythonVersion },
                   { label: 'yt-dlp', status: true, val: systemCheck?.ytDlpVersion },
                   { label: '收藏 / 历史', status: true, val: `${systemCheck?.libraryStats?.favorites ?? favorites.length} / ${systemCheck?.libraryStats?.history ?? historyItems.length}` },
+                  { label: '下载记录', status: true, val: `${systemCheck?.libraryStats?.downloads ?? downloadHistory.length} 条` },
                   { label: '歌词偏移', status: true, val: `${systemCheck?.libraryStats?.lyricsOffsets ?? 0} 条` },
                 ].map((stat, i) => (
                   <div key={i} className="bg-white/5 border border-white/10 p-4 rounded-xl flex justify-between items-center">

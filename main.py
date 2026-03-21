@@ -850,7 +850,7 @@ async def get_library():
         "favorites": fetch_library_tracks("favorites", "saved_at", 100),
         "history": fetch_library_tracks("play_history", "played_at", 50),
         "recentSearches": fetch_recent_searches(12),
-        "recentDownloads": fetch_recent_downloads(12),
+        "recentDownloads": fetch_recent_downloads(30),
     }
 
 

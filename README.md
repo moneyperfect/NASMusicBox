@@ -47,6 +47,7 @@ pip install -r requirements-dev.txt
 
 - YouTube 搜索容错与排序增强
 - 本地 SQLite 收藏、历史、搜索、下载记录
+- 下载中心，支持顺序队列、进度跟踪与失败重试
 - 多源歌词与歌词偏移持久化
 - 桌面托盘、迷你播放器、全局快捷键、开机启动
 - GitHub Release 自动更新检查
@@ -97,7 +98,7 @@ dist\release
 
 1. 更新 `app_meta.py` 和 `frontend/package.json` 中的版本号
 2. 提交代码并推送
-3. 创建形如 `v1.1.0` 的 Git tag
+3. 创建形如 `v1.2.0` 的 Git tag
 4. GitHub Actions 自动生成 Release 产物
 
 ## 声明
