@@ -54,19 +54,53 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/release | Out-Null
-          Compress-Archive -Path dist/NASMusicBox/* -DestinationPath dist/release/NASMusicBox-portable-v${env:APP_VERSION}.zip -Force
+          Compress-Archive -Path dist/NASMusicBox/* -DestinationPath dist/release/NASMusicBox-portable.zip -Force
+
+      - name: Validate release assets
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "dist/release/NASMusicBox-Setup.exe",
+            "dist/release/NASMusicBox-portable.zip"
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path $file)) {
+              throw "Required release asset is missing: $file"
+            }
+          }
 
       - name: Upload workflow artifact
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: NASMusicBox-release-v${{ env.APP_VERSION }}
-          path: dist/release/*
+          path: |
+            dist/release/NASMusicBox-Setup.exe
+            dist/release/NASMusicBox-portable.zip
 
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          name: NAS 音乐器 v${{ env.APP_VERSION }}
+          body: |
+            ## 本次更新
+            - 发布 Windows 安装版与便携版
+            - 修复公开仓库下载链路，支持 GitHub Release 直接下载
+            - 提供桌面端搜索、播放、歌词、收藏、下载与本地资料库能力
+
+            ## Windows 下载
+            - 安装版：`NASMusicBox-Setup.exe`
+            - 便携版：`NASMusicBox-portable.zip`
+
+            ## 使用说明
+            - 安装版适合大多数用户，双击安装后即可使用
+            - 便携版无需安装，解压后运行 `NASMusicBox.exe`
+            - Windows 首次运行可能出现未签名提示，请确认来源为本仓库 Release
+
+            ## 声明
+            本项目公开仅供学习交流与个人技术研究使用。我们不对他人滥用此代码进行牟利或从事其他非法活动承担任何责任。
+          fail_on_unmatched_files: true
           files: |
-            dist/release/NASMusicBox-Setup-${{ env.APP_VERSION }}.exe
-            dist/release/NASMusicBox-portable-v${{ env.APP_VERSION }}.zip
+            dist/release/NASMusicBox-Setup.exe
+            dist/release/NASMusicBox-portable.zip

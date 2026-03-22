@@ -54,7 +54,7 @@ jobs:
 
       - name: Run backend tests
         shell: pwsh
-        run: pytest
+        run: python -m pytest
 
       - name: Smoke test desktop packaging
         shell: pwsh

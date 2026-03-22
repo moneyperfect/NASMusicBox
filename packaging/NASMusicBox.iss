@@ -1,8 +1,9 @@
 #define MyAppName "NAS音乐器"
 #define MyAppPublisher "moneyperfect"
 #define MyAppURL "https://github.com/moneyperfect/NASMusicBox"
+#define RepoRoot ".."
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.3"
+  #define MyAppVersion "1.2.4"
 #endif
 
 [Setup]
@@ -22,20 +23,22 @@ Compression=lzma
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputDir=dist\release
-OutputBaseFilename=NASMusicBox-Setup-{#MyAppVersion}
-SetupIconFile=assets\app-icon.ico
+OutputDir={#RepoRoot}\dist\release
+OutputBaseFilename=NASMusicBox-Setup
+SetupIconFile={#RepoRoot}\assets\app-icon.ico
 UninstallDisplayIcon={app}\NASMusicBox.exe
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+#ifdef IncludeChineseLanguage
+Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "dist\NASMusicBox\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RepoRoot}\dist\NASMusicBox\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\NASMusicBox.exe"

@@ -19,13 +19,13 @@ def test_parse_release_prefers_installer_and_portable_assets():
             "published_at": "2026-03-21T00:00:00Z",
             "assets": [
                 {
-                    "name": "NASMusicBox-portable-v1.2.0.zip",
+                    "name": "NASMusicBox-portable.zip",
                     "browser_download_url": "https://example.com/portable.zip",
                     "size": 2048,
                     "content_type": "application/zip",
                 },
                 {
-                    "name": "NASMusicBox-Setup-v1.2.0.exe",
+                    "name": "NASMusicBox-Setup.exe",
                     "browser_download_url": "https://example.com/setup.exe",
                     "size": 4096,
                     "content_type": "application/vnd.microsoft.portable-executable",
