@@ -51,8 +51,8 @@ pip install -r requirements-dev.txt
 - 多源歌词与歌词偏移持久化
 - 桌面托盘、迷你播放器、全局快捷键、开机启动
 - GitHub Release 自动更新检查
-- 沉浸式全屏模式，可通过托盘菜单、`F11`、`Esc`、`Ctrl + Shift + F` 切换与退出
-- 主窗口可通过 `Ctrl + Shift + H` 快速隐藏或重新显示
+- 沉浸式全屏模式，可通过托盘菜单或 `start-desktop.bat --fullscreen` 启动
+- 为避免键盘输入卡顿，桌面端已停用本轮新增的全屏与隐藏热键
 
 ## 桌面打包
 
@@ -99,7 +99,7 @@ dist\release
 
 1. 更新 `app_meta.py` 和 `frontend/package.json` 中的版本号
 2. 提交代码并推送
-3. 创建形如 `v1.2.1` 的 Git tag
+3. 创建形如 `v1.2.2` 的 Git tag
 4. GitHub Actions 自动生成 Release 产物
 
 ## 声明

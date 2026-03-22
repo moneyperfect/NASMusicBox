@@ -368,17 +368,6 @@ function App() {
     postDesktopMessage({ type: 'action', payload: action });
   };
 
-  const invokeDesktopShell = async (methodName) => {
-    const desktopApi = window.pywebview?.api;
-    if (!desktopApi || typeof desktopApi[methodName] !== 'function') return false;
-    try {
-      await desktopApi[methodName]();
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   const setNoticeText = (text) => {
     setNotice(text);
     setTimeout(() => setNotice(''), 3000);
@@ -798,32 +787,6 @@ function App() {
     downloadAbortControllersRef.current.forEach((controller) => controller.abort());
     downloadAbortControllersRef.current.clear();
   }, []);
-
-  useEffect(() => {
-    if (isMiniMode) return undefined;
-
-    const handleDesktopKeys = (event) => {
-      const desktopApi = window.pywebview?.api;
-      if (!desktopApi) return;
-
-      const target = event.target;
-      const tagName = target?.tagName?.toLowerCase?.() || '';
-      const isTyping = tagName === 'input' || tagName === 'textarea' || target?.isContentEditable;
-
-      if (event.key === 'F11') {
-        event.preventDefault();
-        void invokeDesktopShell('toggle_fullscreen');
-        return;
-      }
-
-      if (event.key === 'Escape' && !isTyping) {
-        void invokeDesktopShell('exit_fullscreen');
-      }
-    };
-
-    window.addEventListener('keydown', handleDesktopKeys);
-    return () => window.removeEventListener('keydown', handleDesktopKeys);
-  }, [isMiniMode]);
 
   const runSearch = async (overrideQuery) => {
     const q = normalizeSearchQuery(typeof overrideQuery === 'string' ? overrideQuery : queryText);
@@ -1575,7 +1538,7 @@ function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {[
                   { label: '后端核心', status: backendStatus === 'online', val: backendStatus },
-                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.2.1' },
+                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.2.2' },
                   { label: '运行模式', status: true, val: systemCheck?.runtimeMode === 'packaged' ? '桌面安装版' : '源码模式' },
                   { label: 'ffmpeg', status: !!systemCheck?.ffmpegAvailable, val: systemCheck?.ffmpegAvailable ? '已启用' : '未检测到' },
                   { label: '本地数据库', status: !!systemCheck?.libraryDbAvailable, val: systemCheck?.libraryDbAvailable ? 'SQLite 已连接' : '未初始化' },
@@ -1604,12 +1567,10 @@ function App() {
               <div className="mt-6 p-6 bg-white/5 border border-white/10 rounded-2xl">
                 <h4 className="flex items-center gap-2 mb-3 text-slate-200"><ShieldCheck size={18} /> 桌面控制</h4>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm text-slate-400">
-                  <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`F11`：在桌面壳内切换沉浸式全屏</div>
-                  <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`Esc`：退出沉浸式全屏</div>
-                  <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`Ctrl + Shift + F`：全局切换主窗口全屏</div>
-                  <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`Ctrl + Shift + H`：隐藏或重新显示主窗口</div>
                   <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">托盘菜单：`Show NAS` / `Hide NAS` / `Immersive Fullscreen`</div>
+                  <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">启动即全屏：`start-desktop.bat --fullscreen`</div>
                   <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`Ctrl + Alt + M`：切换迷你播放器</div>
+                  <div className="rounded-xl border border-amber-400/20 bg-amber-500/8 px-4 py-3 text-amber-100">为避免键盘输入卡顿，桌面端已停用本轮新增的全屏与隐藏热键。</div>
                 </div>
               </div>
             </div>
