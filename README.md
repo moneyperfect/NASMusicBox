@@ -53,6 +53,7 @@ pip install -r requirements-dev.txt
 - GitHub Release 自动更新检查
 - 沉浸式全屏模式，可通过托盘菜单或 `start-desktop.bat --fullscreen` 启动
 - 为避免键盘输入卡顿，桌面端已停用本轮新增的全屏与隐藏热键
+- 托盘菜单已统一为中文项，便于长期使用
 
 ## 桌面打包
 
@@ -99,7 +100,7 @@ dist\release
 
 1. 更新 `app_meta.py` 和 `frontend/package.json` 中的版本号
 2. 提交代码并推送
-3. 创建形如 `v1.2.2` 的 Git tag
+3. 创建形如 `v1.2.3` 的 Git tag
 4. GitHub Actions 自动生成 Release 产物
 
 ## 声明

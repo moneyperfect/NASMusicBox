@@ -336,22 +336,22 @@ class DesktopApp:
 
     def update_status_label(self, _item=None) -> str:
         if self.update_download_in_progress:
-            return "Updates: downloading..."
+            return "更新：正在下载..."
         if self.update_check_in_progress:
-            return "Updates: checking..."
+            return "更新：正在检查..."
         if self.update_error:
-            return "Updates: check failed"
+            return "更新：检查失败"
         if self.available_release and is_newer_version(self.available_release.version, APP_VERSION):
-            return f"Update ready: v{self.available_release.version}"
-        return f"Updates: current v{APP_VERSION}"
+            return f"发现新版本：v{self.available_release.version}"
+        return f"更新：当前版本 v{APP_VERSION}"
 
     def download_update_label(self, _item=None) -> str:
         if self.update_download_in_progress:
-            return "Downloading update..."
+            return "正在下载更新..."
         asset = self.available_release.preferred_asset if self.available_release else None
         if asset:
-            return f"Download {asset.name}"
-        return "Download Latest Installer"
+            return f"下载 {asset.name}"
+        return "下载最新安装包"
 
     def trigger_update_check(self, *_args, background: bool = False) -> None:
         with self.update_lock:
@@ -425,36 +425,36 @@ class DesktopApp:
 
     def create_tray_menu(self) -> Menu:
         return Menu(
-            MenuItem("Show NAS", lambda icon, item: self.show_main_window(), default=True),
-            MenuItem("Hide NAS", lambda icon, item: self.hide_main_window()),
+            MenuItem("显示 NAS", lambda icon, item: self.show_main_window(), default=True),
+            MenuItem("隐藏 NAS", lambda icon, item: self.hide_main_window()),
             MenuItem(
-                "Immersive Fullscreen",
+                "沉浸式全屏",
                 lambda icon, item: self.toggle_main_fullscreen(),
                 checked=lambda item: self.main_window_is_fullscreen(),
             ),
             MenuItem(
-                "Mini Player",
+                "迷你播放器",
                 lambda icon, item: self.toggle_mini_window(),
                 checked=lambda item: self.mini_window_visible(),
             ),
-            MenuItem("Play / Pause", lambda icon, item: self.dispatch_shell_action("toggle-play")),
-            MenuItem("Previous", lambda icon, item: self.dispatch_shell_action("previous")),
-            MenuItem("Next", lambda icon, item: self.dispatch_shell_action("next")),
-            MenuItem("Toggle Vibe", lambda icon, item: self.dispatch_shell_action("toggle-vibe")),
+            MenuItem("播放 / 暂停", lambda icon, item: self.dispatch_shell_action("toggle-play")),
+            MenuItem("上一首", lambda icon, item: self.dispatch_shell_action("previous")),
+            MenuItem("下一首", lambda icon, item: self.dispatch_shell_action("next")),
+            MenuItem("切换 Vibe", lambda icon, item: self.dispatch_shell_action("toggle-vibe")),
             MenuItem(self.update_status_label, lambda icon, item: None, enabled=False),
-            MenuItem("Check for Updates", lambda icon, item: self.trigger_update_check()),
+            MenuItem("检查更新", lambda icon, item: self.trigger_update_check()),
             MenuItem(
                 self.download_update_label,
                 lambda icon, item: self.download_latest_update(),
                 enabled=lambda item: self.available_release is not None and not self.update_download_in_progress,
             ),
-            MenuItem("Open Releases Page", lambda icon, item: self.open_releases_page()),
+            MenuItem("打开发布页面", lambda icon, item: self.open_releases_page()),
             MenuItem(
-                "Launch at Login",
+                "开机启动",
                 lambda icon, item: self.toggle_startup(),
                 checked=lambda item: self.is_startup_enabled(),
             ),
-            MenuItem("Quit NAS", lambda icon, item: self.quit()),
+            MenuItem("退出 NAS", lambda icon, item: self.quit()),
         )
 
     def start_tray(self) -> None:
