@@ -2,7 +2,7 @@
 #define MyAppPublisher "moneyperfect"
 #define MyAppURL "https://github.com/moneyperfect/NASMusicBox"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.0"
+  #define MyAppVersion "1.2.1"
 #endif
 
 [Setup]

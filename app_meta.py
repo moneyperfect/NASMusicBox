@@ -2,7 +2,7 @@ APP_ID = "NASMusicBox"
 APP_NAME = "NAS Music Box"
 APP_BRAND_NAME = "NAS音乐器"
 APP_SHORT_NAME = "NAS"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_AUTHOR = "moneyperfect"
 
 BACKEND_HOST = "127.0.0.1"

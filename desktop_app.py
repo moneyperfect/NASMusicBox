@@ -45,6 +45,23 @@ HEALTH_URL = f"{BACKEND_URL}/health"
 STARTUP_VALUE_NAME = f"{APP_ID}Desktop"
 
 
+class DesktopShellBridge:
+    def __init__(self, app: "DesktopApp") -> None:
+        self.app = app
+
+    def toggle_fullscreen(self) -> dict[str, bool]:
+        self.app.toggle_main_fullscreen()
+        return {"ok": True}
+
+    def exit_fullscreen(self) -> dict[str, bool]:
+        self.app.exit_main_fullscreen()
+        return {"ok": True}
+
+    def toggle_visibility(self) -> dict[str, bool]:
+        self.app.toggle_main_window_visibility()
+        return {"ok": True}
+
+
 class DesktopApp:
     def __init__(self, *, start_fullscreen: bool = False) -> None:
         ensure_runtime_directories()
@@ -64,6 +81,7 @@ class DesktopApp:
         self.update_check_in_progress = False
         self.update_download_in_progress = False
         self.start_fullscreen = start_fullscreen
+        self.shell_bridge = DesktopShellBridge(self)
 
     @property
     def storage_path(self) -> str:
@@ -210,7 +228,8 @@ class DesktopApp:
             keyboard.add_hotkey("ctrl+alt+up", lambda: self.dispatch_shell_action("volume-up"))
             keyboard.add_hotkey("ctrl+alt+down", lambda: self.dispatch_shell_action("volume-down"))
             keyboard.add_hotkey("ctrl+alt+m", lambda: self.toggle_mini_window())
-            keyboard.add_hotkey("ctrl+alt+enter", lambda: self.toggle_main_fullscreen())
+            keyboard.add_hotkey("ctrl+shift+f", lambda: self.toggle_main_fullscreen())
+            keyboard.add_hotkey("ctrl+shift+h", lambda: self.toggle_main_window_visibility())
             self.hotkeys_registered = True
         except Exception:
             self.hotkeys_registered = False
@@ -256,6 +275,20 @@ class DesktopApp:
         except Exception:
             pass
 
+    def main_window_is_hidden(self) -> bool:
+        if not self.main_window:
+            return False
+        try:
+            return self.main_window.state == "hidden"
+        except Exception:
+            return False
+
+    def toggle_main_window_visibility(self, *_args) -> None:
+        if self.main_window_is_hidden():
+            self.show_main_window()
+        else:
+            self.hide_main_window()
+
     def main_window_is_fullscreen(self) -> bool:
         if not self.main_window:
             return False
@@ -272,6 +305,10 @@ class DesktopApp:
         except Exception:
             return
         self.refresh_tray_menu()
+
+    def exit_main_fullscreen(self, *_args) -> None:
+        if self.main_window_is_fullscreen():
+            self.toggle_main_fullscreen()
 
     def create_mini_window(self) -> None:
         if self.mini_window is not None:
@@ -427,9 +464,9 @@ class DesktopApp:
     def create_tray_menu(self) -> Menu:
         return Menu(
             MenuItem("Show NAS", lambda icon, item: self.show_main_window(), default=True),
-            MenuItem("Hide NAS", lambda icon, item: self.hide_main_window()),
+            MenuItem("Hide NAS (Ctrl+Shift+H)", lambda icon, item: self.hide_main_window()),
             MenuItem(
-                "Immersive Fullscreen",
+                "Immersive Fullscreen (Ctrl+Shift+F)",
                 lambda icon, item: self.toggle_main_fullscreen(),
                 checked=lambda item: self.main_window_is_fullscreen(),
             ),
@@ -512,6 +549,7 @@ class DesktopApp:
         self.main_window = webview.create_window(
             APP_BRAND_NAME,
             f"{BACKEND_URL}/",
+            js_api=self.shell_bridge,
             width=1440,
             height=900,
             min_size=(1100, 720),
