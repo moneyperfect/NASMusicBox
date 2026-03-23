@@ -428,6 +428,7 @@ function App() {
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [volume, setVolume] = useState(0.8);
+  const playbackMetricsRef = useRef({ startedAt: 0, trackKey: '' });
 
   const queryText = useMemo(() => makeQuery(querySong, queryArtist), [querySong, queryArtist]);
   const recommendationFingerprint = useMemo(
@@ -756,7 +757,9 @@ function App() {
 
     const resolvedUrl = resolveAudioUrl(downloadUrl);
     const parsedUrl = new URL(resolvedUrl);
-    const rawUrl = parsedUrl.searchParams.get('url');
+    const rawUrl = parsedUrl.pathname.endsWith('/proxy-stream')
+      ? parsedUrl.searchParams.get('url')
+      : resolvedUrl;
     if (!rawUrl) throw new Error('未能提取上游音频地址');
 
     const normalizedExt = String(audioExt || 'm4a').replace(/^\./, '') || 'm4a';
@@ -1057,11 +1060,17 @@ function App() {
         theme: data.theme || 'Vibe Resonating',
         colors: data.colors || ['#22d3ee', '#000000'],
         audioSrc: resolveAudioUrl(data.audioSrc),
+        proxyAudioSrc: resolveAudioUrl(data.proxyAudioSrc || ''),
         audioExt: data.audioExt || candidate.audioExt || null,
         videoId: data.videoId || candidate.videoId || null,
         query: data.query || query,
+        streamMode: data.streamMode || 'direct',
       };
 
+      playbackMetricsRef.current = {
+        startedAt: performance.now(),
+        trackKey: resolved.key,
+      };
       setTrack(resolved);
       setCurrentTime(0);
       setDuration(0);
@@ -1104,6 +1113,34 @@ function App() {
     }
   };
 
+  const handleAudioError = () => {
+    if (!track || !audioRef.current) {
+      setIsPlaying(false);
+      return;
+    }
+
+    const directSource = resolveAudioUrl(track.audioSrc);
+    const proxySource = resolveAudioUrl(track.proxyAudioSrc || '');
+    if (proxySource && directSource !== proxySource) {
+      setNoticeText('直连播放失败，正在切换兼容通道');
+      setTrack((prev) => prev ? {
+        ...prev,
+        audioSrc: proxySource,
+        streamMode: 'proxy',
+      } : prev);
+      window.setTimeout(() => {
+        if (audioRef.current) {
+          audioRef.current.load();
+          audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
+        }
+      }, 60);
+      return;
+    }
+
+    setIsPlaying(false);
+    setNoticeText('音频播放失败，请重试');
+  };
+
   const handleTogglePlay = () => {
     if (!audioRef.current || !track) return;
     if (isPlaying) {
@@ -1119,7 +1156,17 @@ function App() {
     resolveAndPlay(playQueue[nextIndex], { queue: playQueue, index: nextIndex });
   };
 
-  const onLoadedMetadata = () => setDuration(audioRef.current?.duration || 0);
+  const onLoadedMetadata = () => {
+    setDuration(audioRef.current?.duration || 0);
+    if (track?.key && playbackMetricsRef.current.trackKey === track.key && playbackMetricsRef.current.startedAt > 0) {
+      const elapsed = Math.round(performance.now() - playbackMetricsRef.current.startedAt);
+      console.info('[NAS] audio_loaded_metadata', {
+        loadMs: elapsed,
+        streamMode: track.streamMode || 'unknown',
+        title: track.title,
+      });
+    }
+  };
   const onTimeUpdate = () => setCurrentTime(audioRef.current?.currentTime || 0);
   const seekTo = (nextTime) => {
     if (audioRef.current) audioRef.current.currentTime = nextTime;
@@ -2059,6 +2106,7 @@ function App() {
         preload="auto"
         onLoadedMetadata={onLoadedMetadata}
         onTimeUpdate={onTimeUpdate}
+        onError={handleAudioError}
         onEnded={() => {
           if (queueIndex < playQueue.length - 1) jumpQueue(queueIndex + 1);
           else setIsPlaying(false);

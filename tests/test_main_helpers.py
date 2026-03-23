@@ -133,6 +133,7 @@ def test_library_roundtrip_and_system_check(isolated_library):
 def test_search_youtube_entries_uses_backend_cache(monkeypatch):
     main.SEARCH_RESULTS_CACHE.clear()
     calls = {"count": 0}
+    monkeypatch.setattr(main, "search_provider_order", lambda: ["legacy_ytdlp"])
 
     class FakeYoutubeDL:
         def __init__(self, _opts):
@@ -200,7 +201,81 @@ def test_visualize_prefers_direct_video_lookup_without_search(monkeypatch):
 
     assert payload["videoId"] == "video-1"
     assert payload["audioExt"] == "m4a"
-    assert payload["audioSrc"].startswith("/proxy-stream?url=")
+    assert payload["audioSrc"] == "https://example.com/audio.m4a"
+    assert payload["proxyAudioSrc"].startswith("/proxy-stream?url=")
+    assert payload["streamMode"] == "direct"
+
+
+def test_search_provider_uses_youtube_data_api_when_available(monkeypatch):
+    main.SEARCH_RESULTS_CACHE.clear()
+    monkeypatch.setattr(main, "YOUTUBE_DATA_API_KEY", "demo-key")
+    monkeypatch.setattr(main, "NAS_SEARCH_PROVIDER", "auto")
+
+    def fake_request_json(url, *, params=None, timeout=12, kind="metadata"):
+        if "youtube/v3/search" in url:
+            return {
+                "items": [
+                    {
+                        "id": {"videoId": "video-1"},
+                        "snippet": {
+                            "title": "Yellow",
+                            "description": "Official audio",
+                            "channelTitle": "Coldplay",
+                            "thumbnails": {"high": {"url": "https://example.com/yellow.jpg"}},
+                        },
+                    }
+                ]
+            }
+        if "youtube/v3/videos" in url:
+            return {"items": [{"id": "video-1", "contentDetails": {"duration": "PT4M26S"}}]}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(main, "request_json", fake_request_json)
+    monkeypatch.setattr(main, "search_provider_order", lambda: ["youtube_data_api"])
+
+    payload = main.build_search_response_payload("Yellow Coldplay", 5)
+
+    assert payload["provider"] == "youtube_data_api"
+    assert payload["results"][0].videoId == "video-1"
+    assert payload["results"][0].duration == 266
+
+
+def test_normalize_ytmusic_language_handles_web_locales():
+    assert main.normalize_ytmusic_language("zh-CN") == "zh_CN"
+    assert main.normalize_ytmusic_language("zh-TW") == "zh_TW"
+    assert main.normalize_ytmusic_language("fr-FR") == "fr"
+    assert main.normalize_ytmusic_language("xx-YY") == "en"
+
+
+def test_search_ytmusicapi_entries_filters_metric_labels_and_skips_extra_queries(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def search(self, query, filter=None, limit=20):
+            calls.append((query, filter, limit))
+            if filter != "songs":
+                raise AssertionError("videos search should be skipped when songs already filled the page")
+            return [
+                {
+                    "videoId": f"song-{index}",
+                    "title": f"Track {index}",
+                    "artists": [{"name": "Coldplay"}, {"name": "播放次数：23亿"}],
+                    "duration_seconds": 240 + index,
+                    "thumbnails": [{"url": f"https://example.com/{index}.jpg", "width": 120, "height": 120}],
+                    "category": "歌曲",
+                    "resultType": "song",
+                }
+                for index in range(1, 7)
+            ]
+
+    monkeypatch.setattr(main, "ytmusic_client", lambda: FakeClient())
+
+    entries = main.search_ytmusicapi_entries("Yellow Coldplay", 5)
+
+    assert len(entries) == 6
+    assert calls == [("Yellow Coldplay", "songs", 7)]
+    assert entries[0]["uploader"] == "Coldplay"
+    assert entries[0]["provider"] == "ytmusicapi"
 
 
 def test_recommendations_mix_history_and_personalized_results(isolated_library, monkeypatch):
@@ -229,6 +304,7 @@ def test_recommendations_mix_history_and_personalized_results(isolated_library, 
         )
     )
     asyncio.run(main.upsert_search_history(main.SearchHistoryEntry(query="The Weeknd")))
+    monkeypatch.setattr(main, "search_provider_order", lambda: ["ytmusicapi"])
 
     def fake_search(query, limit):
         normalized = query.lower()
@@ -245,12 +321,12 @@ def test_recommendations_mix_history_and_personalized_results(isolated_library, 
         return []
 
     main.SEARCH_RESULTS_CACHE.set(
-        main.build_search_cache_key("Coldplay", 6),
+        main.build_search_cache_key("Coldplay", 6, "ytmusicapi"),
         fake_search("Coldplay", 6),
         main.SEARCH_CACHE_TTL_SECONDS,
     )
     main.SEARCH_RESULTS_CACHE.set(
-        main.build_search_cache_key("The Weeknd", 6),
+        main.build_search_cache_key("The Weeknd", 6, "ytmusicapi"),
         fake_search("The Weeknd", 6),
         main.SEARCH_CACHE_TTL_SECONDS,
     )

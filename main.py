@@ -3,6 +3,7 @@ from collections import Counter
 from typing import Any, Optional
 from pathlib import Path
 from urllib.parse import quote
+import os
 import platform
 import shutil
 import socket
@@ -26,6 +27,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
+
+try:
+    from ytmusicapi import YTMusic
+except ImportError:  # pragma: no cover - optional dependency in local dev
+    YTMusic = None
 
 from app_meta import APP_BRAND_NAME, APP_VERSION, BACKEND_HOST, BACKEND_PORT, UPDATE_CHANNEL
 from app_paths import (
@@ -62,10 +68,12 @@ class SearchItem(BaseModel):
     query: str
     duration: Optional[int] = None
     durationText: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
     results: list[SearchItem]
+    provider: Optional[str] = None
 
 
 class VisualizeRequest(BaseModel):
@@ -78,11 +86,14 @@ class VisualizeResponse(BaseModel):
     artist: str
     cover: str
     audioSrc: str
+    proxyAudioSrc: Optional[str] = None
     audioExt: Optional[str] = None
     colors: list[str]
     theme: str
     videoId: Optional[str] = None
     query: Optional[str] = None
+    provider: Optional[str] = None
+    streamMode: Optional[str] = None
 
 
 class LibraryTrack(BaseModel):
@@ -210,6 +221,42 @@ COLOR_CACHE = TTLMemoryCache()
 RECOMMENDATIONS_CACHE = TTLMemoryCache()
 COLOR_WARMUP_IN_FLIGHT: set[str] = set()
 COLOR_WARMUP_LOCK = threading.Lock()
+HTTP_SESSION_CACHE: dict[tuple[str, str, str], requests.Session] = {}
+HTTP_SESSION_LOCK = threading.Lock()
+YTMUSIC_CLIENT: Any = None
+YTMUSIC_CLIENT_LOCK = threading.Lock()
+
+YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_DATA_API_KEY", "").strip()
+NAS_SEARCH_PROVIDER = os.getenv("NAS_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
+NAS_METADATA_PROXY_MODE = os.getenv("NAS_METADATA_PROXY_MODE", "auto").strip().lower() or "auto"
+NAS_MEDIA_TRANSPORT = os.getenv("NAS_MEDIA_TRANSPORT", "auto").strip().lower() or "auto"
+NAS_CUSTOM_PROXY_URL = os.getenv("NAS_CUSTOM_PROXY_URL", "").strip()
+NAS_SEARCH_REGION = (os.getenv("NAS_SEARCH_REGION", "CN").strip() or "CN").upper()
+NAS_SEARCH_LANGUAGE = os.getenv("NAS_SEARCH_LANGUAGE", "zh-CN").strip() or "zh-CN"
+DEFAULT_HTTP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+SUPPORTED_YTMUSIC_LANGUAGES = {
+    "ar",
+    "cs",
+    "de",
+    "en",
+    "es",
+    "fr",
+    "hi",
+    "it",
+    "ja",
+    "ko",
+    "nl",
+    "pt",
+    "ru",
+    "tr",
+    "ur",
+    "zh_CN",
+    "zh_TW",
+}
 
 
 def frontend_is_built() -> bool:
@@ -230,6 +277,122 @@ def port_is_open(port: int) -> bool:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def perf_counter_ms() -> float:
+    return time.perf_counter() * 1000.0
+
+
+def log_timing(event: str, **payload: Any) -> None:
+    normalized_parts = []
+    for key, value in payload.items():
+        if value is None:
+            continue
+        normalized_parts.append(f"{key}={value}")
+    print(f"[NAS] {event} {' '.join(normalized_parts)}".strip())
+
+
+def env_proxy_available() -> bool:
+    return bool(os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy"))
+
+
+def metadata_proxy_mode() -> str:
+    mode = NAS_METADATA_PROXY_MODE
+    if mode == "auto":
+        if NAS_CUSTOM_PROXY_URL:
+            return "custom"
+        if env_proxy_available():
+            return "system"
+        return "direct"
+    if mode == "custom" and not NAS_CUSTOM_PROXY_URL:
+        return "direct"
+    return mode
+
+
+def custom_proxy_mapping() -> dict[str, str]:
+    if not NAS_CUSTOM_PROXY_URL:
+        return {}
+    return {"http": NAS_CUSTOM_PROXY_URL, "https": NAS_CUSTOM_PROXY_URL}
+
+
+def get_http_session(kind: str, mode: str) -> requests.Session:
+    effective_mode = mode or "direct"
+    cache_key = (kind, effective_mode, NAS_CUSTOM_PROXY_URL)
+    with HTTP_SESSION_LOCK:
+        cached = HTTP_SESSION_CACHE.get(cache_key)
+        if cached:
+            return cached
+
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": DEFAULT_HTTP_USER_AGENT,
+                "Accept-Encoding": "gzip, deflate",
+                "Accept-Language": NAS_SEARCH_LANGUAGE.replace("_", "-"),
+            }
+        )
+        session.trust_env = effective_mode == "system"
+        if effective_mode == "custom":
+            session.trust_env = False
+            session.proxies.update(custom_proxy_mapping())
+        HTTP_SESSION_CACHE[cache_key] = session
+        return session
+
+
+def metadata_session() -> requests.Session:
+    return get_http_session("metadata", metadata_proxy_mode())
+
+
+def media_attempt_modes() -> list[str]:
+    if NAS_MEDIA_TRANSPORT == "direct":
+        return ["direct"]
+    if NAS_MEDIA_TRANSPORT == "proxy":
+        modes = []
+        if NAS_CUSTOM_PROXY_URL:
+            modes.append("custom")
+        if env_proxy_available():
+            modes.append("system")
+        if not modes:
+            modes.append("direct")
+        return modes
+
+    modes = ["direct"]
+    if NAS_CUSTOM_PROXY_URL:
+        modes.append("custom")
+    if env_proxy_available():
+        modes.append("system")
+    return list(dict.fromkeys(modes))
+
+
+def request_json(url: str, *, params: Optional[dict[str, Any]] = None, timeout: int = 12, kind: str = "metadata") -> Any:
+    session = metadata_session() if kind == "metadata" else get_http_session(kind, "direct")
+    response = session.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def request_text(url: str, *, timeout: int = 12, kind: str = "metadata") -> str:
+    session = metadata_session() if kind == "metadata" else get_http_session(kind, "direct")
+    response = session.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.text
+
+
+def request_media_response(url: str, *, headers: Optional[dict[str, str]] = None, timeout: int = 25, stream: bool = True) -> tuple[requests.Response, str]:
+    last_error: Exception | None = None
+    for mode in media_attempt_modes():
+        session = get_http_session("media", mode)
+        try:
+            response = session.get(url, stream=stream, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response, mode
+        except requests.RequestException as exc:
+            last_error = exc
+            log_timing("media_attempt_failed", mode=mode, error=exc.__class__.__name__)
+            continue
+    if last_error:
+        raise last_error
+    raise requests.RequestException("No media transport mode available")
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -486,6 +649,11 @@ def get_system_check() -> dict:
         "pythonVersion": sys.version.split()[0],
         "platform": platform.platform(),
         "ytDlpVersion": yt_dlp.version.__version__,
+        "ytMusicApiAvailable": YTMusic is not None,
+        "youtubeDataApiEnabled": bool(YOUTUBE_DATA_API_KEY),
+        "searchProvider": NAS_SEARCH_PROVIDER,
+        "metadataProxyMode": metadata_proxy_mode(),
+        "mediaTransport": NAS_MEDIA_TRANSPORT,
         "ffmpegAvailable": ffmpeg_available,
         "ffmpegBinary": ffmpeg_binary,
         "nodeAvailable": node_available,
@@ -506,8 +674,16 @@ def normalize_cache_text(value: str) -> str:
     return " ".join((value or "").strip().casefold().split())
 
 
-def build_search_cache_key(query: str, limit: int) -> str:
-    return f"{normalize_cache_text(query)}::{limit}"
+def build_search_cache_key(query: str, limit: int, provider: str = "auto", region: str = "", language: str = "") -> str:
+    return "::".join(
+        [
+            normalize_cache_text(query),
+            str(limit),
+            provider or "auto",
+            (region or NAS_SEARCH_REGION).upper(),
+            (language or NAS_SEARCH_LANGUAGE).lower(),
+        ]
+    )
 
 
 def build_playback_cache_key(video_id: str) -> str:
@@ -561,7 +737,7 @@ def get_dominant_colors(image_url: str, num_colors: int = 4) -> list[str]:
         if not image_url:
             return DEFAULT_VISUAL_COLORS
 
-        resp = requests.get(image_url, timeout=8)
+        resp = metadata_session().get(image_url, timeout=8)
         if resp.status_code != 200:
             return DEFAULT_VISUAL_COLORS
 
@@ -652,6 +828,7 @@ def search_item_from_entry(entry: dict, fallback_query: str = "") -> SearchItem 
         query=fallback_query or f"{title} {artist}".strip(),
         duration=duration,
         durationText=format_duration(duration),
+        provider=entry.get("provider"),
     )
 
 
@@ -670,6 +847,7 @@ def search_item_from_library_track(item: dict) -> SearchItem | None:
         query=item.get("query") or f"{title} {artist}".strip(),
         duration=None,
         durationText=None,
+        provider="library",
     )
 
 
@@ -724,6 +902,15 @@ def get_search_ydl_opts() -> dict:
 
 def get_media_ydl_opts() -> dict:
     return get_ydl_opts(prefer_audio_only=False, relaxed_clients=True)
+
+
+def get_fast_media_ydl_opts() -> dict:
+    opts = get_ydl_opts(prefer_audio_only=True, relaxed_clients=True)
+    extractor_args = opts.setdefault("extractor_args", {})
+    youtube_args = extractor_args.setdefault("youtube", {})
+    youtube_args["player_skip"] = ["configs", "webpage", "js", "initial_data"]
+    youtube_args.setdefault("player_client", ["android", "tv_simply", "web"])
+    return opts
 
 
 def audio_format_score(fmt: dict) -> int:
@@ -800,11 +987,28 @@ def extract_playback_info(video_id: str) -> dict:
     if cached is not CACHE_MISS:
         return cached
 
-    ydl_opts = get_media_ydl_opts()
-    ydl_opts.update({"skip_download": True, "logger": SilentYtdlpLogger()})
+    started_ms = perf_counter_ms()
+    info = None
+    last_error: Exception | None = None
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    for attempt_name, ydl_opts in (
+        ("fast", get_fast_media_ydl_opts()),
+        ("safe", get_media_ydl_opts()),
+    ):
+        try:
+            ydl_opts.update({"skip_download": True, "logger": SilentYtdlpLogger()})
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            if info:
+                log_timing("playback_info_resolved", video_id=video_id, resolve_ms=int(perf_counter_ms() - started_ms), attempt=attempt_name)
+                break
+        except Exception as exc:
+            last_error = exc
+            log_timing("playback_info_attempt_failed", video_id=video_id, attempt=attempt_name, error=exc.__class__.__name__)
+            continue
+
+    if not info and last_error:
+        raise last_error
 
     ttl = PLAYBACK_INFO_CACHE_TTL_SECONDS if info else PLAYBACK_INFO_NEGATIVE_CACHE_TTL_SECONDS
     PLAYBACK_INFO_CACHE.set(cache_key, info, ttl)
@@ -967,17 +1171,266 @@ def score_search_entry(query: str, entry: dict) -> int:
     return score
 
 
-def search_youtube_entries(query: str, limit: int) -> list[dict]:
+def parse_duration_text(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return normalize_duration_seconds(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+", text):
+        return normalize_duration_seconds(text)
+    parts = text.split(":")
+    if not all(part.isdigit() for part in parts):
+        return None
+    try:
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + int(part)
+        return normalize_duration_seconds(seconds)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_iso8601_duration(value: str) -> Optional[int]:
+    if not value:
+        return None
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value)
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def pick_thumbnail_url(thumbnails: Any) -> str:
+    if isinstance(thumbnails, list):
+        valid_items = [item for item in thumbnails if isinstance(item, dict) and item.get("url")]
+        if not valid_items:
+            return ""
+        valid_items.sort(key=lambda item: (item.get("width") or 0, item.get("height") or 0), reverse=True)
+        return str(valid_items[0].get("url") or "")
+    if isinstance(thumbnails, dict):
+        for key in ("maxres", "high", "medium", "default"):
+            candidate = thumbnails.get(key) or {}
+            if isinstance(candidate, dict) and candidate.get("url"):
+                return str(candidate.get("url") or "")
+    return ""
+
+
+def normalize_ytmusic_language(value: str) -> str:
+    normalized = (value or "").strip().replace("-", "_")
+    if normalized in SUPPORTED_YTMUSIC_LANGUAGES:
+        return normalized
+
+    base_language = normalized.split("_", 1)[0].lower()
+    if base_language == "zh":
+        return "zh_CN"
+    if base_language in SUPPORTED_YTMUSIC_LANGUAGES:
+        return base_language
+    return "en"
+
+
+def looks_like_metric_label(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return True
+    return bool(re.search(r"(播放次数|次观看|views?\b|watching\b)", text, re.IGNORECASE))
+
+
+def search_provider_order() -> list[str]:
+    mode = NAS_SEARCH_PROVIDER
+    if mode == "auto":
+        providers: list[str] = []
+        if YOUTUBE_DATA_API_KEY:
+            providers.append("youtube_data_api")
+        if YTMusic is not None:
+            providers.append("ytmusicapi")
+        providers.append("legacy_ytdlp")
+        return providers
+    return [mode]
+
+
+def normalize_catalog_entry(entry: dict, provider: str) -> dict:
+    normalized = dict(entry)
+    normalized["provider"] = provider
+    normalized["duration"] = normalize_duration_seconds(entry.get("duration"))
+    return normalized
+
+
+def ytmusic_client() -> Any:
+    global YTMUSIC_CLIENT
+    if YTMusic is None:
+        return None
+    with YTMUSIC_CLIENT_LOCK:
+        if YTMUSIC_CLIENT is None:
+            preferred_language = normalize_ytmusic_language(NAS_SEARCH_LANGUAGE)
+            mode = metadata_proxy_mode()
+            init_attempts: list[dict[str, Any]] = []
+
+            def append_language_attempts(language: str) -> None:
+                if mode == "direct":
+                    init_attempts.append({"language": language, "requests_session": get_http_session("ytmusic", "direct")})
+                elif mode == "custom" and NAS_CUSTOM_PROXY_URL:
+                    init_attempts.append({"language": language, "proxies": custom_proxy_mapping()})
+                init_attempts.append({"language": language})
+
+            append_language_attempts(preferred_language)
+            if preferred_language != "en":
+                append_language_attempts("en")
+            init_attempts.append({})
+
+            last_error: Exception | None = None
+            for kwargs in init_attempts:
+                try:
+                    YTMUSIC_CLIENT = YTMusic(**kwargs)
+                    break
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    last_error = exc
+                    continue
+
+            if YTMUSIC_CLIENT is None and last_error:
+                log_timing("ytmusic_client_fallback", preferred_language=preferred_language, mode=mode, error=last_error.__class__.__name__)
+        return YTMUSIC_CLIENT
+
+
+def search_youtube_data_api(query: str, limit: int) -> list[dict]:
+    if not YOUTUBE_DATA_API_KEY:
+        return []
+
+    search_size = min(max(limit * 2, limit + 4), 15)
+    started_ms = perf_counter_ms()
+    payload = request_json(
+        "https://www.googleapis.com/youtube/v3/search",
+        params={
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "maxResults": search_size,
+            "videoEmbeddable": "true",
+            "videoCategoryId": "10",
+            "regionCode": NAS_SEARCH_REGION,
+            "relevanceLanguage": NAS_SEARCH_LANGUAGE,
+            "fields": "items(id/videoId,snippet(title,description,channelTitle,thumbnails))",
+            "key": YOUTUBE_DATA_API_KEY,
+        },
+        timeout=10,
+        kind="metadata",
+    )
+    items = payload.get("items") or []
+    video_ids = [item.get("id", {}).get("videoId") for item in items if item.get("id", {}).get("videoId")]
+    durations_by_id: dict[str, Optional[int]] = {}
+
+    if video_ids:
+        details_payload = request_json(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "contentDetails",
+                "id": ",".join(video_ids),
+                "fields": "items(id,contentDetails/duration)",
+                "key": YOUTUBE_DATA_API_KEY,
+            },
+            timeout=10,
+            kind="metadata",
+        )
+        for item in details_payload.get("items") or []:
+            video_id = item.get("id")
+            if video_id:
+                durations_by_id[video_id] = parse_iso8601_duration((item.get("contentDetails") or {}).get("duration") or "")
+
+    entries = []
+    for item in items:
+        snippet = item.get("snippet") or {}
+        video_id = (item.get("id") or {}).get("videoId")
+        if not video_id:
+            continue
+        entries.append(
+            {
+                "id": video_id,
+                "title": snippet.get("title") or "Unknown Title",
+                "uploader": snippet.get("channelTitle") or "Unknown Artist",
+                "channel": snippet.get("channelTitle") or "Unknown Artist",
+                "description": snippet.get("description") or "",
+                "thumbnail": pick_thumbnail_url(snippet.get("thumbnails")),
+                "duration": durations_by_id.get(video_id),
+            }
+        )
+
+    log_timing("search_provider", provider="youtube_data_api", search_ms=int(perf_counter_ms() - started_ms), count=len(entries))
+    return [normalize_catalog_entry(entry, "youtube_data_api") for entry in entries]
+
+
+def search_ytmusicapi_entries(query: str, limit: int) -> list[dict]:
+    client = ytmusic_client()
+    if client is None:
+        return []
+
+    search_size = min(max(limit + 2, 6), 10)
+    combined_entries: list[dict] = []
+    seen_video_ids: set[str] = set()
+    started_ms = perf_counter_ms()
+    target_size = max(limit, 6)
+
+    for search_filter in ("songs", "videos"):
+        try:
+            results = client.search(query, filter=search_filter, limit=search_size)
+        except Exception as exc:
+            log_timing("search_provider_failed", provider=f"ytmusicapi:{search_filter}", error=exc.__class__.__name__)
+            continue
+
+        for result in results or []:
+            video_id = result.get("videoId")
+            if not video_id or video_id in seen_video_ids:
+                continue
+            seen_video_ids.add(video_id)
+
+            artists = result.get("artists") or []
+            artist_names = []
+            if isinstance(artists, list):
+                for artist in artists:
+                    if isinstance(artist, dict):
+                        name = str(artist.get("name") or "").strip()
+                        if name and not looks_like_metric_label(name):
+                            artist_names.append(name)
+                    elif artist:
+                        name = str(artist).strip()
+                        if name and not looks_like_metric_label(name):
+                            artist_names.append(name)
+            artist = ", ".join(artist_names) or result.get("author") or result.get("byline") or result.get("subtitle") or "Unknown Artist"
+            combined_entries.append(
+                {
+                    "id": video_id,
+                    "title": result.get("title") or "Unknown Title",
+                    "uploader": artist,
+                    "channel": result.get("author") or artist,
+                    "description": " ".join(str(part) for part in [result.get("category"), result.get("resultType")] if part),
+                    "thumbnail": pick_thumbnail_url(result.get("thumbnails")),
+                    "duration": normalize_duration_seconds(result.get("duration_seconds")) or parse_duration_text(result.get("duration")),
+                }
+            )
+            if len(combined_entries) >= target_size:
+                break
+
+        if len(combined_entries) >= target_size:
+            break
+
+    log_timing("search_provider", provider="ytmusicapi", search_ms=int(perf_counter_ms() - started_ms), count=len(combined_entries))
+    return [normalize_catalog_entry(entry, "ytmusicapi") for entry in combined_entries]
+
+
+def search_youtube_entries_legacy(query: str, limit: int) -> list[dict]:
     normalized_query = " ".join((query or "").split())
     if not normalized_query:
         return []
 
-    cache_key = build_search_cache_key(normalized_query, limit)
-    cached = SEARCH_RESULTS_CACHE.get(cache_key)
-    if cached is not CACHE_MISS:
-        return list(cached)
-
     search_size = min(max(limit * 2, limit + 4), 30)
+    started_ms = perf_counter_ms()
     ydl_opts = get_search_ydl_opts()
     ydl_opts.update(
         {
@@ -1000,19 +1453,55 @@ def search_youtube_entries(query: str, limit: int) -> list[dict]:
         ),
         reverse=True,
     )
-    result = ranked_entries[:limit]
-    ttl = SEARCH_CACHE_TTL_SECONDS if result else SEARCH_NEGATIVE_CACHE_TTL_SECONDS
-    SEARCH_RESULTS_CACHE.set(cache_key, result, ttl)
-    return result
+    log_timing("search_provider", provider="legacy_ytdlp", search_ms=int(perf_counter_ms() - started_ms), count=len(ranked_entries))
+    return [normalize_catalog_entry(entry, "legacy_ytdlp") for entry in ranked_entries[:limit]]
+
+
+def search_entries_with_provider(query: str, limit: int, provider: str, *, allow_network: bool = True) -> list[dict]:
+    cache_key = build_search_cache_key(query, limit, provider)
+    cached = SEARCH_RESULTS_CACHE.get(cache_key)
+    if cached is not CACHE_MISS:
+        return list(cached)
+    if not allow_network:
+        return []
+
+    try:
+        if provider == "youtube_data_api":
+            results = search_youtube_data_api(query, limit)
+        elif provider == "ytmusicapi":
+            results = search_ytmusicapi_entries(query, limit)
+        else:
+            results = search_youtube_entries_legacy(query, limit)
+    except Exception as exc:
+        log_timing("search_provider_failed", provider=provider, error=exc.__class__.__name__)
+        results = []
+
+    ttl = SEARCH_CACHE_TTL_SECONDS if results else SEARCH_NEGATIVE_CACHE_TTL_SECONDS
+    SEARCH_RESULTS_CACHE.set(cache_key, results, ttl)
+    return results
+
+
+def search_youtube_entries(query: str, limit: int, *, allow_network: bool = True) -> list[dict]:
+    normalized_query = " ".join((query or "").split())
+    if not normalized_query:
+        return []
+
+    for provider in search_provider_order():
+        results = search_entries_with_provider(normalized_query, limit, provider, allow_network=allow_network)
+        if results:
+            return results[:limit]
+    return []
 
 
 def build_search_response_payload(query: str, limit: int) -> dict:
+    provider = None
     results: list[SearchItem] = []
     for entry in search_youtube_entries(query, limit):
+        provider = provider or entry.get("provider")
         item = search_item_from_entry(entry)
         if item:
             results.append(item)
-    return {"results": results}
+    return {"results": results, "provider": provider}
 
 
 def build_visualize_error_payload(detail: str, status_code: int) -> dict:
@@ -1034,6 +1523,7 @@ def build_visualize_response_payload(query: str = "", video_id: str = "") -> dic
         return dict(cached)
 
     request_label = video_id or query or ""
+    started_ms = perf_counter_ms()
     print(f"Visualizing: {request_label}")
 
     def resolve_candidate(candidate: dict) -> dict:
@@ -1062,17 +1552,22 @@ def build_visualize_response_payload(query: str = "", video_id: str = "") -> dic
         extracted_colors = get_cached_cover_colors(cover_url) or warm_cover_colors(cover_url)
         theme = analyze_theme(title, extracted_colors)
         proxy_endpoint = f"/proxy-stream?url={quote(audio_url, safe='')}"
+        stream_mode = "proxy" if NAS_MEDIA_TRANSPORT == "proxy" else "direct"
+        primary_audio_src = proxy_endpoint if stream_mode == "proxy" else audio_url
 
         return {
             "title": title,
             "artist": artist,
             "cover": cover_url,
-            "audioSrc": proxy_endpoint,
+            "audioSrc": primary_audio_src,
+            "proxyAudioSrc": proxy_endpoint,
             "audioExt": audio_ext,
             "colors": extracted_colors,
             "theme": theme,
             "videoId": candidate_video_id,
             "query": query_text,
+            "provider": candidate.get("provider"),
+            "streamMode": stream_mode,
         }
 
     last_error: Exception | None = None
@@ -1081,6 +1576,13 @@ def build_visualize_response_payload(query: str = "", video_id: str = "") -> dic
         try:
             payload = resolve_candidate({"id": video_id})
             cache_visualize_payload(query, video_id, payload, VISUALIZE_CACHE_TTL_SECONDS)
+            log_timing(
+                "visualize_resolved",
+                resolve_ms=int(perf_counter_ms() - started_ms),
+                stream_mode=payload.get("streamMode"),
+                provider=payload.get("provider") or "video_lookup",
+                fallback_reason="none",
+            )
             return payload
         except Exception as exc:
             last_error = exc
@@ -1095,6 +1597,13 @@ def build_visualize_response_payload(query: str = "", video_id: str = "") -> dic
             try:
                 payload = resolve_candidate(match)
                 cache_visualize_payload(query, payload.get("videoId") or "", payload, VISUALIZE_CACHE_TTL_SECONDS)
+                log_timing(
+                    "visualize_resolved",
+                    resolve_ms=int(perf_counter_ms() - started_ms),
+                    stream_mode=payload.get("streamMode"),
+                    provider=payload.get("provider"),
+                    fallback_reason="search_fallback",
+                )
                 return payload
             except Exception as exc:
                 last_error = exc
@@ -1121,29 +1630,32 @@ def fetch_lyrics_payload(
     if cached is not CACHE_MISS:
         return dict(cached)
 
-    headers = {"User-Agent": "NSRL-Local-V3 (https://github.com/)"}
     clean_track, clean_artist = extract_track_and_artist(track_name, artist_name)
     target_duration = normalize_duration_seconds(audio_duration)
     target_lang = get_target_language(track_name, artist_name)
 
+    if video_id:
+        ytmusic_payload = fetch_ytmusic_lyrics(video_id)
+        if ytmusic_payload:
+            LYRICS_CACHE.set(cache_key, ytmusic_payload, LYRICS_CACHE_TTL_SECONDS)
+            return ytmusic_payload
+
     url_get = f"https://lrclib.net/api/get?track_name={quote(clean_track)}&artist_name={quote(clean_artist)}"
     try:
-        resp = requests.get(url_get, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
-                if target_duration is not None:
-                    exact_diff = duration_diff_seconds(data, target_duration)
-                    if exact_diff is not None and exact_diff > 2:
-                        data = None
-                if data:
-                    payload = {
-                        "syncedLyrics": data.get("syncedLyrics"),
-                        "plainLyrics": data.get("plainLyrics"),
-                        "source": "lrclib",
-                    }
-                    LYRICS_CACHE.set(cache_key, payload, LYRICS_CACHE_TTL_SECONDS)
-                    return payload
+        data = request_json(url_get, timeout=10, kind="metadata")
+        if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
+            if target_duration is not None:
+                exact_diff = duration_diff_seconds(data, target_duration)
+                if exact_diff is not None and exact_diff > 2:
+                    data = None
+            if data:
+                payload = {
+                    "syncedLyrics": data.get("syncedLyrics"),
+                    "plainLyrics": data.get("plainLyrics"),
+                    "source": "lrclib",
+                }
+                LYRICS_CACHE.set(cache_key, payload, LYRICS_CACHE_TTL_SECONDS)
+                return payload
     except Exception as exc:
         print(f"Exact match failed: {exc}")
 
@@ -1176,34 +1688,32 @@ def fetch_lyrics_payload(
 
     def do_search(q: str, target_trk: str, target_art: str):
         try:
-            response = requests.get(f"https://lrclib.net/api/search?q={quote(q)}", headers=headers, timeout=10)
-            if response.status_code == 200:
-                results = response.json()
-                if results and isinstance(results, list):
-                    valid_results = [
-                        res for res in results
-                        if is_valid_match(res.get("trackName"), res.get("artistName"), target_trk, target_art)
+            results = request_json(f"https://lrclib.net/api/search?q={quote(q)}", timeout=10, kind="metadata")
+            if results and isinstance(results, list):
+                valid_results = [
+                    res for res in results
+                    if is_valid_match(res.get("trackName"), res.get("artistName"), target_trk, target_art)
+                ]
+
+                if not valid_results:
+                    return None
+
+                if target_duration is not None:
+                    close_matches = [
+                        res for res in valid_results
+                        if (duration_diff_seconds(res, target_duration) is not None and duration_diff_seconds(res, target_duration) <= 2)
                     ]
+                    if close_matches:
+                        valid_results = close_matches
 
-                    if not valid_results:
-                        return None
-
-                    if target_duration is not None:
-                        close_matches = [
-                            res for res in valid_results
-                            if (duration_diff_seconds(res, target_duration) is not None and duration_diff_seconds(res, target_duration) <= 2)
-                        ]
-                        if close_matches:
-                            valid_results = close_matches
-
-                    valid_results.sort(key=match_priority)
-                    best_match = valid_results[0]
-                    if best_match.get("syncedLyrics") or best_match.get("plainLyrics"):
-                        return {
-                            "syncedLyrics": best_match.get("syncedLyrics"),
-                            "plainLyrics": best_match.get("plainLyrics"),
-                            "source": "lrclib",
-                        }
+                valid_results.sort(key=match_priority)
+                best_match = valid_results[0]
+                if best_match.get("syncedLyrics") or best_match.get("plainLyrics"):
+                    return {
+                        "syncedLyrics": best_match.get("syncedLyrics"),
+                        "plainLyrics": best_match.get("plainLyrics"),
+                        "source": "lrclib",
+                    }
         except Exception:
             pass
         return None
@@ -1365,7 +1875,11 @@ def build_recommendations_payload() -> dict:
             break
 
     for seed_query in personalized_recommendation_seeds(favorites, history, searches):
-        cached_results = SEARCH_RESULTS_CACHE.get(build_search_cache_key(seed_query, 6))
+        cached_results = CACHE_MISS
+        for provider in search_provider_order():
+            cached_results = SEARCH_RESULTS_CACHE.get(build_search_cache_key(seed_query, 6, provider))
+            if cached_results is not CACHE_MISS:
+                break
         if cached_results is CACHE_MISS:
             continue
         for entry in cached_results:
@@ -1639,9 +2153,17 @@ async def search_tracks(req: SearchRequest):
         raise HTTPException(status_code=422, detail="Query is required")
 
     limit = max(1, min(int(req.limit), 15))
+    started_ms = perf_counter_ms()
 
     try:
-        return await run_in_threadpool(build_search_response_payload, query, limit)
+        payload = await run_in_threadpool(build_search_response_payload, query, limit)
+        log_timing(
+            "search_completed",
+            search_ms=int(perf_counter_ms() - started_ms),
+            provider=payload.get("provider"),
+            count=len(payload.get("results") or []),
+        )
+        return payload
     except Exception as exc:
         print(f"Search error: {exc}")
         raise HTTPException(status_code=500, detail="Search failed") from exc
@@ -1835,16 +2357,70 @@ def parse_xml_captions(payload: str) -> list[tuple[float, str]]:
     return entries
 
 
+def extract_ytmusic_browse_id(payload: Any) -> str | None:
+    if isinstance(payload, str):
+        return payload if payload.startswith("M") else None
+    if isinstance(payload, dict):
+        for key in ("lyricsBrowseId", "browseId", "lyrics"):
+            candidate = payload.get(key)
+            browse_id = extract_ytmusic_browse_id(candidate)
+            if browse_id:
+                return browse_id
+        for value in payload.values():
+            browse_id = extract_ytmusic_browse_id(value)
+            if browse_id:
+                return browse_id
+    if isinstance(payload, list):
+        for item in payload:
+            browse_id = extract_ytmusic_browse_id(item)
+            if browse_id:
+                return browse_id
+    return None
+
+
+def fetch_ytmusic_lyrics(video_id: str) -> dict | None:
+    client = ytmusic_client()
+    if client is None or not video_id:
+        return None
+
+    try:
+        try:
+            watch_payload = client.get_watch_playlist(videoId=video_id, limit=1)
+        except TypeError:
+            watch_payload = client.get_watch_playlist(video_id, limit=1)
+    except Exception as exc:
+        log_timing("ytmusic_lyrics_failed", step="watch", error=exc.__class__.__name__)
+        return None
+
+    browse_id = extract_ytmusic_browse_id(watch_payload)
+    if not browse_id:
+        return None
+
+    try:
+        lyrics_payload = client.get_lyrics(browse_id)
+    except Exception as exc:
+        log_timing("ytmusic_lyrics_failed", step="lyrics", error=exc.__class__.__name__)
+        return None
+
+    if isinstance(lyrics_payload, dict):
+        plain_lyrics = lyrics_payload.get("lyrics") or lyrics_payload.get("text")
+        if isinstance(plain_lyrics, list):
+            plain_lyrics = "\n".join(str(line) for line in plain_lyrics if line)
+        if plain_lyrics:
+            return {
+                "syncedLyrics": None,
+                "plainLyrics": str(plain_lyrics),
+                "source": "ytmusicapi",
+            }
+    return None
+
+
 def fetch_youtube_captions(video_id: str, target_lang: str) -> dict | None:
     if not video_id:
         return None
 
-    ydl_opts = get_media_ydl_opts()
-    ydl_opts.update({"skip_download": True, "ignoreerrors": True, "logger": SilentYtdlpLogger()})
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        info = extract_playback_info(video_id)
     except Exception as exc:
         print(f"YouTube captions info failed: {exc}")
         return None
@@ -1865,13 +2441,11 @@ def fetch_youtube_captions(video_id: str, target_lang: str) -> dict | None:
         if not chosen or not chosen.get("url"):
             continue
         try:
-            response = requests.get(chosen["url"], timeout=15)
-            response.raise_for_status()
             ext = chosen.get("ext")
             if ext == "json3":
-                parsed_entries = parse_json3_captions(response.json())
+                parsed_entries = parse_json3_captions(request_json(chosen["url"], timeout=15, kind="metadata"))
             else:
-                parsed_entries = parse_xml_captions(response.text)
+                parsed_entries = parse_xml_captions(request_text(chosen["url"], timeout=15, kind="metadata"))
 
             payload = build_lrc_payload(parsed_entries, source)
             if payload:
@@ -1929,22 +2503,16 @@ async def visualize(req: VisualizeRequest):
 @app.get("/proxy-stream")
 async def proxy_stream(url: str, request: Request):
     try:
+        started_ms = perf_counter_ms()
         print(f"Proxying stream: {url[:120]}")
 
-        upstream_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        }
+        upstream_headers = {"User-Agent": DEFAULT_HTTP_USER_AGENT}
 
         range_header = request.headers.get("range")
         if range_header:
             upstream_headers["Range"] = range_header
 
-        upstream = requests.get(url, stream=True, headers=upstream_headers, timeout=25)
-        upstream.raise_for_status()
+        upstream, transport_mode = request_media_response(url, headers=upstream_headers, timeout=25, stream=True)
 
         media_type = upstream.headers.get("content-type", "audio/mp4")
         response_headers = {}
@@ -1955,6 +2523,13 @@ async def proxy_stream(url: str, request: Request):
 
         if "accept-ranges" not in response_headers:
             response_headers["accept-ranges"] = "bytes"
+
+        log_timing(
+            "proxy_stream_opened",
+            fetch_ms=int(perf_counter_ms() - started_ms),
+            stream_mode=transport_mode,
+            range="yes" if range_header else "no",
+        )
 
         def iterfile():
             try:
@@ -1981,16 +2556,14 @@ async def proxy_stream(url: str, request: Request):
 @app.get("/download")
 async def download_track(url: str, filename: str = "music.mp3"):
     try:
+        started_ms = perf_counter_ms()
         print(f"Downloading stream: {url[:120]}")
-        upstream_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        }
-        upstream = requests.get(url, stream=True, headers=upstream_headers, timeout=60)
-        upstream.raise_for_status()
+        upstream, transport_mode = request_media_response(
+            url,
+            headers={"User-Agent": DEFAULT_HTTP_USER_AGENT},
+            timeout=60,
+            stream=True,
+        )
 
         safe_filename = safe_download_filename(filename)
         ascii_filename = ascii_download_filename(safe_filename)
@@ -2009,6 +2582,13 @@ async def download_track(url: str, filename: str = "music.mp3"):
         content_length = upstream.headers.get("content-length")
         if content_length:
             response_headers["Content-Length"] = content_length
+
+        log_timing(
+            "download_opened",
+            fetch_ms=int(perf_counter_ms() - started_ms),
+            stream_mode=transport_mode,
+            filename=safe_filename,
+        )
 
         def iterfile():
             try:
