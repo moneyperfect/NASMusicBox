@@ -1,5 +1,6 @@
 ﻿from io import BytesIO
-from typing import Optional
+from collections import Counter
+from typing import Any, Optional
 from pathlib import Path
 from urllib.parse import quote
 import platform
@@ -10,6 +11,8 @@ import difflib
 import html
 import re
 import sqlite3
+import threading
+import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -19,6 +22,7 @@ import requests
 import uvicorn
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -113,6 +117,20 @@ class LibraryResponse(BaseModel):
     recentDownloads: list[DownloadHistoryEntry]
 
 
+class RecommendationSection(BaseModel):
+    id: str
+    title: str
+    subtitle: str = ""
+    items: list[SearchItem]
+    source: str = "mixed"
+
+
+class RecommendationsResponse(BaseModel):
+    mode: str
+    generatedAt: str
+    sections: list[RecommendationSection]
+
+
 class LyricsOffsetEntry(BaseModel):
     trackKey: str
     videoId: Optional[str] = None
@@ -131,6 +149,67 @@ class SilentYtdlpLogger:
 
     def error(self, _: str) -> None:
         pass
+
+
+DEFAULT_VISUAL_COLORS = ["#49dcb1", "#08111d", "#02060c"]
+SEARCH_CACHE_TTL_SECONDS = 180
+SEARCH_NEGATIVE_CACHE_TTL_SECONDS = 35
+VISUALIZE_CACHE_TTL_SECONDS = 75
+VISUALIZE_NEGATIVE_CACHE_TTL_SECONDS = 20
+PLAYBACK_INFO_CACHE_TTL_SECONDS = 120
+PLAYBACK_INFO_NEGATIVE_CACHE_TTL_SECONDS = 25
+LYRICS_CACHE_TTL_SECONDS = 60 * 60 * 6
+LYRICS_NEGATIVE_CACHE_TTL_SECONDS = 60 * 8
+COLOR_CACHE_TTL_SECONDS = 60 * 60 * 24
+RECOMMENDATIONS_CACHE_TTL_SECONDS = 45
+RECOMMENDATIONS_MIN_ITEMS = 4
+CACHE_MISS = object()
+
+CURATED_RECOMMENDATION_SEEDS = [
+    {"title": "Yellow", "artist": "Coldplay", "query": "Yellow Coldplay"},
+    {"title": "Blinding Lights", "artist": "The Weeknd", "query": "Blinding Lights The Weeknd"},
+    {"title": "Take On Me", "artist": "a-ha", "query": "Take On Me a-ha"},
+    {"title": "A Thousand Years", "artist": "Christina Perri", "query": "A Thousand Years Christina Perri"},
+    {"title": "Nightcall", "artist": "Kavinsky", "query": "Nightcall Kavinsky"},
+    {"title": "Viva La Vida", "artist": "Coldplay", "query": "Viva La Vida Coldplay"},
+]
+
+
+class TTLMemoryCache:
+    def __init__(self) -> None:
+        self._items: dict[str, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str, default: Any = CACHE_MISS) -> Any:
+        now = time.monotonic()
+        with self._lock:
+            entry = self._items.get(key)
+            if not entry:
+                return default
+            expires_at, value = entry
+            if expires_at <= now:
+                self._items.pop(key, None)
+                return default
+            return value
+
+    def set(self, key: str, value: Any, ttl_seconds: int) -> Any:
+        with self._lock:
+            self._items[key] = (time.monotonic() + max(1, int(ttl_seconds)), value)
+        return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+SEARCH_RESULTS_CACHE = TTLMemoryCache()
+PLAYBACK_INFO_CACHE = TTLMemoryCache()
+VISUALIZE_CACHE = TTLMemoryCache()
+LYRICS_CACHE = TTLMemoryCache()
+COLOR_CACHE = TTLMemoryCache()
+RECOMMENDATIONS_CACHE = TTLMemoryCache()
+COLOR_WARMUP_IN_FLIGHT: set[str] = set()
+COLOR_WARMUP_LOCK = threading.Lock()
 
 
 def frontend_is_built() -> bool:
@@ -423,24 +502,112 @@ def get_system_check() -> dict:
     }
 
 
+def normalize_cache_text(value: str) -> str:
+    return " ".join((value or "").strip().casefold().split())
+
+
+def build_search_cache_key(query: str, limit: int) -> str:
+    return f"{normalize_cache_text(query)}::{limit}"
+
+
+def build_playback_cache_key(video_id: str) -> str:
+    return f"playback::{(video_id or '').strip()}"
+
+
+def build_visualize_cache_key(query: str = "", video_id: str = "") -> str:
+    return f"visualize::{normalize_cache_text(video_id)}::{normalize_cache_text(query)}"
+
+
+def build_lyrics_cache_key(
+    track_name: str,
+    artist_name: str = "",
+    audio_duration: Optional[float] = None,
+    video_id: str = "",
+) -> str:
+    rounded_duration = normalize_duration_seconds(audio_duration) or 0
+    return "::".join(
+        [
+            normalize_cache_text(track_name),
+            normalize_cache_text(artist_name),
+            str(rounded_duration),
+            normalize_cache_text(video_id),
+        ]
+    )
+
+
+def make_track_identity(video_id: Optional[str], title: str, artist: str) -> str:
+    if video_id:
+        return f"vid:{video_id}"
+    return f"{normalize_cache_text(title)}::{normalize_cache_text(artist)}"
+
+
+def recommendation_cache_key() -> str:
+    favorites = fetch_library_tracks("favorites", "saved_at", 12)
+    history = fetch_library_tracks("play_history", "played_at", 12)
+    searches = fetch_recent_searches(8)
+
+    segments = []
+    for item in favorites:
+        segments.append(f"f:{item['key']}:{item.get('savedAt') or ''}")
+    for item in history:
+        segments.append(f"h:{item['key']}:{item.get('playedAt') or ''}")
+    for item in searches:
+        segments.append(f"s:{normalize_cache_text(item.get('query') or '')}:{item.get('searchedAt') or ''}")
+    return "|".join(segments) or "empty"
+
+
 def get_dominant_colors(image_url: str, num_colors: int = 4) -> list[str]:
     try:
         if not image_url:
-            return ["#333333", "#000000"]
+            return DEFAULT_VISUAL_COLORS
 
         resp = requests.get(image_url, timeout=8)
         if resp.status_code != 200:
-            return ["#333333", "#000000"]
+            return DEFAULT_VISUAL_COLORS
 
         image = BytesIO(resp.content)
         colors = colorgram.extract(image, num_colors)
         hex_colors = [f"#{c.rgb.r:02x}{c.rgb.g:02x}{c.rgb.b:02x}" for c in colors]
         while len(hex_colors) < 2:
-            hex_colors.append("#333333")
+            hex_colors.append(DEFAULT_VISUAL_COLORS[min(len(hex_colors), len(DEFAULT_VISUAL_COLORS) - 1)])
         return hex_colors
     except Exception as exc:
         print(f"Color extraction failed: {exc}")
-        return ["#555555", "#1a1a1a", "#000000"]
+        return DEFAULT_VISUAL_COLORS
+
+
+def get_cached_cover_colors(image_url: str) -> list[str] | None:
+    if not image_url:
+        return DEFAULT_VISUAL_COLORS
+
+    cached = COLOR_CACHE.get(image_url)
+    if cached is CACHE_MISS:
+        return None
+    return list(cached)
+
+
+def warm_cover_colors(image_url: str) -> list[str]:
+    if not image_url:
+        return DEFAULT_VISUAL_COLORS
+
+    cached = get_cached_cover_colors(image_url)
+    if cached:
+        return cached
+
+    with COLOR_WARMUP_LOCK:
+        if image_url in COLOR_WARMUP_IN_FLIGHT:
+            return DEFAULT_VISUAL_COLORS
+        COLOR_WARMUP_IN_FLIGHT.add(image_url)
+
+    def worker() -> None:
+        try:
+            COLOR_CACHE.set(image_url, get_dominant_colors(image_url), COLOR_CACHE_TTL_SECONDS)
+        finally:
+            with COLOR_WARMUP_LOCK:
+                COLOR_WARMUP_IN_FLIGHT.discard(image_url)
+
+    threading.Thread(target=worker, name="nas-cover-colors", daemon=True).start()
+    return DEFAULT_VISUAL_COLORS
 
 
 def analyze_theme(title: str, _: list[str]) -> str:
@@ -464,6 +631,46 @@ def format_duration(seconds: Optional[int]) -> Optional[str]:
     except (TypeError, ValueError):
         return None
     return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def search_item_from_entry(entry: dict, fallback_query: str = "") -> SearchItem | None:
+    if not isinstance(entry, dict):
+        return None
+
+    video_id = entry.get("id")
+    title = entry.get("title") or "Unknown Title"
+    artist = entry.get("uploader") or entry.get("channel") or "Unknown Artist"
+    if not video_id:
+        return None
+
+    duration = normalize_duration_seconds(entry.get("duration"))
+    return SearchItem(
+        title=title,
+        artist=artist,
+        cover=entry.get("thumbnail") or "",
+        videoId=video_id,
+        query=fallback_query or f"{title} {artist}".strip(),
+        duration=duration,
+        durationText=format_duration(duration),
+    )
+
+
+def search_item_from_library_track(item: dict) -> SearchItem | None:
+    if not isinstance(item, dict):
+        return None
+    title = item.get("title") or ""
+    artist = item.get("artist") or ""
+    if not title and not artist:
+        return None
+    return SearchItem(
+        title=title or "Unknown Title",
+        artist=artist or "Unknown Artist",
+        cover=item.get("cover") or "",
+        videoId=item.get("videoId") or "",
+        query=item.get("query") or f"{title} {artist}".strip(),
+        duration=None,
+        durationText=None,
+    )
 
 
 def safe_download_filename(filename: str) -> str:
@@ -588,11 +795,20 @@ def extract_playback_info(video_id: str) -> dict:
     if not video_id:
         raise HTTPException(status_code=422, detail="videoId is required")
 
+    cache_key = build_playback_cache_key(video_id)
+    cached = PLAYBACK_INFO_CACHE.get(cache_key)
+    if cached is not CACHE_MISS:
+        return cached
+
     ydl_opts = get_media_ydl_opts()
     ydl_opts.update({"skip_download": True, "logger": SilentYtdlpLogger()})
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+
+    ttl = PLAYBACK_INFO_CACHE_TTL_SECONDS if info else PLAYBACK_INFO_NEGATIVE_CACHE_TTL_SECONDS
+    PLAYBACK_INFO_CACHE.set(cache_key, info, ttl)
+    return info
 
 
 def dedupe_entries(entries: list[dict], limit: int) -> list[dict]:
@@ -756,6 +972,11 @@ def search_youtube_entries(query: str, limit: int) -> list[dict]:
     if not normalized_query:
         return []
 
+    cache_key = build_search_cache_key(normalized_query, limit)
+    cached = SEARCH_RESULTS_CACHE.get(cache_key)
+    if cached is not CACHE_MISS:
+        return list(cached)
+
     search_size = min(max(limit * 2, limit + 4), 30)
     ydl_opts = get_search_ydl_opts()
     ydl_opts.update(
@@ -779,7 +1000,418 @@ def search_youtube_entries(query: str, limit: int) -> list[dict]:
         ),
         reverse=True,
     )
-    return ranked_entries[:limit]
+    result = ranked_entries[:limit]
+    ttl = SEARCH_CACHE_TTL_SECONDS if result else SEARCH_NEGATIVE_CACHE_TTL_SECONDS
+    SEARCH_RESULTS_CACHE.set(cache_key, result, ttl)
+    return result
+
+
+def build_search_response_payload(query: str, limit: int) -> dict:
+    results: list[SearchItem] = []
+    for entry in search_youtube_entries(query, limit):
+        item = search_item_from_entry(entry)
+        if item:
+            results.append(item)
+    return {"results": results}
+
+
+def build_visualize_error_payload(detail: str, status_code: int) -> dict:
+    return {"__error__": True, "detail": detail, "statusCode": status_code}
+
+
+def cache_visualize_payload(query: str, video_id: str, payload: dict, ttl_seconds: int) -> None:
+    VISUALIZE_CACHE.set(build_visualize_cache_key(query=query, video_id=video_id), payload, ttl_seconds)
+    if video_id:
+        VISUALIZE_CACHE.set(build_visualize_cache_key(video_id=video_id), payload, ttl_seconds)
+
+
+def build_visualize_response_payload(query: str = "", video_id: str = "") -> dict:
+    cache_key = build_visualize_cache_key(query=query, video_id=video_id)
+    cached = VISUALIZE_CACHE.get(cache_key)
+    if cached is not CACHE_MISS:
+        if isinstance(cached, dict) and cached.get("__error__"):
+            raise HTTPException(status_code=int(cached.get("statusCode") or 502), detail=cached.get("detail") or "Visualize failed")
+        return dict(cached)
+
+    request_label = video_id or query or ""
+    print(f"Visualizing: {request_label}")
+
+    def resolve_candidate(candidate: dict) -> dict:
+        candidate_video_id = candidate.get("id")
+        if not candidate_video_id:
+            raise RuntimeError("missing video id")
+
+        video_data = extract_playback_info(candidate_video_id)
+        audio_format = select_preferred_audio_format(video_data)
+        audio_url = audio_format.get("url") if audio_format else video_data.get("url")
+        if not audio_url:
+            raise RuntimeError("missing playable stream URL")
+
+        title = video_data.get("title") or candidate.get("title") or "Unknown Title"
+        artist = video_data.get("uploader") or video_data.get("channel") or candidate.get("uploader") or "Unknown Artist"
+        cover_url = video_data.get("thumbnail") or candidate.get("thumbnail") or ""
+        query_text = query or f"{title} {artist}".strip()
+        audio_ext = (
+            (audio_format or {}).get("audio_ext")
+            or (audio_format or {}).get("ext")
+            or "m4a"
+        )
+        if audio_ext == "none":
+            audio_ext = (audio_format or {}).get("ext") or "m4a"
+
+        extracted_colors = get_cached_cover_colors(cover_url) or warm_cover_colors(cover_url)
+        theme = analyze_theme(title, extracted_colors)
+        proxy_endpoint = f"/proxy-stream?url={quote(audio_url, safe='')}"
+
+        return {
+            "title": title,
+            "artist": artist,
+            "cover": cover_url,
+            "audioSrc": proxy_endpoint,
+            "audioExt": audio_ext,
+            "colors": extracted_colors,
+            "theme": theme,
+            "videoId": candidate_video_id,
+            "query": query_text,
+        }
+
+    last_error: Exception | None = None
+
+    if video_id:
+        try:
+            payload = resolve_candidate({"id": video_id})
+            cache_visualize_payload(query, video_id, payload, VISUALIZE_CACHE_TTL_SECONDS)
+            return payload
+        except Exception as exc:
+            last_error = exc
+
+    seen_video_ids: set[str] = {video_id} if video_id else set()
+    if query:
+        for match in search_youtube_entries(query, 6):
+            match_video_id = match.get("id")
+            if not match_video_id or match_video_id in seen_video_ids:
+                continue
+            seen_video_ids.add(match_video_id)
+            try:
+                payload = resolve_candidate(match)
+                cache_visualize_payload(query, payload.get("videoId") or "", payload, VISUALIZE_CACHE_TTL_SECONDS)
+                return payload
+            except Exception as exc:
+                last_error = exc
+                continue
+
+    if last_error:
+        error_payload = build_visualize_error_payload("Unable to resolve a playable stream", 502)
+        VISUALIZE_CACHE.set(cache_key, error_payload, VISUALIZE_NEGATIVE_CACHE_TTL_SECONDS)
+        raise HTTPException(status_code=502, detail="Unable to resolve a playable stream") from last_error
+
+    error_payload = build_visualize_error_payload("Song not found", 404)
+    VISUALIZE_CACHE.set(cache_key, error_payload, VISUALIZE_NEGATIVE_CACHE_TTL_SECONDS)
+    raise HTTPException(status_code=404, detail="Song not found")
+
+
+def fetch_lyrics_payload(
+    track_name: str,
+    artist_name: str = "",
+    audio_duration: Optional[float] = None,
+    video_id: str = "",
+) -> dict:
+    cache_key = build_lyrics_cache_key(track_name, artist_name, audio_duration, video_id)
+    cached = LYRICS_CACHE.get(cache_key)
+    if cached is not CACHE_MISS:
+        return dict(cached)
+
+    headers = {"User-Agent": "NSRL-Local-V3 (https://github.com/)"}
+    clean_track, clean_artist = extract_track_and_artist(track_name, artist_name)
+    target_duration = normalize_duration_seconds(audio_duration)
+    target_lang = get_target_language(track_name, artist_name)
+
+    url_get = f"https://lrclib.net/api/get?track_name={quote(clean_track)}&artist_name={quote(clean_artist)}"
+    try:
+        resp = requests.get(url_get, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
+                if target_duration is not None:
+                    exact_diff = duration_diff_seconds(data, target_duration)
+                    if exact_diff is not None and exact_diff > 2:
+                        data = None
+                if data:
+                    payload = {
+                        "syncedLyrics": data.get("syncedLyrics"),
+                        "plainLyrics": data.get("plainLyrics"),
+                        "source": "lrclib",
+                    }
+                    LYRICS_CACHE.set(cache_key, payload, LYRICS_CACHE_TTL_SECONDS)
+                    return payload
+    except Exception as exc:
+        print(f"Exact match failed: {exc}")
+
+    def is_valid_match(result_track: str, result_artist: str, target_track: str, target_artist: str) -> bool:
+        if not target_track:
+            return False
+
+        track_sim = difflib.SequenceMatcher(None, target_track.lower(), (result_track or "").lower()).ratio()
+        if track_sim > 0.8:
+            return True
+        if track_sim > 0.5:
+            if not target_artist:
+                return True
+            artist_sim = difflib.SequenceMatcher(None, target_artist.lower(), (result_artist or "").lower()).ratio()
+            if artist_sim > 0.4:
+                return True
+        return False
+
+    def match_priority(result: dict):
+        diff = duration_diff_seconds(result, target_duration)
+        close_duration_rank = 1
+        if target_duration is not None:
+            close_duration_rank = 0 if (diff is not None and diff <= 2) else 1
+
+        missing_duration_rank = 1 if (target_duration is not None and diff is None) else 0
+        duration_rank = diff if diff is not None else 9999
+        lyrics_lang_rank = -score_lyrics(result.get("syncedLyrics") or result.get("plainLyrics") or "", target_lang)
+        lyrics_sync_rank = 0 if result.get("syncedLyrics") else 1
+        return (close_duration_rank, missing_duration_rank, duration_rank, lyrics_lang_rank, lyrics_sync_rank)
+
+    def do_search(q: str, target_trk: str, target_art: str):
+        try:
+            response = requests.get(f"https://lrclib.net/api/search?q={quote(q)}", headers=headers, timeout=10)
+            if response.status_code == 200:
+                results = response.json()
+                if results and isinstance(results, list):
+                    valid_results = [
+                        res for res in results
+                        if is_valid_match(res.get("trackName"), res.get("artistName"), target_trk, target_art)
+                    ]
+
+                    if not valid_results:
+                        return None
+
+                    if target_duration is not None:
+                        close_matches = [
+                            res for res in valid_results
+                            if (duration_diff_seconds(res, target_duration) is not None and duration_diff_seconds(res, target_duration) <= 2)
+                        ]
+                        if close_matches:
+                            valid_results = close_matches
+
+                    valid_results.sort(key=match_priority)
+                    best_match = valid_results[0]
+                    if best_match.get("syncedLyrics") or best_match.get("plainLyrics"):
+                        return {
+                            "syncedLyrics": best_match.get("syncedLyrics"),
+                            "plainLyrics": best_match.get("plainLyrics"),
+                            "source": "lrclib",
+                        }
+        except Exception:
+            pass
+        return None
+
+    fallback_queries: list[tuple[str, str, str]] = []
+    seen_queries: set[str] = set()
+    for fallback_query, target_track, target_artist in [
+        (f"{clean_track} {clean_artist}".strip(), clean_track, clean_artist),
+        (clean_track, clean_track, clean_artist),
+        (clean_text_for_lyrics(track_name), clean_text_for_lyrics(track_name), artist_name),
+    ]:
+        normalized_fallback = normalize_cache_text(fallback_query)
+        if not normalized_fallback or normalized_fallback in seen_queries:
+            continue
+        seen_queries.add(normalized_fallback)
+        fallback_queries.append((fallback_query, target_track, target_artist))
+
+    for fallback_query, target_track, target_artist in fallback_queries:
+        result = do_search(fallback_query, target_track, target_artist)
+        if result:
+            LYRICS_CACHE.set(cache_key, result, LYRICS_CACHE_TTL_SECONDS)
+            return result
+
+    youtube_caption_payload = fetch_youtube_captions(video_id, target_lang)
+    if youtube_caption_payload:
+        LYRICS_CACHE.set(cache_key, youtube_caption_payload, LYRICS_CACHE_TTL_SECONDS)
+        return youtube_caption_payload
+
+    empty_payload = {
+        "syncedLyrics": None,
+        "plainLyrics": None,
+        "source": None,
+    }
+    LYRICS_CACHE.set(cache_key, empty_payload, LYRICS_NEGATIVE_CACHE_TTL_SECONDS)
+    return empty_payload
+
+
+def recommendation_item_identity(item: SearchItem) -> str:
+    return make_track_identity(item.videoId or None, item.title, item.artist)
+
+
+def personalized_recommendation_seeds(
+    favorites: list[dict],
+    history: list[dict],
+    searches: list[dict],
+) -> list[str]:
+    artist_weights: Counter[str] = Counter()
+    query_weights: Counter[str] = Counter()
+
+    for index, item in enumerate(favorites[:12]):
+        artist = (item.get("artist") or "").strip()
+        query = (item.get("query") or "").strip()
+        if artist:
+            artist_weights[artist] += max(35, 120 - index * 8)
+        if query and len(query.split()) >= 2:
+            query_weights[query] += max(20, 70 - index * 5)
+
+    for index, item in enumerate(history[:12]):
+        artist = (item.get("artist") or "").strip()
+        query = (item.get("query") or "").strip()
+        if artist:
+            artist_weights[artist] += max(20, 90 - index * 6)
+        if query and len(query.split()) >= 2:
+            query_weights[query] += max(10, 55 - index * 4)
+
+    for index, item in enumerate(searches[:8]):
+        query = (item.get("query") or "").strip()
+        if query:
+            query_weights[query] += max(15, 60 - index * 5)
+
+    seeds: list[str] = []
+    seen: set[str] = set()
+
+    for artist, _weight in artist_weights.most_common(3):
+        normalized = normalize_cache_text(artist)
+        if normalized and normalized not in seen:
+            seeds.append(artist)
+            seen.add(normalized)
+
+    for query, _weight in query_weights.most_common(4):
+        normalized = normalize_cache_text(query)
+        if normalized and normalized not in seen:
+            seeds.append(query)
+            seen.add(normalized)
+
+    return seeds[:5]
+
+
+def curated_recommendation_items() -> list[SearchItem]:
+    items: list[SearchItem] = []
+    for seed in CURATED_RECOMMENDATION_SEEDS[:RECOMMENDATIONS_MIN_ITEMS]:
+        items.append(
+            SearchItem(
+                title=seed["title"],
+                artist=seed["artist"],
+                cover="",
+                videoId="",
+                query=seed["query"],
+                duration=None,
+                durationText=None,
+            )
+        )
+    return items
+
+
+def build_recommendations_payload() -> dict:
+    cache_key = recommendation_cache_key()
+    cached = RECOMMENDATIONS_CACHE.get(cache_key)
+    if cached is not CACHE_MISS:
+        return dict(cached)
+
+    favorites = fetch_library_tracks("favorites", "saved_at", 30)
+    history = fetch_library_tracks("play_history", "played_at", 30)
+    searches = fetch_recent_searches(12)
+
+    sections: list[RecommendationSection] = []
+    excluded_identities = {
+        make_track_identity(item.get("videoId"), item.get("title") or "", item.get("artist") or "")
+        for item in [*favorites, *history]
+    }
+
+    continue_listening: list[SearchItem] = []
+    continue_seen: set[str] = set()
+    for item in history:
+        next_item = search_item_from_library_track(item)
+        if not next_item:
+            continue
+        identity = recommendation_item_identity(next_item)
+        if identity in continue_seen:
+            continue
+        continue_seen.add(identity)
+        continue_listening.append(next_item)
+        if len(continue_listening) >= RECOMMENDATIONS_MIN_ITEMS:
+            break
+
+    if continue_listening:
+        sections.append(
+            RecommendationSection(
+                id="continue-listening",
+                title="继续听",
+                subtitle="从你最近播放的歌里继续进入状态",
+                items=continue_listening,
+                source="history",
+            )
+        )
+
+    personalized_items: list[SearchItem] = []
+    personalized_seen = set(continue_seen)
+    for item in [*favorites, *history]:
+        candidate = search_item_from_library_track(item)
+        if not candidate:
+            continue
+        identity = recommendation_item_identity(candidate)
+        if identity in personalized_seen or identity in continue_seen:
+            continue
+        personalized_seen.add(identity)
+        personalized_items.append(candidate)
+        if len(personalized_items) >= RECOMMENDATIONS_MIN_ITEMS:
+            break
+
+    for seed_query in personalized_recommendation_seeds(favorites, history, searches):
+        cached_results = SEARCH_RESULTS_CACHE.get(build_search_cache_key(seed_query, 6))
+        if cached_results is CACHE_MISS:
+            continue
+        for entry in cached_results:
+            candidate = search_item_from_entry(entry, fallback_query=seed_query)
+            if not candidate:
+                continue
+            identity = recommendation_item_identity(candidate)
+            if identity in personalized_seen or identity in excluded_identities:
+                continue
+            personalized_seen.add(identity)
+            personalized_items.append(candidate)
+            if len(personalized_items) >= RECOMMENDATIONS_MIN_ITEMS:
+                break
+        if len(personalized_items) >= RECOMMENDATIONS_MIN_ITEMS:
+            break
+
+    if personalized_items:
+        sections.append(
+            RecommendationSection(
+                id="for-you",
+                title="为你推荐",
+                subtitle="基于收藏、最近播放和搜索行为混合生成",
+                items=personalized_items,
+                source="behavior",
+            )
+        )
+
+    curated_items = curated_recommendation_items()
+    sections.append(
+        RecommendationSection(
+            id="nas-curated",
+            title="NAS 精选",
+            subtitle="冷启动也能立即开始播放的固定精选",
+            items=curated_items,
+            source="curated",
+        )
+    )
+
+    mode = "mixed" if personalized_items else "curated"
+    payload = {
+        "mode": mode,
+        "generatedAt": utc_now_iso(),
+        "sections": sections,
+    }
+    RECOMMENDATIONS_CACHE.set(cache_key, payload, RECOMMENDATIONS_CACHE_TTL_SECONDS)
+    return payload
 
 
 def get_dist_file(path_value: str) -> Path | None:
@@ -852,6 +1484,11 @@ async def get_library():
         "recentSearches": fetch_recent_searches(12),
         "recentDownloads": fetch_recent_downloads(30),
     }
+
+
+@app.get("/recommendations", response_model=RecommendationsResponse)
+async def get_recommendations():
+    return await run_in_threadpool(build_recommendations_payload)
 
 
 @app.post("/library/favorites", response_model=LibraryTrack)
@@ -1004,32 +1641,7 @@ async def search_tracks(req: SearchRequest):
     limit = max(1, min(int(req.limit), 15))
 
     try:
-        entries = search_youtube_entries(query, limit)
-        results: list[SearchItem] = []
-        for entry in entries:
-            if not entry:
-                continue
-            video_id = entry.get("id")
-            title = entry.get("title") or "Unknown Title"
-            artist = entry.get("uploader") or "Unknown Artist"
-            cover = entry.get("thumbnail") or ""
-            duration = entry.get("duration")
-            if not video_id:
-                continue
-            query_text = f"{title} {artist}".strip()
-            results.append(
-                SearchItem(
-                    title=title,
-                    artist=artist,
-                    cover=cover,
-                    videoId=video_id,
-                    query=query_text,
-                    duration=duration,
-                    durationText=format_duration(duration),
-                )
-            )
-
-        return {"results": results}
+        return await run_in_threadpool(build_search_response_payload, query, limit)
     except Exception as exc:
         print(f"Search error: {exc}")
         raise HTTPException(status_code=500, detail="Search failed") from exc
@@ -1282,129 +1894,20 @@ async def get_lyrics(
     if not track_name:
         raise HTTPException(status_code=422, detail="track_name is required")
 
-    headers = {"User-Agent": "NSRL-Local-V3 (https://github.com/)"}
-    clean_track, clean_artist = extract_track_and_artist(track_name, artist_name)
-    target_duration = normalize_duration_seconds(audio_duration)
-    target_lang = get_target_language(track_name, artist_name)
     saved_offset = fetch_saved_lyrics_offset(track_key=track_key, video_id=video_id)
 
-    # 1. Exact Match
-    url_get = f"https://lrclib.net/api/get?track_name={quote(clean_track)}&artist_name={quote(clean_artist)}"
     try:
-        resp = requests.get(url_get, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
-                if target_duration is not None:
-                    exact_diff = duration_diff_seconds(data, target_duration)
-                    if exact_diff is not None and exact_diff > 2:
-                        data = None
-                if data:
-                    return {
-                        "syncedLyrics": data.get("syncedLyrics"),
-                        "plainLyrics": data.get("plainLyrics"),
-                        "source": "lrclib",
-                        "offsetSeconds": saved_offset,
-                    }
+        payload = await run_in_threadpool(fetch_lyrics_payload, track_name, artist_name, audio_duration, video_id)
     except Exception as exc:
-        print(f"Exact match failed: {exc}")
-
-    def is_valid_match(result_track, result_artist, target_track, target_artist):
-        if not target_track:
-            return False
-
-        # Calculate similarity ratios
-        track_sim = difflib.SequenceMatcher(None, target_track.lower(), (result_track or "").lower()).ratio()
-
-        # If track similarity is very high, artist mismatch might be a cover, so accept it
-        if track_sim > 0.8:
-            return True
-
-        # If track similarity is ok, check artist
-        if track_sim > 0.5:
-            if not target_artist:
-                return True
-            artist_sim = difflib.SequenceMatcher(None, target_artist.lower(), (result_artist or "").lower()).ratio()
-            if artist_sim > 0.4:
-                return True
-
-        return False
-
-    def match_priority(result: dict):
-        diff = duration_diff_seconds(result, target_duration)
-        close_duration_rank = 1
-        if target_duration is not None:
-            close_duration_rank = 0 if (diff is not None and diff <= 2) else 1
-
-        missing_duration_rank = 1 if (target_duration is not None and diff is None) else 0
-        duration_rank = diff if diff is not None else 9999
-        lyrics_lang_rank = -score_lyrics(result.get("syncedLyrics") or result.get("plainLyrics") or "", target_lang)
-        lyrics_sync_rank = 0 if result.get("syncedLyrics") else 1
-        return (close_duration_rank, missing_duration_rank, duration_rank, lyrics_lang_rank, lyrics_sync_rank)
-
-    def do_search(q, target_trk, target_art):
-        try:
-            r = requests.get(f"https://lrclib.net/api/search?q={quote(q)}", headers=headers, timeout=10)
-            if r.status_code == 200:
-                results = r.json()
-                if results and isinstance(results, list):
-                    # Filter out wildly wrong matches
-                    valid_results = [
-                        res for res in results
-                        if is_valid_match(res.get("trackName"), res.get("artistName"), target_trk, target_art)
-                    ]
-
-                    if not valid_results:
-                        return None
-
-                    # If we can find close duration matches, force the shortlist to avoid wrong versions.
-                    if target_duration is not None:
-                        close_matches = [
-                            res for res in valid_results
-                            if (duration_diff_seconds(res, target_duration) is not None and duration_diff_seconds(res, target_duration) <= 2)
-                        ]
-                        if close_matches:
-                            valid_results = close_matches
-
-                    valid_results.sort(key=match_priority)
-                    best_match = valid_results[0]
-                    if best_match.get("syncedLyrics") or best_match.get("plainLyrics"):
-                        return {
-                            "syncedLyrics": best_match.get("syncedLyrics"),
-                            "plainLyrics": best_match.get("plainLyrics"),
-                            "source": "lrclib",
-                            "offsetSeconds": saved_offset,
-                        }
-        except Exception:
-            pass
-        return None
-
-    # 2. Search Fallback (Cleaned track + cleaned artist)
-    q1 = f"{clean_track} {clean_artist}".strip()
-    res = do_search(q1, clean_track, clean_artist)
-    if res:
-        return res
-
-    # 3. Search Fallback 2 (Cleaned track ONLY)
-    res2 = do_search(clean_track, clean_track, clean_artist)
-    if res2:
-        return res2
-
-    # 4. Search Fallback 3 (Original cleaned track without split)
-    orig_clean = clean_text_for_lyrics(track_name)
-    res3 = do_search(orig_clean, orig_clean, artist_name)
-    if res3:
-        return res3
-
-    youtube_caption_payload = fetch_youtube_captions(video_id, target_lang)
-    if youtube_caption_payload:
-        youtube_caption_payload["offsetSeconds"] = saved_offset
-        return youtube_caption_payload
+        print(f"Lyrics error: {exc}")
+        payload = {
+            "syncedLyrics": None,
+            "plainLyrics": None,
+            "source": None,
+        }
 
     return {
-        "syncedLyrics": None,
-        "plainLyrics": None,
-        "source": None,
+        **payload,
         "offsetSeconds": saved_offset,
     }
 
@@ -1414,76 +1917,8 @@ async def visualize(req: VisualizeRequest):
     if not req.videoId and not req.query:
         raise HTTPException(status_code=422, detail="query or videoId is required")
 
-    request_label = req.videoId or req.query or ""
-    print(f"Visualizing: {request_label}")
-
     try:
-        candidates: list[dict] = []
-        seen_video_ids: set[str] = set()
-
-        if req.videoId:
-            candidates.append({"id": req.videoId})
-            seen_video_ids.add(req.videoId)
-
-        if req.query:
-            for match in search_youtube_entries(req.query or "", 6):
-                video_id = match.get("id")
-                if not video_id or video_id in seen_video_ids:
-                    continue
-                candidates.append(match)
-                seen_video_ids.add(video_id)
-
-        if not candidates:
-            raise HTTPException(status_code=404, detail="Song not found")
-
-        last_error = None
-        for candidate in candidates:
-            video_id = candidate.get("id")
-            if not video_id:
-                continue
-
-            try:
-                video_data = extract_playback_info(video_id)
-                audio_format = select_preferred_audio_format(video_data)
-                audio_url = audio_format.get("url") if audio_format else video_data.get("url")
-                if not audio_url:
-                    raise RuntimeError("missing playable stream URL")
-
-                title = video_data.get("title") or candidate.get("title") or "Unknown Title"
-                artist = video_data.get("uploader") or video_data.get("channel") or candidate.get("uploader") or "Unknown Artist"
-                cover_url = video_data.get("thumbnail") or candidate.get("thumbnail") or ""
-                query_text = req.query or f"{title} {artist}".strip()
-                audio_ext = (
-                    (audio_format or {}).get("audio_ext")
-                    or (audio_format or {}).get("ext")
-                    or "m4a"
-                )
-                if audio_ext == "none":
-                    audio_ext = (audio_format or {}).get("ext") or "m4a"
-
-                extracted_colors = get_dominant_colors(cover_url)
-                theme = analyze_theme(title, extracted_colors)
-                proxy_endpoint = f"/proxy-stream?url={quote(audio_url, safe='')}"
-
-                return {
-                    "title": title,
-                    "artist": artist,
-                    "cover": cover_url,
-                    "audioSrc": proxy_endpoint,
-                    "audioExt": audio_ext,
-                    "colors": extracted_colors,
-                    "theme": theme,
-                    "videoId": video_id,
-                    "query": query_text,
-                }
-            except Exception as candidate_error:
-                last_error = candidate_error
-                continue
-
-        if last_error:
-            raise HTTPException(status_code=502, detail="Unable to resolve a playable stream") from last_error
-        raise HTTPException(status_code=404, detail="Song not found")
-
+        return await run_in_threadpool(build_visualize_response_payload, req.query or "", req.videoId or "")
     except HTTPException:
         raise
     except Exception as exc:

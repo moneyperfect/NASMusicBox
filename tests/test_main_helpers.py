@@ -30,6 +30,12 @@ def isolated_library(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "port_is_open", lambda _port: False)
 
     main.init_library_db()
+    main.SEARCH_RESULTS_CACHE.clear()
+    main.PLAYBACK_INFO_CACHE.clear()
+    main.VISUALIZE_CACHE.clear()
+    main.LYRICS_CACHE.clear()
+    main.COLOR_CACHE.clear()
+    main.RECOMMENDATIONS_CACHE.clear()
     return db_path
 
 
@@ -122,3 +128,139 @@ def test_library_roundtrip_and_system_check(isolated_library):
     assert system_check["appVersion"] == APP_VERSION
     assert system_check["libraryDbAvailable"] is True
     assert system_check["frontendBuilt"] is True
+
+
+def test_search_youtube_entries_uses_backend_cache(monkeypatch):
+    main.SEARCH_RESULTS_CACHE.clear()
+    calls = {"count": 0}
+
+    class FakeYoutubeDL:
+        def __init__(self, _opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, _query, download=False):
+            calls["count"] += 1
+            return {
+                "entries": [
+                    {
+                        "id": "video-1",
+                        "title": "Yellow",
+                        "uploader": "Coldplay",
+                        "thumbnail": "https://example.com/yellow.jpg",
+                        "duration": 266,
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+
+    first = main.search_youtube_entries("Yellow Coldplay", 5)
+    second = main.search_youtube_entries("Yellow Coldplay", 5)
+
+    assert calls["count"] == 1
+    assert first[0]["id"] == "video-1"
+    assert second[0]["title"] == "Yellow"
+
+
+def test_visualize_prefers_direct_video_lookup_without_search(monkeypatch):
+    main.VISUALIZE_CACHE.clear()
+    main.PLAYBACK_INFO_CACHE.clear()
+    main.COLOR_CACHE.clear()
+
+    monkeypatch.setattr(
+        main,
+        "extract_playback_info",
+        lambda video_id: {
+            "id": video_id,
+            "title": "Yellow",
+            "uploader": "Coldplay",
+            "thumbnail": "",
+            "formats": [
+                {
+                    "format_id": "140",
+                    "url": "https://example.com/audio.m4a",
+                    "acodec": "mp4a.40.2",
+                    "vcodec": "none",
+                    "ext": "m4a",
+                    "protocol": "https",
+                    "abr": 128,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(main, "search_youtube_entries", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("search should not run")))
+
+    payload = main.build_visualize_response_payload(query="Yellow Coldplay", video_id="video-1")
+
+    assert payload["videoId"] == "video-1"
+    assert payload["audioExt"] == "m4a"
+    assert payload["audioSrc"].startswith("/proxy-stream?url=")
+
+
+def test_recommendations_mix_history_and_personalized_results(isolated_library, monkeypatch):
+    asyncio.run(
+        main.upsert_favorite(
+            main.LibraryTrack(
+                key="fav-1",
+                title="Yellow",
+                artist="Coldplay",
+                cover="",
+                query="Yellow Coldplay",
+                videoId="fav-1",
+            )
+        )
+    )
+    asyncio.run(
+        main.upsert_history(
+            main.LibraryTrack(
+                key="hist-1",
+                title="Take On Me",
+                artist="a-ha",
+                cover="",
+                query="Take On Me a-ha",
+                videoId="hist-1",
+            )
+        )
+    )
+    asyncio.run(main.upsert_search_history(main.SearchHistoryEntry(query="The Weeknd")))
+
+    def fake_search(query, limit):
+        normalized = query.lower()
+        if "coldplay" in normalized:
+            return [
+                {"id": "song-1", "title": "Clocks", "uploader": "Coldplay", "thumbnail": "", "duration": 307},
+                {"id": "song-2", "title": "Adventure of a Lifetime", "uploader": "Coldplay", "thumbnail": "", "duration": 264},
+            ][:limit]
+        if "weeknd" in normalized:
+            return [
+                {"id": "song-3", "title": "Save Your Tears", "uploader": "The Weeknd", "thumbnail": "", "duration": 215},
+                {"id": "song-4", "title": "Starboy", "uploader": "The Weeknd", "thumbnail": "", "duration": 230},
+            ][:limit]
+        return []
+
+    main.SEARCH_RESULTS_CACHE.set(
+        main.build_search_cache_key("Coldplay", 6),
+        fake_search("Coldplay", 6),
+        main.SEARCH_CACHE_TTL_SECONDS,
+    )
+    main.SEARCH_RESULTS_CACHE.set(
+        main.build_search_cache_key("The Weeknd", 6),
+        fake_search("The Weeknd", 6),
+        main.SEARCH_CACHE_TTL_SECONDS,
+    )
+
+    payload = main.build_recommendations_payload()
+    sections = {section.id: section for section in payload["sections"]}
+
+    assert payload["mode"] == "mixed"
+    assert "continue-listening" in sections
+    assert "for-you" in sections
+    assert "nas-curated" in sections
+    assert sections["continue-listening"].items[0].title == "Take On Me"
+    assert len(sections["for-you"].items) >= 2

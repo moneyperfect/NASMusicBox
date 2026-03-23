@@ -66,13 +66,17 @@ const BRAND = {
   tagline: 'Next Audio Station',
 };
 
-const QUICK_PRESETS = [
-  { song: 'Yellow', artist: 'Coldplay', cover: 'https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=400' },
-  { song: 'Viva La Vida', artist: 'Coldplay', cover: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=400' },
-  { song: 'Take On Me', artist: 'a-ha', cover: 'https://images.unsplash.com/photo-1493225255756-d9584f8606e9?w=400' },
-  { song: 'A Thousand Years', artist: 'Christina Perri', cover: 'https://images.unsplash.com/photo-1514525253361-bee8a197c0c5?w=400' },
-  { song: 'Nightcall', artist: 'Kavinsky', cover: 'https://images.unsplash.com/photo-1557683316-973673baf926?w=400' },
-  { song: 'Blinding Lights', artist: 'The Weeknd', cover: 'https://images.unsplash.com/photo-1619983081563-430f63602796?w=400' },
+const DISCOVER_FALLBACK_ITEMS = [
+  { title: 'Yellow', artist: 'Coldplay', cover: '', query: 'Yellow Coldplay', videoId: '' },
+  { title: 'Blinding Lights', artist: 'The Weeknd', cover: '', query: 'Blinding Lights The Weeknd', videoId: '' },
+  { title: 'Take On Me', artist: 'a-ha', cover: '', query: 'Take On Me a-ha', videoId: '' },
+  { title: 'A Thousand Years', artist: 'Christina Perri', cover: '', query: 'A Thousand Years Christina Perri', videoId: '' },
+];
+
+const DISCOVER_HEROES = [
+  { id: 'primary', subtitle: '混合推荐', accent: ['#49dcb1', '#0c8f82', '#06121d'] },
+  { id: 'continue', subtitle: '继续听', accent: ['#7dd3fc', '#2563eb', '#08111d'] },
+  { id: 'curated', subtitle: 'NAS 精选', accent: ['#f59e0b', '#ef4444', '#14090a'] },
 ];
 
 const BROWSE_CATEGORIES = [
@@ -93,11 +97,13 @@ const RADIO_STATIONS = [
 ];
 
 const searchCache = new Map();
+const visualizeCache = new Map();
 const IS_MINI_MODE = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('mini') === '1';
 const PLAYER_STATE_STORAGE_KEY = 'nas_player_state_v1';
 const DESKTOP_ACTION_STORAGE_KEY = 'nas_desktop_action_v1';
 const DESKTOP_SYNC_CHANNEL = 'nas_desktop_sync_v1';
 const LIBRARY_SYNC_INTERVAL_MS = 6000;
+const VISUALIZE_CACHE_TTL_MS = 75 * 1000;
 
 const trimTrailingSlash = (value) => value.replace(/\/+$/, '');
 const normalizeSearchQuery = (value) => (value || '').trim().replace(/\s+/g, ' ');
@@ -153,6 +159,94 @@ const readBooleanStorage = (key) => {
     return false;
   }
 };
+
+const makeVisualSeed = (song, artist = '') => `${song || ''}::${artist || ''}`.trim() || BRAND.name;
+
+const seedToPalette = (seedText) => {
+  const seed = Array.from(seedText || BRAND.name).reduce((total, char, index) => total + char.charCodeAt(0) * (index + 1), 0);
+  const hue = seed % 360;
+  return [
+    `hsl(${hue} 72% 58%)`,
+    `hsl(${(hue + 36) % 360} 68% 44%)`,
+    `hsl(${(hue + 210) % 360} 46% 12%)`,
+  ];
+};
+
+const createBrandCover = (song, artist = '') => {
+  const title = (song || BRAND.name).slice(0, 22);
+  const subtitle = (artist || BRAND.tagline).slice(0, 26);
+  const [accent, accentTwo, background] = seedToPalette(makeVisualSeed(song, artist));
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+      <defs>
+        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="${background}" />
+          <stop offset="55%" stop-color="${accentTwo}" />
+          <stop offset="100%" stop-color="${accent}" />
+        </linearGradient>
+        <radialGradient id="glow" cx="28%" cy="18%" r="70%">
+          <stop offset="0%" stop-color="rgba(255,255,255,0.78)" />
+          <stop offset="100%" stop-color="rgba(255,255,255,0)" />
+        </radialGradient>
+      </defs>
+      <rect width="512" height="512" rx="48" fill="url(#bg)" />
+      <circle cx="104" cy="92" r="130" fill="url(#glow)" opacity="0.38" />
+      <circle cx="414" cy="402" r="154" fill="${accent}" opacity="0.16" />
+      <circle cx="362" cy="164" r="84" fill="${accentTwo}" opacity="0.28" />
+      <text x="48" y="92" fill="rgba(255,255,255,0.9)" font-size="28" font-family="Segoe UI, Arial, sans-serif" font-weight="700" letter-spacing="4">${BRAND.name}</text>
+      <text x="48" y="386" fill="#ffffff" font-size="46" font-family="Segoe UI, Arial, sans-serif" font-weight="700">${title}</text>
+      <text x="48" y="430" fill="rgba(255,255,255,0.72)" font-size="24" font-family="Segoe UI, Arial, sans-serif">${subtitle}</text>
+    </svg>
+  `;
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+};
+
+const resolveCoverArt = (song, artist, cover) => (cover && String(cover).trim() ? String(cover).trim() : createBrandCover(song, artist));
+
+const handleCoverError = (event, song, artist) => {
+  const nextCover = createBrandCover(song, artist);
+  if (event.currentTarget.src === nextCover) return;
+  event.currentTarget.onerror = null;
+  event.currentTarget.src = nextCover;
+};
+
+const recommendationIdentity = (item) => item?.videoId ? `vid:${item.videoId}` : `${(item?.title || '').trim().toLowerCase()}::${(item?.artist || '').trim().toLowerCase()}`;
+
+const buildFallbackRecommendations = () => ({
+  mode: 'fallback',
+  generatedAt: null,
+  sections: [
+    {
+      id: 'nas-curated',
+      title: 'NAS 精选',
+      subtitle: '还没有听歌记录时，先从这些稳定好听的歌开始',
+      source: 'fallback',
+      items: DISCOVER_FALLBACK_ITEMS,
+    },
+  ],
+});
+
+const normalizeRecommendationItem = (item) => ({
+  title: item?.title || '',
+  artist: item?.artist || '',
+  cover: item?.cover || '',
+  query: item?.query || makeQuery(item?.title, item?.artist),
+  videoId: item?.videoId || '',
+  duration: item?.duration ?? null,
+  durationText: item?.durationText || null,
+});
+
+const normalizeRecommendationSection = (section) => ({
+  id: section?.id || String(section?.title || 'section').toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+  title: section?.title || '推荐内容',
+  subtitle: section?.subtitle || '',
+  source: section?.source || 'mixed',
+  items: Array.isArray(section?.items) ? section.items.map(normalizeRecommendationItem) : [],
+});
+
+const heroBackgroundStyle = (colors) => ({
+  background: `radial-gradient(circle at 20% 20%, ${colors[0]} 0%, transparent 32%), radial-gradient(circle at 82% 82%, ${colors[1]} 0%, transparent 35%), linear-gradient(135deg, ${colors[2]} 0%, #050913 58%, ${colors[1]} 100%)`,
+});
 
 const formatTime = (seconds) => {
   if (!Number.isFinite(seconds) || seconds < 0) return '00:00';
@@ -281,6 +375,8 @@ function App() {
   const [searching, setSearching] = useState(false);
   const [searchRan, setSearchRan] = useState(false);
   const [searchResults, setSearchResults] = useState([]);
+  const [discoverRecommendations, setDiscoverRecommendations] = useState(() => buildFallbackRecommendations());
+  const [discoverLoading, setDiscoverLoading] = useState(false);
 
   const [resolvingTrack, setResolvingTrack] = useState(false);
   const [track, setTrack] = useState(null);
@@ -334,6 +430,59 @@ function App() {
   const [volume, setVolume] = useState(0.8);
 
   const queryText = useMemo(() => makeQuery(querySong, queryArtist), [querySong, queryArtist]);
+  const recommendationFingerprint = useMemo(
+    () => JSON.stringify({
+      favorites: favorites.slice(0, 8).map((item) => [item.key, item.savedAt || '']),
+      history: historyItems.slice(0, 8).map((item) => [item.key, item.playedAt || '']),
+    }),
+    [favorites, historyItems],
+  );
+
+  const discoverSections = useMemo(
+    () => (Array.isArray(discoverRecommendations?.sections) ? discoverRecommendations.sections.map(normalizeRecommendationSection) : buildFallbackRecommendations().sections),
+    [discoverRecommendations],
+  );
+  const continueSection = discoverSections.find((section) => section.id === 'continue-listening') || null;
+  const primaryDiscoverSection = discoverSections.find((section) => section.id === 'for-you') || continueSection || discoverSections[0] || null;
+  const curatedSection = discoverSections.find((section) => section.id === 'nas-curated') || discoverSections[0] || null;
+  const discoverSpotlightItems = useMemo(() => {
+    const merged = [];
+    const seen = new Set();
+    [primaryDiscoverSection, curatedSection, continueSection].forEach((section) => {
+      if (!section?.items) return;
+      section.items.forEach((item) => {
+        const identity = recommendationIdentity(item);
+        if (!seen.has(identity)) {
+          seen.add(identity);
+          merged.push(item);
+        }
+      });
+    });
+    return merged.slice(0, 4);
+  }, [primaryDiscoverSection, curatedSection, continueSection]);
+  const discoverHeroCards = useMemo(
+    () => [
+      {
+        ...DISCOVER_HEROES[0],
+        title: primaryDiscoverSection?.title || '为你推荐',
+        desc: primaryDiscoverSection?.subtitle || '根据你的收藏和最近播放做混合推荐',
+        item: primaryDiscoverSection?.items?.[0] || discoverSpotlightItems[0] || null,
+      },
+      {
+        ...DISCOVER_HEROES[1],
+        title: continueSection?.title || '继续听',
+        desc: continueSection?.subtitle || '最近听过的内容，点一下继续进入状态',
+        item: continueSection?.items?.[0] || historyItems[0] || discoverSpotlightItems[1] || null,
+      },
+      {
+        ...DISCOVER_HEROES[2],
+        title: curatedSection?.title || 'NAS 精选',
+        desc: curatedSection?.subtitle || '冷启动时也能立即开始播放的固定精选',
+        item: curatedSection?.items?.[0] || discoverSpotlightItems[2] || null,
+      },
+    ],
+    [primaryDiscoverSection, continueSection, curatedSection, discoverSpotlightItems, historyItems],
+  );
 
   const apiRequest = async (path, options = {}) => {
     const { headers, ...rest } = options;
@@ -460,6 +609,48 @@ function App() {
   useEffect(() => {
     void refreshLibraryState({ bootstrapLocal: true });
   }, []);
+
+  useEffect(() => {
+    if (isMiniMode) return undefined;
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setDiscoverLoading(true);
+      try {
+        const response = await fetch(apiUrl('/recommendations'), {
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          throw new Error(data?.detail || `request_failed_${response.status}`);
+        }
+        const nextSections = Array.isArray(data?.sections) ? data.sections.map(normalizeRecommendationSection) : [];
+        if (nextSections.length > 0) {
+          setDiscoverRecommendations({
+            mode: data?.mode || 'mixed',
+            generatedAt: data?.generatedAt || null,
+            sections: nextSections,
+          });
+        } else {
+          setDiscoverRecommendations(buildFallbackRecommendations());
+        }
+      } catch (error) {
+        if (error?.name !== 'AbortError') {
+          setDiscoverRecommendations((previous) => (previous?.sections?.length ? previous : buildFallbackRecommendations()));
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setDiscoverLoading(false);
+        }
+      }
+    }, 120);
+
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [isMiniMode, recommendationFingerprint]);
 
   useEffect(() => {
     const syncFromServer = () => {
@@ -795,7 +986,6 @@ function App() {
       setQuerySong(q);
       setQueryArtist('');
     }
-    setSearching(true);
     setSearchRan(true);
 
     if (searchCache.has(q)) {
@@ -805,10 +995,10 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ query: q, searchedAt: new Date().toISOString() }),
       }).catch(() => {});
-      setSearching(false);
       return;
     }
 
+    setSearching(true);
     try {
       const data = await apiRequest('/search', {
         method: 'POST',
@@ -841,13 +1031,24 @@ function App() {
   const resolveAndPlay = async (candidate, options = {}) => {
     const { queue = null, index = -1 } = options;
     const query = candidate.query || makeQuery(candidate.title, candidate.artist);
+    const cacheKey = candidate.videoId ? `vid:${candidate.videoId}` : `query:${normalizeSearchQuery(query)}`;
+    const cached = visualizeCache.get(cacheKey);
+    const cachedData = cached && (Date.now() - cached.cachedAt) < VISUALIZE_CACHE_TTL_MS ? cached.payload : null;
 
-    setResolvingTrack(true);
+    if (!cachedData) {
+      setResolvingTrack(true);
+    }
     try {
-      const data = await apiRequest('/visualize', {
+      const data = cachedData || await apiRequest('/visualize', {
         method: 'POST',
         body: JSON.stringify({ query, videoId: candidate.videoId || null }),
       });
+      if (!cachedData) {
+        visualizeCache.set(cacheKey, { payload: data, cachedAt: Date.now() });
+        if (data?.videoId) {
+          visualizeCache.set(`vid:${data.videoId}`, { payload: data, cachedAt: Date.now() });
+        }
+      }
       const resolved = {
         key: trackKey(data.videoId || candidate.videoId, data.title || candidate.title, data.artist || candidate.artist),
         title: data.title || candidate.title,
@@ -887,17 +1088,19 @@ function App() {
       }).catch(() => {});
 
       // Auto play
-      setTimeout(() => {
+      window.setTimeout(() => {
         if (audioRef.current) {
           audioRef.current.play();
           setIsPlaying(true);
         }
-      }, 300);
+      }, cachedData ? 24 : 80);
 
     } catch {
       setNoticeText('加载音频失败，请重试');
     } finally {
-      setResolvingTrack(false);
+      if (!cachedData) {
+        setResolvingTrack(false);
+      }
     }
   };
 
@@ -1037,19 +1240,18 @@ function App() {
   }, [isMiniMode, track, isPlaying, currentTime, duration, volume, queueIndex, playQueue.length, vibeModeEnabled]);
 
   const renderCard = (song, artist, cover, onClick, isPlayable = true) => {
-    let displayCover = cover;
-    if (!displayCover) {
-      if (song) {
-        displayCover = `https://ui-avatars.com/api/?name=${encodeURIComponent(song)}&background=random&color=fff&size=512&font-size=0.33`;
-      } else {
-        displayCover = 'https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=400';
-      }
-    }
+    const displayCover = resolveCoverArt(song, artist, cover);
 
     return (
       <div className="music-card animate-slide-up group" onClick={onClick}>
         <div className="card-image-wrap">
-          <img src={displayCover} className="card-image" alt="" />
+          <img
+            src={displayCover}
+            className="card-image"
+            alt=""
+            loading="lazy"
+            onError={(event) => handleCoverError(event, song, artist)}
+          />
           {isPlayable && (
             <div className="play-hover-btn">
               <Play fill="currentColor" size={16} className="ml-0.5" />
@@ -1090,8 +1292,13 @@ function App() {
       <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(73,220,177,0.28),_transparent_55%),linear-gradient(135deg,_#08111d,_#02060c)] text-white">
         <div className="h-screen flex flex-col justify-between p-4">
           <div className="flex items-center gap-3">
-            {miniTrack?.cover ? (
-              <img src={miniTrack.cover} alt="" className="w-16 h-16 rounded-2xl object-cover shadow-2xl border border-white/10" />
+            {miniTrack ? (
+              <img
+                src={resolveCoverArt(miniTrack?.title, miniTrack?.artist, miniTrack?.cover)}
+                alt=""
+                className="w-16 h-16 rounded-2xl object-cover shadow-2xl border border-white/10"
+                onError={(event) => handleCoverError(event, miniTrack?.title, miniTrack?.artist)}
+              />
             ) : (
               <div className="w-16 h-16 rounded-2xl bg-white/10 border border-white/10 flex items-center justify-center">
                 <Disc3 size={22} className="text-white/50" />
@@ -1260,37 +1467,87 @@ function App() {
         <div className="page-wrapper">
           {activePage === 'discover' && (
             <div className="animate-slide-up">
-              <h1 className="text-3xl font-bold text-white mb-6 tracking-tight">现在就听</h1>
+              <div className="flex items-start justify-between gap-4 mb-6">
+                <div>
+                  <h1 className="text-3xl font-bold text-white tracking-tight">现在就听</h1>
+                  <p className="text-sm text-white/45 mt-2">首屏先展示本地推荐，后台再异步刷新，不等网络也不会空白。</p>
+                </div>
+                <div className={`px-3 py-2 rounded-full text-xs font-semibold border ${discoverLoading ? 'border-cyan-400/30 text-cyan-300 bg-cyan-400/10' : 'border-white/10 text-white/45 bg-white/5'}`}>
+                  {discoverLoading ? '推荐正在刷新' : `推荐模式 · ${discoverRecommendations?.mode === 'mixed' ? '混合推荐' : '精选兜底'}`}
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-12">
-                {[
-                  { subtitle: '主打推荐', title: '今日热门精选', desc: '发现属于你的新节奏', img: 'https://images.unsplash.com/photo-1514525253361-bee8a197c0c5?w=600' },
-                  { subtitle: '新发布', title: '本周新歌', desc: '不容错过的全球首发', img: 'https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=600' },
-                  { subtitle: '沉浸氛围', title: '深夜电子乐', desc: '感受强劲的低音频率', img: 'https://images.unsplash.com/photo-1557683316-973673baf926?w=600' },
-                ].map((banner, i) => (
-                  <div key={i} className="relative rounded-xl overflow-hidden aspect-[4/3] cursor-pointer group hover:opacity-90 transition-opacity" onClick={() => setActivePage('search')}>
-                    <img src={banner.img} alt={banner.title} className="absolute inset-0 w-full h-full object-cover transition-transform duration-700 group-hover:scale-105" />
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent" />
+                {discoverHeroCards.map((banner, index) => (
+                  <div
+                    key={banner.id}
+                    className="relative rounded-xl overflow-hidden aspect-[4/3] cursor-pointer group border border-white/6 hover:opacity-95 transition-opacity"
+                    style={heroBackgroundStyle(banner.accent)}
+                    onClick={() => {
+                      if (banner.item) {
+                        resolveAndPlay(banner.item);
+                      } else {
+                        setActivePage('search');
+                      }
+                    }}
+                  >
+                    <div className="absolute inset-0 opacity-80">
+                      <div className="absolute -top-10 -left-8 w-36 h-36 rounded-full bg-white/10 blur-3xl" />
+                      <div className="absolute -bottom-10 right-0 w-40 h-40 rounded-full bg-black/25 blur-3xl" />
+                      <div className="absolute top-8 right-8 w-16 h-16 rounded-full border border-white/10" />
+                    </div>
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/72 via-black/10 to-transparent" />
                     <div className="absolute bottom-0 left-0 p-5 w-full">
                       <p className="text-[10px] font-bold text-white/70 uppercase tracking-wider mb-1">{banner.subtitle}</p>
                       <h3 className="text-xl font-bold text-white mb-1 leading-tight">{banner.title}</h3>
-                      <p className="text-sm text-white/50">{banner.desc}</p>
+                      <p className="text-sm text-white/55">{banner.desc}</p>
+                      <div className="mt-4 text-xs font-semibold text-white/80">
+                        {banner.item ? `点按直接播放 · ${banner.item.title || '马上开始'}` : '点按开始探索'}
+                      </div>
                     </div>
                   </div>
                 ))}
               </div>
 
               <div className="flex justify-between items-end mb-4 border-b border-white/5 pb-2">
-                <h2 className="text-xl font-bold text-white tracking-tight">最近播放的推荐</h2>
-                <button className="text-xs font-semibold text-[var(--accent)] hover:opacity-80">查看全部 <ChevronRight size={12} className="inline -mt-0.5" /></button>
+                <div>
+                  <h2 className="text-xl font-bold text-white tracking-tight">{primaryDiscoverSection?.title || 'NAS 精选'}</h2>
+                  <p className="text-xs text-white/45 mt-1">{primaryDiscoverSection?.subtitle || '从固定精选里挑一首，直接开始播放。'}</p>
+                </div>
+                <button className="text-xs font-semibold text-[var(--accent)] hover:opacity-80" onClick={() => setActivePage('search')}>
+                  去搜索 <ChevronRight size={12} className="inline -mt-0.5" />
+                </button>
               </div>
               <div className="card-grid">
-                {QUICK_PRESETS.map((item, idx) => renderCard(
-                  item.song,
+                {discoverSpotlightItems.map((item, idx) => renderCard(
+                  item.title,
                   item.artist,
                   item.cover,
-                  () => resolveAndPlay({ title: item.song, artist: item.artist })
+                  () => resolveAndPlay(item, { queue: discoverSpotlightItems, index: idx }),
                 ))}
               </div>
+
+              {continueSection?.items?.length > 0 && (
+                <>
+                  <div className="flex justify-between items-end mt-12 mb-4 border-b border-white/5 pb-2">
+                    <div>
+                      <h2 className="text-xl font-bold text-white tracking-tight">{continueSection.title}</h2>
+                      <p className="text-xs text-white/45 mt-1">{continueSection.subtitle || '继续听你最近停下来的内容。'}</p>
+                    </div>
+                    <button className="text-xs font-semibold text-[var(--accent)] hover:opacity-80" onClick={() => setActivePage('history')}>
+                      打开历史 <ChevronRight size={12} className="inline -mt-0.5" />
+                    </button>
+                  </div>
+                  <div className="card-grid">
+                    {continueSection.items.slice(0, 4).map((item, idx) => renderCard(
+                      item.title,
+                      item.artist,
+                      item.cover,
+                      () => resolveAndPlay(item, { queue: continueSection.items, index: idx }),
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -1595,7 +1852,13 @@ function App() {
               <div className="flex flex-col gap-8">
                 {RADIO_STATIONS.map((station, i) => (
                   <div key={station.id} className="relative rounded-2xl overflow-hidden h-64 md:h-80 cursor-pointer group hover:opacity-90 transition-opacity" onClick={() => resolveAndPlay({ title: station.title, artist: 'NAS Radio', cover: station.img, query: station.title + ' live mix' })}>
-                    <img src={station.img} alt={station.title} className="absolute inset-0 w-full h-full object-cover transition-transform duration-700 group-hover:scale-105" />
+                    <img
+                      src={resolveCoverArt(station.title, 'NAS Radio', station.img)}
+                      alt={station.title}
+                      className="absolute inset-0 w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
+                      loading="lazy"
+                      onError={(event) => handleCoverError(event, station.title, 'NAS Radio')}
+                    />
                     <div className="absolute inset-0 bg-gradient-to-r from-black/80 via-black/40 to-transparent" />
                     <div className="absolute top-0 left-0 p-8 h-full flex flex-col justify-center">
                       <p className="text-xs font-bold text-white/70 uppercase tracking-widest mb-3 border border-white/20 inline-block px-3 py-1 rounded-full backdrop-blur-md">LIVE 广播</p>
@@ -1619,7 +1882,13 @@ function App() {
                     {uniqueArtists.map((artist, idx) => (
                       <div key={idx} className="flex flex-col items-center cursor-pointer group" onClick={() => runSearch(artist)}>
                         <div className="w-32 h-32 rounded-full bg-white/10 shadow-lg border border-white/5 mb-4 overflow-hidden group-hover:scale-105 transition-transform relative">
-                          <img src={`https://ui-avatars.com/api/?name=${encodeURIComponent(artist)}&background=random&size=256&font-size=0.33`} alt={artist} className="w-full h-full object-cover mix-blend-overlay opacity-60" />
+                          <img
+                            src={createBrandCover(artist, 'Artist')}
+                            alt={artist}
+                            className="w-full h-full object-cover mix-blend-overlay opacity-60"
+                            loading="lazy"
+                            onError={(event) => handleCoverError(event, artist, 'Artist')}
+                          />
                           <div className="absolute inset-0 flex items-center justify-center text-4xl font-black text-white/50 bg-gradient-to-br from-white/10 to-transparent">
                             {artist.charAt(0).toUpperCase()}
                           </div>
@@ -1652,7 +1921,11 @@ function App() {
                     {allSongs.map((song, idx) => (
                       <div key={song.key} className="grid grid-cols-[auto_1fr_1fr_auto] gap-4 px-4 py-3 items-center hover:bg-white/5 rounded-lg cursor-pointer group transition-colors" onClick={() => resolveAndPlay(song)}>
                         <div className="w-8 relative flex justify-center items-center">
-                          <img src={song.cover} className="w-8 h-8 rounded shrink-0 opacity-100 group-hover:opacity-40 transition-opacity" />
+                          <img
+                            src={resolveCoverArt(song.title, song.artist, song.cover)}
+                            className="w-8 h-8 rounded shrink-0 opacity-100 group-hover:opacity-40 transition-opacity"
+                            onError={(event) => handleCoverError(event, song.title, song.artist)}
+                          />
                           <Play size={14} className="absolute text-white opacity-0 group-hover:opacity-100 drop-shadow-md" fill="currentColor" />
                         </div>
                         <span className="text-sm font-semibold truncate group-hover:text-white transition-colors">{song.title}</span>
@@ -1672,7 +1945,12 @@ function App() {
         <div className="current-track-info">
           {track ? (
             <>
-              <img src={track.cover} className="track-img" alt="" />
+                <img
+                  src={resolveCoverArt(track.title, track.artist, track.cover)}
+                  className="track-img"
+                  alt=""
+                  onError={(event) => handleCoverError(event, track.title, track.artist)}
+                />
               <div className="track-details">
                 <div className="track-name">{track.title}</div>
                 <div className="track-artist">{track.artist}</div>
