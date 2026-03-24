@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
@@ -33,7 +34,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency in local dev
     YTMusic = None
 
-from app_meta import APP_BRAND_NAME, APP_VERSION, BACKEND_HOST, BACKEND_PORT, UPDATE_CHANNEL
+from app_meta import APP_BRAND_NAME, APP_NAME, APP_VERSION, BACKEND_HOST, BACKEND_PORT, UPDATE_CHANNEL
 from app_paths import (
     DATA_DIR,
     FRONTEND_DIST,
@@ -118,6 +119,7 @@ class DownloadHistoryEntry(BaseModel):
     artist: str
     filename: str = ""
     sourceUrl: str = ""
+    savedPath: str = ""
     downloadedAt: Optional[str] = None
 
 
@@ -149,6 +151,38 @@ class LyricsOffsetEntry(BaseModel):
     artist: str = ""
     offsetSeconds: float = 0
     updatedAt: Optional[str] = None
+
+
+class AppSettingsResponse(BaseModel):
+    downloadDirectory: str
+    runtimeMode: str
+
+
+class AppSettingsUpdateRequest(BaseModel):
+    downloadDirectory: str = ""
+
+
+class DownloadJobCreateRequest(BaseModel):
+    key: Optional[str] = None
+    title: str
+    artist: str = ""
+    filename: str
+    sourceUrl: str
+
+
+class DownloadJobResponse(BaseModel):
+    id: str
+    status: str
+    progress: float = 0
+    bytesReceived: int = 0
+    totalBytes: int = 0
+    filename: str = ""
+    savedPath: str = ""
+    sourceUrl: str = ""
+    error: str = ""
+    createdAt: str
+    startedAt: Optional[str] = None
+    completedAt: Optional[str] = None
 
 
 class SilentYtdlpLogger:
@@ -225,6 +259,9 @@ HTTP_SESSION_CACHE: dict[tuple[str, str, str], requests.Session] = {}
 HTTP_SESSION_LOCK = threading.Lock()
 YTMUSIC_CLIENT: Any = None
 YTMUSIC_CLIENT_LOCK = threading.Lock()
+APP_SETTING_DOWNLOAD_DIRECTORY = "download_directory"
+DOWNLOAD_JOBS: dict[str, dict[str, Any]] = {}
+DOWNLOAD_JOBS_LOCK = threading.Lock()
 
 YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_DATA_API_KEY", "").strip()
 NAS_SEARCH_PROVIDER = os.getenv("NAS_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
@@ -402,6 +439,216 @@ def get_db_connection() -> sqlite3.Connection:
     return connection
 
 
+def ensure_column_exists(connection: sqlite3.Connection, table_name: str, column_name: str, definition_sql: str) -> None:
+    existing_columns = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name not in existing_columns:
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition_sql}")
+
+
+def default_download_directory() -> Path:
+    downloads_root = Path.home() / "Downloads"
+    return downloads_root / APP_NAME
+
+
+def get_app_setting(key: str, default: str = "") -> str:
+    with get_db_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT setting_value
+            FROM app_settings
+            WHERE setting_key = ?
+            """,
+            (key,),
+        ).fetchone()
+    if not row:
+        return default
+    return str(row["setting_value"] or default)
+
+
+def set_app_setting(key: str, value: str) -> str:
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO app_settings (setting_key, setting_value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+                setting_value = excluded.setting_value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, utc_now_iso()),
+        )
+    return value
+
+
+def resolve_download_directory_path(preferred_value: str = "") -> Path:
+    candidate = (preferred_value or get_app_setting(APP_SETTING_DOWNLOAD_DIRECTORY, "")).strip()
+    if candidate:
+        path = Path(candidate).expanduser()
+    else:
+        path = default_download_directory()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def get_app_settings_payload() -> dict:
+    download_directory = str(resolve_download_directory_path())
+    return {
+        "downloadDirectory": download_directory,
+        "runtimeMode": "packaged" if IS_FROZEN else "source",
+    }
+
+
+def open_path_in_file_manager(path_value: Path) -> None:
+    target = Path(path_value)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Path does not exist")
+    if platform.system().lower().startswith("win"):
+        os.startfile(str(target))  # type: ignore[attr-defined]
+        return
+    raise HTTPException(status_code=501, detail="Open folder is only available on Windows")
+
+
+def make_unique_download_path(directory: Path, filename: str) -> Path:
+    safe_name = safe_download_filename(filename)
+    base_name = Path(safe_name).stem or "music"
+    suffix = Path(safe_name).suffix or ".m4a"
+    candidate = directory / f"{base_name}{suffix}"
+    counter = 2
+    while candidate.exists():
+        candidate = directory / f"{base_name} ({counter}){suffix}"
+        counter += 1
+    return candidate
+
+
+def snapshot_download_job(job_id: str) -> dict:
+    with DOWNLOAD_JOBS_LOCK:
+        job = DOWNLOAD_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Download job not found")
+        return dict(job)
+
+
+def update_download_job(job_id: str, **fields: Any) -> dict:
+    with DOWNLOAD_JOBS_LOCK:
+        job = DOWNLOAD_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Download job not found")
+        job.update(fields)
+        return dict(job)
+
+
+def run_download_job(job_id: str, source_url: str, filename: str) -> None:
+    part_path: Path | None = None
+    try:
+        destination_dir = resolve_download_directory_path()
+        destination_path = make_unique_download_path(destination_dir, filename)
+        part_path = destination_path.with_suffix(destination_path.suffix + ".part")
+        update_download_job(
+            job_id,
+            status="downloading",
+            progress=0.0,
+            bytesReceived=0,
+            totalBytes=0,
+            filename=destination_path.name,
+            savedPath=str(destination_path),
+            startedAt=utc_now_iso(),
+        )
+
+        upstream, transport_mode = request_media_response(
+            source_url,
+            timeout=30,
+            stream=True,
+        )
+        total_bytes = int(upstream.headers.get("content-length") or 0)
+        bytes_received = 0
+        update_download_job(job_id, totalBytes=total_bytes)
+
+        with open(part_path, "wb") as handle:
+            for chunk in upstream.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                bytes_received += len(chunk)
+                progress = (bytes_received / total_bytes) if total_bytes > 0 else 0.0
+                update_download_job(
+                    job_id,
+                    bytesReceived=bytes_received,
+                    totalBytes=total_bytes,
+                    progress=min(0.99, progress) if total_bytes <= 0 else min(1.0, progress),
+                )
+
+        os.replace(part_path, destination_path)
+        update_download_job(
+            job_id,
+            status="completed",
+            progress=1.0,
+            bytesReceived=bytes_received,
+            totalBytes=max(total_bytes, bytes_received),
+            filename=destination_path.name,
+            savedPath=str(destination_path),
+            completedAt=utc_now_iso(),
+            error="",
+            transportMode=transport_mode,
+        )
+    except Exception as exc:
+        if part_path and part_path.exists():
+            try:
+                part_path.unlink()
+            except OSError:
+                pass
+        update_download_job(
+            job_id,
+            status="failed",
+            error=str(exc) or exc.__class__.__name__,
+            completedAt=utc_now_iso(),
+        )
+
+
+def create_download_job(request: DownloadJobCreateRequest) -> dict:
+    source_url = (request.sourceUrl or "").strip()
+    if not source_url:
+        raise HTTPException(status_code=422, detail="sourceUrl is required")
+    safe_filename = safe_download_filename(request.filename)
+    if not safe_filename:
+        raise HTTPException(status_code=422, detail="filename is required")
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    job_payload = {
+        "id": job_id,
+        "status": "queued",
+        "progress": 0.0,
+        "bytesReceived": 0,
+        "totalBytes": 0,
+        "filename": safe_filename,
+        "savedPath": "",
+        "sourceUrl": source_url,
+        "error": "",
+        "createdAt": utc_now_iso(),
+        "startedAt": None,
+        "completedAt": None,
+        "title": request.title,
+        "artist": request.artist,
+        "key": request.key,
+    }
+    with DOWNLOAD_JOBS_LOCK:
+        DOWNLOAD_JOBS[job_id] = job_payload
+
+    worker = threading.Thread(
+        target=run_download_job,
+        args=(job_id, source_url, safe_filename),
+        daemon=True,
+        name=f"download-job-{job_id}",
+    )
+    worker.start()
+    return dict(job_payload)
+
+
 def init_library_db() -> None:
     with get_db_connection() as connection:
         connection.executescript(
@@ -438,6 +685,7 @@ def init_library_db() -> None:
                 artist TEXT NOT NULL,
                 filename TEXT NOT NULL DEFAULT '',
                 source_url TEXT NOT NULL DEFAULT '',
+                saved_path TEXT NOT NULL DEFAULT '',
                 downloaded_at TEXT NOT NULL
             );
 
@@ -447,6 +695,12 @@ def init_library_db() -> None:
                 title TEXT NOT NULL DEFAULT '',
                 artist TEXT NOT NULL DEFAULT '',
                 offset_seconds REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             );
 
@@ -463,6 +717,7 @@ def init_library_db() -> None:
             ON lyrics_offsets(video_id);
             """
         )
+        ensure_column_exists(connection, "download_history", "saved_path", "TEXT NOT NULL DEFAULT ''")
 
 
 def library_track_from_row(row: sqlite3.Row, timestamp_field: str) -> dict:
@@ -510,7 +765,7 @@ def fetch_recent_downloads(limit: int = 12) -> list[dict]:
     with get_db_connection() as connection:
         rows = connection.execute(
             """
-            SELECT track_key, title, artist, filename, source_url, downloaded_at
+            SELECT track_key, title, artist, filename, source_url, saved_path, downloaded_at
             FROM download_history
             ORDER BY downloaded_at DESC, id DESC
             LIMIT ?
@@ -524,6 +779,7 @@ def fetch_recent_downloads(limit: int = 12) -> list[dict]:
             "artist": row["artist"],
             "filename": row["filename"],
             "sourceUrl": row["source_url"],
+            "savedPath": row["saved_path"],
             "downloadedAt": row["downloaded_at"],
         }
         for row in rows
@@ -665,6 +921,7 @@ def get_system_check() -> dict:
         "libraryDb": str(LIBRARY_DB),
         "libraryDbAvailable": LIBRARY_DB.is_file(),
         "libraryStats": library_stats,
+        "downloadDirectory": str(resolve_download_directory_path()),
         "recommendedEntry": "http://localhost:8010",
         "issues": issues,
     }
@@ -1222,6 +1479,21 @@ def pick_thumbnail_url(thumbnails: Any) -> str:
     return ""
 
 
+def preferred_video_thumbnail(video_id: str = "", current_url: str = "") -> str:
+    normalized_video_id = (video_id or "").strip()
+    if not normalized_video_id:
+        return current_url or ""
+
+    high_res_candidate = f"https://i.ytimg.com/vi/{normalized_video_id}/hqdefault.jpg"
+    if not current_url:
+        return high_res_candidate
+
+    normalized_url = current_url.lower()
+    if any(marker in normalized_url for marker in ("=w60-", "=w120-", "/default.jpg", "/mqdefault.jpg", "/sddefault.jpg")):
+        return high_res_candidate
+    return current_url
+
+
 def normalize_ytmusic_language(value: str) -> str:
     normalized = (value or "").strip().replace("-", "_")
     if normalized in SUPPORTED_YTMUSIC_LANGUAGES:
@@ -1259,6 +1531,7 @@ def normalize_catalog_entry(entry: dict, provider: str) -> dict:
     normalized = dict(entry)
     normalized["provider"] = provider
     normalized["duration"] = normalize_duration_seconds(entry.get("duration"))
+    normalized["thumbnail"] = preferred_video_thumbnail(str(entry.get("id") or ""), str(entry.get("thumbnail") or ""))
     return normalized
 
 
@@ -1990,6 +2263,28 @@ async def system_check():
     return get_system_check()
 
 
+@app.get("/app-settings", response_model=AppSettingsResponse)
+async def get_app_settings():
+    init_library_db()
+    return get_app_settings_payload()
+
+
+@app.post("/app-settings", response_model=AppSettingsResponse)
+async def update_app_settings(item: AppSettingsUpdateRequest):
+    init_library_db()
+    requested_directory = (item.downloadDirectory or "").strip()
+    resolved_directory = resolve_download_directory_path(requested_directory)
+    set_app_setting(APP_SETTING_DOWNLOAD_DIRECTORY, str(resolved_directory))
+    return get_app_settings_payload()
+
+
+@app.post("/app-settings/open-download-directory")
+async def open_download_directory():
+    init_library_db()
+    open_path_in_file_manager(resolve_download_directory_path())
+    return {"ok": True, "path": str(resolve_download_directory_path())}
+
+
 @app.get("/library", response_model=LibraryResponse)
 async def get_library():
     return {
@@ -2109,8 +2404,8 @@ async def create_download_history(item: DownloadHistoryEntry):
     with get_db_connection() as connection:
         connection.execute(
             """
-            INSERT INTO download_history (track_key, title, artist, filename, source_url, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO download_history (track_key, title, artist, filename, source_url, saved_path, downloaded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item.key,
@@ -2118,6 +2413,7 @@ async def create_download_history(item: DownloadHistoryEntry):
                 item.artist,
                 item.filename,
                 item.sourceUrl,
+                item.savedPath,
                 downloaded_at,
             ),
         )
@@ -2128,8 +2424,29 @@ async def create_download_history(item: DownloadHistoryEntry):
         "artist": item.artist,
         "filename": item.filename,
         "sourceUrl": item.sourceUrl,
+        "savedPath": item.savedPath,
         "downloadedAt": downloaded_at,
     }
+
+
+@app.post("/download-jobs", response_model=DownloadJobResponse)
+async def create_desktop_download_job(item: DownloadJobCreateRequest):
+    init_library_db()
+    return create_download_job(item)
+
+
+@app.get("/download-jobs/{job_id}", response_model=DownloadJobResponse)
+async def get_download_job(job_id: str):
+    return snapshot_download_job(job_id)
+
+
+@app.post("/download-jobs/{job_id}/open-folder")
+async def open_download_job_folder(job_id: str):
+    job = snapshot_download_job(job_id)
+    saved_path = str(job.get("savedPath") or "").strip()
+    target_path = Path(saved_path).parent if saved_path else resolve_download_directory_path()
+    open_path_in_file_manager(target_path)
+    return {"ok": True, "path": str(target_path)}
 
 
 @app.get("/lyrics-offset")

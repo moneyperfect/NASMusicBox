@@ -36,6 +36,7 @@ def isolated_library(tmp_path, monkeypatch):
     main.LYRICS_CACHE.clear()
     main.COLOR_CACHE.clear()
     main.RECOMMENDATIONS_CACHE.clear()
+    main.DOWNLOAD_JOBS.clear()
     return db_path
 
 
@@ -95,6 +96,7 @@ def test_library_roundtrip_and_system_check(isolated_library):
                 artist="YOASOBI",
                 filename="夜に駆ける - YOASOBI.m4a",
                 sourceUrl="https://example.com/audio.m4a",
+                savedPath=str((isolated_library.parent / "downloads" / "yoasobi.m4a")),
             )
         )
     )
@@ -123,11 +125,13 @@ def test_library_roundtrip_and_system_check(isolated_library):
     library = asyncio.run(main.get_library())
     assert library["favorites"][0]["title"] == "夜に駆ける"
     assert library["recentDownloads"][0]["filename"].endswith(".m4a")
+    assert library["recentDownloads"][0]["savedPath"].endswith("yoasobi.m4a")
 
     system_check = main.get_system_check()
     assert system_check["appVersion"] == APP_VERSION
     assert system_check["libraryDbAvailable"] is True
     assert system_check["frontendBuilt"] is True
+    assert system_check["downloadDirectory"]
 
 
 def test_search_youtube_entries_uses_backend_cache(monkeypatch):
@@ -247,6 +251,11 @@ def test_normalize_ytmusic_language_handles_web_locales():
     assert main.normalize_ytmusic_language("xx-YY") == "en"
 
 
+def test_preferred_video_thumbnail_upgrades_low_res_urls():
+    assert main.preferred_video_thumbnail("abc123", "https://lh3.googleusercontent.com/=w120-h120") == "https://i.ytimg.com/vi/abc123/hqdefault.jpg"
+    assert main.preferred_video_thumbnail("abc123", "https://i.ytimg.com/vi/abc123/hqdefault.jpg") == "https://i.ytimg.com/vi/abc123/hqdefault.jpg"
+
+
 def test_search_ytmusicapi_entries_filters_metric_labels_and_skips_extra_queries(monkeypatch):
     calls = []
 
@@ -340,3 +349,12 @@ def test_recommendations_mix_history_and_personalized_results(isolated_library, 
     assert "nas-curated" in sections
     assert sections["continue-listening"].items[0].title == "Take On Me"
     assert len(sections["for-you"].items) >= 2
+
+
+def test_app_settings_roundtrip(isolated_library):
+    settings = asyncio.run(main.get_app_settings())
+    assert settings["runtimeMode"] in {"source", "packaged"}
+    assert settings["downloadDirectory"]
+
+    updated = asyncio.run(main.update_app_settings(main.AppSettingsUpdateRequest(downloadDirectory="~/Downloads/TestNAS")))
+    assert updated["downloadDirectory"].endswith("TestNAS")

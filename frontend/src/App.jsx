@@ -32,9 +32,11 @@ import {
   AlertTriangle,
   Trash2,
   FolderDown,
+  FolderOpen,
 } from 'lucide-react';
 
 import VibeOverlay from './components/VibeOverlay';
+import CoverArt from './components/CoverArt';
 
 const HISTORY_STORAGE_KEY = 'nsrl_local_history_v2';
 const FAVORITES_STORAGE_KEY = 'nsrl_local_favorites_v2';
@@ -104,6 +106,9 @@ const DESKTOP_ACTION_STORAGE_KEY = 'nas_desktop_action_v1';
 const DESKTOP_SYNC_CHANNEL = 'nas_desktop_sync_v1';
 const LIBRARY_SYNC_INTERVAL_MS = 6000;
 const VISUALIZE_CACHE_TTL_MS = 75 * 1000;
+const MANAGED_DOWNLOAD_POLL_MS = 850;
+const QUEUE_PANEL_SOURCES = new Set(['search', 'discover', 'radio', 'continue']);
+const PLAYBACK_MODE_SEQUENCE = ['off', 'all', 'one'];
 
 const trimTrailingSlash = (value) => value.replace(/\/+$/, '');
 const normalizeSearchQuery = (value) => (value || '').trim().replace(/\s+/g, ' ');
@@ -212,6 +217,24 @@ const handleCoverError = (event, song, artist) => {
 
 const recommendationIdentity = (item) => item?.videoId ? `vid:${item.videoId}` : `${(item?.title || '').trim().toLowerCase()}::${(item?.artist || '').trim().toLowerCase()}`;
 
+const shuffleArray = (items) => {
+  const next = [...items];
+  for (let index = next.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [next[index], next[swapIndex]] = [next[swapIndex], next[index]];
+  }
+  return next;
+};
+
+const buildQueueOrder = (queueLength, currentOriginalIndex = 0, shuffleEnabled = false) => {
+  if (!Number.isFinite(queueLength) || queueLength <= 0) return [];
+  const indices = Array.from({ length: queueLength }, (_, index) => index);
+  const safeCurrentIndex = Math.max(0, Math.min(currentOriginalIndex, queueLength - 1));
+  if (!shuffleEnabled || queueLength <= 1) return indices;
+  const remaining = shuffleArray(indices.filter((index) => index !== safeCurrentIndex));
+  return [safeCurrentIndex, ...remaining];
+};
+
 const buildFallbackRecommendations = () => ({
   mode: 'fallback',
   generatedAt: null,
@@ -288,6 +311,7 @@ const normalizeDownloadHistoryItem = (item) => ({
   artist: item?.artist || '',
   filename: item?.filename || '',
   sourceUrl: item?.sourceUrl || '',
+  savedPath: item?.savedPath || '',
   downloadedAt: item?.downloadedAt || new Date().toISOString(),
 });
 
@@ -295,7 +319,7 @@ const mergeDownloadHistory = (primary, secondary, limit = 30) => {
   const merged = new Map();
   [...primary, ...secondary].forEach((rawItem) => {
     const item = normalizeDownloadHistoryItem(rawItem);
-    const dedupeKey = `${item.filename}::${item.sourceUrl}::${item.downloadedAt}`;
+    const dedupeKey = `${item.filename}::${item.sourceUrl}::${item.savedPath}::${item.downloadedAt}`;
     if (!merged.has(dedupeKey)) {
       merged.set(dedupeKey, item);
     }
@@ -325,6 +349,28 @@ const normalizeDownloadTask = (item) => ({
   completedAt: item?.completedAt || null,
   error: item?.error || '',
   sourceUrl: item?.sourceUrl || '',
+  savedPath: item?.savedPath || '',
+  jobId: item?.jobId || '',
+});
+
+const waitWithAbort = (ms, signal) => new Promise((resolve, reject) => {
+  const timer = window.setTimeout(() => {
+    signal?.removeEventListener?.('abort', onAbort);
+    resolve();
+  }, ms);
+
+  const onAbort = () => {
+    window.clearTimeout(timer);
+    reject(new DOMException('Aborted', 'AbortError'));
+  };
+
+  if (signal) {
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
 });
 
 const buildLibraryRecord = (item, timestampField) => {
@@ -381,7 +427,11 @@ function App() {
   const [resolvingTrack, setResolvingTrack] = useState(false);
   const [track, setTrack] = useState(null);
   const [playQueue, setPlayQueue] = useState([]);
+  const [queueOrder, setQueueOrder] = useState([]);
   const [queueIndex, setQueueIndex] = useState(-1);
+  const [queueSource, setQueueSource] = useState('direct');
+  const [repeatMode, setRepeatMode] = useState('off');
+  const [shuffleEnabled, setShuffleEnabled] = useState(false);
 
   const [historyItems, setHistoryItems] = useState(() => readStorage(HISTORY_STORAGE_KEY, []).map(toHistoryRecord));
   const [favorites, setFavorites] = useState(() => readStorage(FAVORITES_STORAGE_KEY, []).map(toFavoriteRecord));
@@ -402,6 +452,7 @@ function App() {
 
   const [backendStatus, setBackendStatus] = useState('checking');
   const [systemCheck, setSystemCheck] = useState(null);
+  const [appSettings, setAppSettings] = useState(null);
   const [notice, setNotice] = useState('');
   const [remotePlayerState, setRemotePlayerState] = useState(() => readObjectStorage(PLAYER_STATE_STORAGE_KEY, {
     track: null,
@@ -413,6 +464,8 @@ function App() {
     queueLength: 0,
     canGoPrevious: false,
     canGoNext: false,
+    repeatMode: 'off',
+    shuffleEnabled: false,
     vibeModeEnabled: false,
     updatedAt: 0,
   }));
@@ -484,6 +537,15 @@ function App() {
     ],
     [primaryDiscoverSection, continueSection, curatedSection, discoverSpotlightItems, historyItems],
   );
+  const orderedPlayQueue = useMemo(
+    () => (queueOrder.length > 0 ? queueOrder.map((itemIndex) => playQueue[itemIndex]).filter(Boolean) : playQueue),
+    [playQueue, queueOrder],
+  );
+  const queuePanelAvailable = orderedPlayQueue.length >= 2 && QUEUE_PANEL_SOURCES.has(queueSource);
+  const canGoPrevious = orderedPlayQueue.length > 0 && (queueIndex > 0 || (repeatMode === 'all' && orderedPlayQueue.length > 1));
+  const canGoNext = orderedPlayQueue.length > 0 && (queueIndex < orderedPlayQueue.length - 1 || (repeatMode === 'all' && orderedPlayQueue.length > 1));
+  const managedDownloadsEnabled = systemCheck?.runtimeMode === 'packaged';
+  const currentDownloadDirectory = appSettings?.downloadDirectory || systemCheck?.downloadDirectory || '';
 
   const apiRequest = async (path, options = {}) => {
     const { headers, ...rest } = options;
@@ -521,6 +583,76 @@ function App() {
   const setNoticeText = (text) => {
     setNotice(text);
     setTimeout(() => setNotice(''), 3000);
+  };
+
+  const applyQueueContext = (queue = [], orderedIndex = -1, nextQueueSource = 'direct', orderOverride = null) => {
+    const normalizedQueue = Array.isArray(queue) ? queue.filter(Boolean) : [];
+    if (normalizedQueue.length === 0 || orderedIndex < 0) {
+      setPlayQueue([]);
+      setQueueOrder([]);
+      setQueueIndex(-1);
+      setQueueSource(nextQueueSource || 'direct');
+      return;
+    }
+
+    const fallbackOriginalIndex = Math.max(0, Math.min(orderedIndex, normalizedQueue.length - 1));
+    const normalizedOrder = Array.isArray(orderOverride) && orderOverride.length === normalizedQueue.length
+      ? [...orderOverride]
+      : buildQueueOrder(normalizedQueue.length, fallbackOriginalIndex, shuffleEnabled);
+    const normalizedCursor = Array.isArray(orderOverride) && orderOverride.length === normalizedQueue.length
+      ? Math.max(0, Math.min(orderedIndex, normalizedOrder.length - 1))
+      : Math.max(0, normalizedOrder.findIndex((value) => value === fallbackOriginalIndex));
+
+    setPlayQueue(normalizedQueue);
+    setQueueOrder(normalizedOrder);
+    setQueueIndex(normalizedCursor);
+    setQueueSource(nextQueueSource || 'direct');
+  };
+
+  const syncQueueMode = (nextShuffleEnabled) => {
+    if (playQueue.length === 0) {
+      setShuffleEnabled(nextShuffleEnabled);
+      return;
+    }
+    const activeOriginalIndex = queueOrder[queueIndex] ?? Math.max(0, Math.min(queueIndex, playQueue.length - 1));
+    const nextOrder = buildQueueOrder(playQueue.length, activeOriginalIndex, nextShuffleEnabled);
+    const nextCursor = Math.max(0, nextOrder.findIndex((value) => value === activeOriginalIndex));
+    setQueueOrder(nextOrder);
+    setQueueIndex(nextCursor);
+    setShuffleEnabled(nextShuffleEnabled);
+  };
+
+  const cycleRepeatMode = () => {
+    setRepeatMode((previous) => PLAYBACK_MODE_SEQUENCE[(PLAYBACK_MODE_SEQUENCE.indexOf(previous) + 1) % PLAYBACK_MODE_SEQUENCE.length]);
+  };
+
+  const openDownloadDirectory = async (jobId = '') => {
+    try {
+      if (jobId) {
+        await apiRequest(`/download-jobs/${encodeURIComponent(jobId)}/open-folder`, { method: 'POST' });
+      } else {
+        await apiRequest('/app-settings/open-download-directory', { method: 'POST' });
+      }
+    } catch (error) {
+      setNoticeText(error instanceof Error ? error.message : '打开目录失败');
+    }
+  };
+
+  const updateDownloadDirectory = async () => {
+    const suggested = currentDownloadDirectory || '';
+    const input = window.prompt('请输入新的下载目录，留空则恢复默认目录。', suggested);
+    if (input === null) return;
+    try {
+      const nextSettings = await apiRequest('/app-settings', {
+        method: 'POST',
+        body: JSON.stringify({ downloadDirectory: input.trim() }),
+      });
+      setAppSettings(nextSettings);
+      setNoticeText('下载目录已更新');
+      void checkBackend();
+    } catch (error) {
+      setNoticeText(error instanceof Error ? error.message : '更新下载目录失败');
+    }
   };
 
   const markLibraryMigrated = () => {
@@ -790,70 +922,139 @@ function App() {
 
       const plan = await resolveDownloadPlan(task);
       updateDownloadTask(task.id, {
-        status: 'downloading',
         filename: plan.filename,
         sourceUrl: plan.rawUrl,
         audioExt: plan.audioExt,
       });
 
-      const response = await fetch(plan.requestUrl, {
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new Error(`下载请求失败 (${response.status})`);
-      }
+      let downloadedAt = new Date().toISOString();
+      let savedPath = '';
+      let jobId = '';
+      let resolvedFilename = plan.filename;
 
-      const totalBytes = Number(response.headers.get('content-length') || 0);
-      const contentType = response.headers.get('content-type') || 'application/octet-stream';
-      const reader = response.body?.getReader();
-      const chunks = [];
-      let received = 0;
+      if (managedDownloadsEnabled) {
+        const createdJob = await apiRequest('/download-jobs', {
+          method: 'POST',
+          body: JSON.stringify({
+            key: task.key || trackKey(task.videoId, task.title, task.artist),
+            title: task.title || '',
+            artist: task.artist || '',
+            filename: plan.filename,
+            sourceUrl: plan.rawUrl,
+          }),
+        });
+        jobId = createdJob.id;
+        updateDownloadTask(task.id, {
+          jobId,
+          status: createdJob.status || 'downloading',
+          filename: createdJob.filename || plan.filename,
+          sourceUrl: createdJob.sourceUrl || plan.rawUrl,
+          savedPath: createdJob.savedPath || '',
+        });
 
-      if (reader) {
         while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            chunks.push(value);
-            received += value.length;
-            updateDownloadTask(task.id, {
-              status: 'downloading',
-              bytesReceived: received,
-              totalBytes,
-              progress: totalBytes > 0 ? received / totalBytes : 0,
-            });
+          const currentJob = await apiRequest(`/download-jobs/${encodeURIComponent(jobId)}`, { cache: 'no-store' });
+          updateDownloadTask(task.id, {
+            jobId,
+            status: currentJob.status || 'downloading',
+            progress: Number(currentJob.progress || 0),
+            bytesReceived: Number(currentJob.bytesReceived || 0),
+            totalBytes: Number(currentJob.totalBytes || 0),
+            filename: currentJob.filename || plan.filename,
+            sourceUrl: currentJob.sourceUrl || plan.rawUrl,
+            savedPath: currentJob.savedPath || '',
+            startedAt: currentJob.startedAt || null,
+            completedAt: currentJob.completedAt || null,
+            error: currentJob.error || '',
+          });
+
+          if (currentJob.status === 'completed') {
+            downloadedAt = currentJob.completedAt || new Date().toISOString();
+            savedPath = currentJob.savedPath || '';
+            resolvedFilename = currentJob.filename || plan.filename;
+            break;
           }
+          if (currentJob.status === 'failed') {
+            throw new Error(currentJob.error || '下载失败');
+          }
+          await waitWithAbort(MANAGED_DOWNLOAD_POLL_MS, controller.signal);
         }
       } else {
-        const blob = await response.blob();
-        received = blob.size;
-        chunks.push(blob);
+        updateDownloadTask(task.id, {
+          status: 'downloading',
+        });
+
+        const response = await fetch(plan.requestUrl, {
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`下载请求失败 (${response.status})`);
+        }
+
+        const totalBytes = Number(response.headers.get('content-length') || 0);
+        const contentType = response.headers.get('content-type') || 'application/octet-stream';
+        const reader = response.body?.getReader();
+        const chunks = [];
+        let received = 0;
+
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+              chunks.push(value);
+              received += value.length;
+              updateDownloadTask(task.id, {
+                status: 'downloading',
+                bytesReceived: received,
+                totalBytes,
+                progress: totalBytes > 0 ? received / totalBytes : 0,
+              });
+            }
+          }
+        } else {
+          const blob = await response.blob();
+          received = blob.size;
+          chunks.push(blob);
+        }
+
+        const blob = chunks[0] instanceof Blob
+          ? chunks[0]
+          : new Blob(chunks, { type: contentType });
+
+        triggerBlobDownload(blob, plan.filename);
+        downloadedAt = new Date().toISOString();
+
+        updateDownloadTask(task.id, {
+          status: 'completed',
+          progress: 1,
+          bytesReceived: received || totalBytes,
+          totalBytes: totalBytes || received,
+          completedAt: downloadedAt,
+          error: '',
+          filename: plan.filename,
+          sourceUrl: plan.rawUrl,
+        });
       }
-
-      const blob = chunks[0] instanceof Blob
-        ? chunks[0]
-        : new Blob(chunks, { type: contentType });
-
-      triggerBlobDownload(blob, plan.filename);
-      const downloadedAt = new Date().toISOString();
 
       updateDownloadTask(task.id, {
         status: 'completed',
         progress: 1,
-        bytesReceived: received || totalBytes,
-        totalBytes: totalBytes || received,
         completedAt: downloadedAt,
         error: '',
-        filename: plan.filename,
+        filename: resolvedFilename,
         sourceUrl: plan.rawUrl,
+        savedPath,
+        jobId,
       });
 
       const historyEntry = {
         key: task.key || trackKey(task.videoId, task.title, task.artist),
         title: task.title || '',
         artist: task.artist || '',
-        filename: plan.filename,
+        filename: resolvedFilename,
         sourceUrl: plan.rawUrl,
+        savedPath,
         downloadedAt,
       };
       addCompletedDownloadHistory(historyEntry);
@@ -862,14 +1063,14 @@ function App() {
         body: JSON.stringify(historyEntry),
       }).catch(() => {});
 
-      setNoticeText(`已完成下载: ${task.title || '音频文件'}`);
+      setNoticeText(savedPath ? `已下载到: ${savedPath}` : `已完成下载: ${task.title || '音频文件'}`);
     } catch (err) {
       if (err?.name === 'AbortError') {
         updateDownloadTask(task.id, {
           status: 'failed',
-          error: '下载已取消',
+          error: managedDownloadsEnabled ? '已停止跟踪后台下载任务' : '下载已取消',
         });
-        setNoticeText('已取消当前下载');
+        setNoticeText(managedDownloadsEnabled ? '后台下载仍可能继续，请稍后查看下载目录' : '已取消当前下载');
       } else {
         console.error(err);
         updateDownloadTask(task.id, {
@@ -912,6 +1113,11 @@ function App() {
   };
 
   const removeDownloadTask = (taskId) => {
+    const targetTask = downloadTasks.find((task) => task.id === taskId);
+    if (managedDownloadsEnabled && targetTask?.jobId && (targetTask.status === 'resolving' || targetTask.status === 'downloading')) {
+      setNoticeText('桌面后台下载暂不支持取消，请等待完成后再清理任务');
+      return;
+    }
     const controller = downloadAbortControllersRef.current.get(taskId);
     if (controller) {
       controller.abort();
@@ -951,11 +1157,15 @@ function App() {
       if (!healthRes.ok) throw new Error();
       const checkRes = await fetch(apiUrl('/system-check'), { cache: 'no-store' });
       const checkData = checkRes.ok ? await checkRes.json() : null;
+      const settingsRes = await fetch(apiUrl('/app-settings'), { cache: 'no-store' });
+      const settingsData = settingsRes.ok ? await settingsRes.json() : null;
       setBackendStatus('online');
       setSystemCheck(checkData);
+      setAppSettings(settingsData);
     } catch {
       setBackendStatus('offline');
       setSystemCheck(null);
+      setAppSettings(null);
     }
   };
 
@@ -1032,7 +1242,12 @@ function App() {
   };
 
   const resolveAndPlay = async (candidate, options = {}) => {
-    const { queue = null, index = -1 } = options;
+    const {
+      queue = null,
+      index = -1,
+      queueSource: nextQueueSource = 'direct',
+      queueOrderOverride = null,
+    } = options;
     const query = candidate.query || makeQuery(candidate.title, candidate.artist);
     const cacheKey = candidate.videoId ? `vid:${candidate.videoId}` : `query:${normalizeSearchQuery(query)}`;
     const cached = visualizeCache.get(cacheKey);
@@ -1056,7 +1271,7 @@ function App() {
         key: trackKey(data.videoId || candidate.videoId, data.title || candidate.title, data.artist || candidate.artist),
         title: data.title || candidate.title,
         artist: data.artist || candidate.artist,
-        cover: data.cover || candidate.cover,
+        cover: resolveCoverArt(data.title || candidate.title, data.artist || candidate.artist, data.cover || candidate.cover),
         theme: data.theme || 'Vibe Resonating',
         colors: data.colors || ['#22d3ee', '#000000'],
         audioSrc: resolveAudioUrl(data.audioSrc),
@@ -1076,10 +1291,7 @@ function App() {
       setDuration(0);
       setIsPlaying(false);
 
-      if (queue) {
-        setPlayQueue(queue);
-        setQueueIndex(index);
-      }
+      applyQueueContext(queue, index, nextQueueSource, queueOrderOverride);
 
       const historyEntry = toHistoryRecord({
         key: resolved.key,
@@ -1152,8 +1364,24 @@ function App() {
   };
 
   const jumpQueue = (nextIndex) => {
-    if (nextIndex < 0 || nextIndex >= playQueue.length) return;
-    resolveAndPlay(playQueue[nextIndex], { queue: playQueue, index: nextIndex });
+    if (nextIndex < 0 || nextIndex >= orderedPlayQueue.length) return;
+    resolveAndPlay(orderedPlayQueue[nextIndex], {
+      queue: playQueue,
+      index: nextIndex,
+      queueSource,
+      queueOrderOverride: queueOrder,
+    });
+  };
+
+  const moveQueue = (direction, { wrap = false } = {}) => {
+    if (orderedPlayQueue.length === 0) return false;
+    let nextIndex = queueIndex + direction;
+    if (nextIndex < 0 || nextIndex >= orderedPlayQueue.length) {
+      if (!wrap) return false;
+      nextIndex = nextIndex < 0 ? orderedPlayQueue.length - 1 : 0;
+    }
+    jumpQueue(nextIndex);
+    return true;
   };
 
   const onLoadedMetadata = () => {
@@ -1181,11 +1409,11 @@ function App() {
       return;
     }
     if (type === 'next') {
-      jumpQueue(queueIndex + 1);
+      moveQueue(1, { wrap: repeatMode === 'all' });
       return;
     }
     if (type === 'previous') {
-      jumpQueue(queueIndex - 1);
+      moveQueue(-1, { wrap: repeatMode === 'all' });
       return;
     }
     if (type === 'toggle-vibe') {
@@ -1231,7 +1459,7 @@ function App() {
       channel.close();
       if (syncChannelRef.current === channel) syncChannelRef.current = null;
     };
-  }, [isMiniMode, queueIndex, playQueue.length, track, isPlaying]);
+  }, [isMiniMode, queueIndex, orderedPlayQueue.length, track, isPlaying, repeatMode]);
 
   useEffect(() => {
     const handleStorage = (event) => {
@@ -1262,7 +1490,7 @@ function App() {
       window.removeEventListener('storage', handleStorage);
       window.removeEventListener('nas-desktop-shell-action', handleShellAction);
     };
-  }, [isMiniMode, remotePlayerState, queueIndex, playQueue.length, track, isPlaying]);
+  }, [isMiniMode, remotePlayerState, queueIndex, orderedPlayQueue.length, track, isPlaying, repeatMode]);
 
   useEffect(() => {
     if (isMiniMode) return undefined;
@@ -1274,9 +1502,11 @@ function App() {
       duration: Number(duration.toFixed(2)),
       volume,
       queueIndex,
-      queueLength: playQueue.length,
-      canGoPrevious: queueIndex > 0,
-      canGoNext: queueIndex >= 0 && queueIndex < playQueue.length - 1,
+      queueLength: orderedPlayQueue.length,
+      canGoPrevious,
+      canGoNext,
+      repeatMode,
+      shuffleEnabled,
       vibeModeEnabled,
       updatedAt: Date.now(),
     };
@@ -1284,20 +1514,22 @@ function App() {
     localStorage.setItem(PLAYER_STATE_STORAGE_KEY, JSON.stringify(payload));
     postDesktopMessage({ type: 'player-state', payload });
     return undefined;
-  }, [isMiniMode, track, isPlaying, currentTime, duration, volume, queueIndex, playQueue.length, vibeModeEnabled]);
+  }, [isMiniMode, track, isPlaying, currentTime, duration, volume, queueIndex, orderedPlayQueue.length, canGoPrevious, canGoNext, repeatMode, shuffleEnabled, vibeModeEnabled]);
 
   const renderCard = (song, artist, cover, onClick, isPlayable = true) => {
     const displayCover = resolveCoverArt(song, artist, cover);
+    const fallbackCover = createBrandCover(song, artist);
 
     return (
       <div className="music-card animate-slide-up group" onClick={onClick}>
         <div className="card-image-wrap">
-          <img
+          <CoverArt
             src={displayCover}
-            className="card-image"
+            fallbackSrc={fallbackCover}
+            className="w-full h-full"
+            imgClassName="card-image"
             alt=""
             loading="lazy"
-            onError={(event) => handleCoverError(event, song, artist)}
           />
           {isPlayable && (
             <div className="play-hover-btn">
@@ -1532,7 +1764,13 @@ function App() {
                     style={heroBackgroundStyle(banner.accent)}
                     onClick={() => {
                       if (banner.item) {
-                        resolveAndPlay(banner.item);
+                        const spotlightIndex = discoverSpotlightItems.findIndex((item) => recommendationIdentity(item) === recommendationIdentity(banner.item));
+                        resolveAndPlay(
+                          banner.item,
+                          spotlightIndex >= 0
+                            ? { queue: discoverSpotlightItems, index: spotlightIndex, queueSource: 'discover' }
+                            : { queueSource: 'discover' },
+                        );
                       } else {
                         setActivePage('search');
                       }
@@ -1570,7 +1808,7 @@ function App() {
                   item.title,
                   item.artist,
                   item.cover,
-                  () => resolveAndPlay(item, { queue: discoverSpotlightItems, index: idx }),
+                  () => resolveAndPlay(item, { queue: discoverSpotlightItems, index: idx, queueSource: 'discover' }),
                 ))}
               </div>
 
@@ -1590,7 +1828,7 @@ function App() {
                       item.title,
                       item.artist,
                       item.cover,
-                      () => resolveAndPlay(item, { queue: continueSection.items, index: idx }),
+                      () => resolveAndPlay(item, { queue: continueSection.items, index: idx, queueSource: 'continue' }),
                     ))}
                   </div>
                 </>
@@ -1609,7 +1847,7 @@ function App() {
                     item.title,
                     item.artist,
                     item.cover,
-                    () => resolveAndPlay(item, { queue: searchResults, index: idx })
+                    () => resolveAndPlay(item, { queue: searchResults, index: idx, queueSource: 'search' })
                   ))}
                 </div>
               ) : (
@@ -1632,7 +1870,7 @@ function App() {
                     item.title,
                     item.artist,
                     item.cover,
-                    () => resolveAndPlay(item)
+                    () => resolveAndPlay(item, { queueSource: 'favorites' })
                   ))}
                 </div>
               ) : (
@@ -1653,7 +1891,7 @@ function App() {
                     item.title,
                     item.artist,
                     item.cover,
-                    () => resolveAndPlay(item),
+                    () => resolveAndPlay(item, { queueSource: 'history' }),
                     true
                   ))}
                 </div>
@@ -1671,9 +1909,29 @@ function App() {
               <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-6">
                 <div>
                   <h2 className="section-title mb-2 border-b-0 pb-0">下载中心</h2>
-                  <p className="text-sm text-white/45">单任务顺序下载，支持进度跟踪、失败重试和最近下载记录。</p>
+                  <p className="text-sm text-white/45">
+                    {managedDownloadsEnabled
+                      ? '桌面端会直接保存到本地目录，支持路径查看、打开目录和最近下载记录。'
+                      : '源码浏览器模式下仍使用浏览器默认下载目录，最近记录只保留文件名与来源。'}
+                  </p>
                 </div>
                 <div className="flex flex-wrap gap-3">
+                  {managedDownloadsEnabled && (
+                    <>
+                      <button
+                        className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/70 hover:bg-white/10 transition-colors"
+                        onClick={() => void openDownloadDirectory()}
+                      >
+                        打开目录
+                      </button>
+                      <button
+                        className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/70 hover:bg-white/10 transition-colors"
+                        onClick={updateDownloadDirectory}
+                      >
+                        修改目录
+                      </button>
+                    </>
+                  )}
                   <button
                     className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/70 hover:bg-white/10 transition-colors"
                     onClick={() => void refreshLibraryState()}
@@ -1702,6 +1960,18 @@ function App() {
                     <div className={`text-3xl font-black ${stat.accent}`}>{stat.value}</div>
                   </div>
                 ))}
+              </div>
+
+              <div className="rounded-3xl border border-white/10 bg-white/5 px-5 py-4 mb-8 flex flex-col gap-2">
+                <div className="text-xs uppercase tracking-[0.24em] text-white/35">当前下载位置</div>
+                <div className="text-sm text-white/80 break-all">
+                  {managedDownloadsEnabled ? (currentDownloadDirectory || '尚未设置下载目录') : '浏览器默认下载目录'}
+                </div>
+                {!managedDownloadsEnabled && (
+                  <div className="text-xs text-white/45">
+                    如果你是从浏览器运行源码版，文件会进入浏览器自己的下载目录；打包桌面版才支持自定义路径。
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
@@ -1758,6 +2028,11 @@ function App() {
                                 </span>
                                 <span>{taskItem.filename || '等待生成文件名'}</span>
                               </div>
+                              {taskItem.savedPath && (
+                                <div className="mt-2 text-xs text-emerald-300/85 break-all">
+                                  保存位置：{taskItem.savedPath}
+                                </div>
+                              )}
                             </div>
 
                             <div className="mt-4 flex flex-wrap gap-2">
@@ -1767,6 +2042,14 @@ function App() {
                                   onClick={() => retryDownloadTask(taskItem.id)}
                                 >
                                   <span className="inline-flex items-center gap-2"><RefreshCw size={14} /> 重试</span>
+                                </button>
+                              )}
+                              {taskItem.savedPath && taskItem.jobId && (
+                                <button
+                                  className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
+                                  onClick={() => void openDownloadDirectory(taskItem.jobId)}
+                                >
+                                  <span className="inline-flex items-center gap-2"><FolderOpen size={14} /> 打开目录</span>
                                 </button>
                               )}
                               {taskItem.sourceUrl && (
@@ -1814,6 +2097,9 @@ function App() {
                             <span className="text-xs text-white/35 shrink-0">{formatRelativeTime(entry.downloadedAt)}</span>
                           </div>
                           <div className="mt-2 text-xs text-white/35 truncate">{entry.filename || '未记录文件名'}</div>
+                          {entry.savedPath && (
+                            <div className="mt-2 text-xs text-emerald-300/85 break-all">{entry.savedPath}</div>
+                          )}
                           {entry.sourceUrl && (
                             <button
                               className="mt-3 text-xs text-cyan-300 hover:text-cyan-200 transition-colors inline-flex items-center gap-1"
@@ -1842,7 +2128,7 @@ function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {[
                   { label: '后端核心', status: backendStatus === 'online', val: backendStatus },
-                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.2.4' },
+                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.5.0' },
                   { label: '运行模式', status: true, val: systemCheck?.runtimeMode === 'packaged' ? '桌面安装版' : '源码模式' },
                   { label: 'ffmpeg', status: !!systemCheck?.ffmpegAvailable, val: systemCheck?.ffmpegAvailable ? '已启用' : '未检测到' },
                   { label: '本地数据库', status: !!systemCheck?.libraryDbAvailable, val: systemCheck?.libraryDbAvailable ? 'SQLite 已连接' : '未初始化' },
@@ -1852,6 +2138,7 @@ function App() {
                   { label: '收藏 / 历史', status: true, val: `${systemCheck?.libraryStats?.favorites ?? favorites.length} / ${systemCheck?.libraryStats?.history ?? historyItems.length}` },
                   { label: '下载记录', status: true, val: `${systemCheck?.libraryStats?.downloads ?? downloadHistory.length} 条` },
                   { label: '歌词偏移', status: true, val: `${systemCheck?.libraryStats?.lyricsOffsets ?? 0} 条` },
+                  { label: '下载目录', status: true, val: managedDownloadsEnabled ? '桌面目录已启用' : '浏览器默认目录' },
                 ].map((stat, i) => (
                   <div key={i} className="bg-white/5 border border-white/10 p-4 rounded-xl flex justify-between items-center">
                     <span className="text-sm font-medium text-slate-400">{stat.label}</span>
@@ -1860,6 +2147,28 @@ function App() {
                     </span>
                   </div>
                 ))}
+              </div>
+              <div className="mt-6 p-6 bg-white/5 border border-white/10 rounded-2xl">
+                <h4 className="flex items-center gap-2 mb-3 text-slate-200"><FolderDown size={18} /> 下载目录</h4>
+                <div className="text-sm text-slate-400 break-all mb-4">
+                  {managedDownloadsEnabled ? (currentDownloadDirectory || '尚未设置') : '当前为源码浏览器模式，下载位置由浏览器自身决定。'}
+                </div>
+                {managedDownloadsEnabled && (
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/80 hover:bg-white/10 transition-colors"
+                      onClick={() => void openDownloadDirectory()}
+                    >
+                      打开当前目录
+                    </button>
+                    <button
+                      className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/80 hover:bg-white/10 transition-colors"
+                      onClick={updateDownloadDirectory}
+                    >
+                      修改下载目录
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="mt-8 p-6 bg-white/5 border border-white/10 rounded-2xl">
                 <h4 className="flex items-center gap-2 mb-2 text-slate-200"><Info size={18} /> 关于项目</h4>
@@ -1898,13 +2207,14 @@ function App() {
               <h1 className="text-3xl font-bold text-white mb-6 tracking-tight">广播</h1>
               <div className="flex flex-col gap-8">
                 {RADIO_STATIONS.map((station, i) => (
-                  <div key={station.id} className="relative rounded-2xl overflow-hidden h-64 md:h-80 cursor-pointer group hover:opacity-90 transition-opacity" onClick={() => resolveAndPlay({ title: station.title, artist: 'NAS Radio', cover: station.img, query: station.title + ' live mix' })}>
-                    <img
+                  <div key={station.id} className="relative rounded-2xl overflow-hidden h-64 md:h-80 cursor-pointer group hover:opacity-90 transition-opacity" onClick={() => resolveAndPlay({ title: station.title, artist: 'NAS Radio', cover: station.img, query: station.title + ' live mix' }, { queueSource: 'radio' })}>
+                    <CoverArt
                       src={resolveCoverArt(station.title, 'NAS Radio', station.img)}
+                      fallbackSrc={createBrandCover(station.title, 'NAS Radio')}
                       alt={station.title}
-                      className="absolute inset-0 w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
+                      className="absolute inset-0 w-full h-full"
+                      imgClassName="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
                       loading="lazy"
-                      onError={(event) => handleCoverError(event, station.title, 'NAS Radio')}
                     />
                     <div className="absolute inset-0 bg-gradient-to-r from-black/80 via-black/40 to-transparent" />
                     <div className="absolute top-0 left-0 p-8 h-full flex flex-col justify-center">
@@ -1966,12 +2276,13 @@ function App() {
                       <span className="w-16 text-right">时长</span>
                     </div>
                     {allSongs.map((song, idx) => (
-                      <div key={song.key} className="grid grid-cols-[auto_1fr_1fr_auto] gap-4 px-4 py-3 items-center hover:bg-white/5 rounded-lg cursor-pointer group transition-colors" onClick={() => resolveAndPlay(song)}>
+                      <div key={song.key} className="grid grid-cols-[auto_1fr_1fr_auto] gap-4 px-4 py-3 items-center hover:bg-white/5 rounded-lg cursor-pointer group transition-colors" onClick={() => resolveAndPlay(song, { queueSource: 'songs' })}>
                         <div className="w-8 relative flex justify-center items-center">
-                          <img
+                          <CoverArt
                             src={resolveCoverArt(song.title, song.artist, song.cover)}
-                            className="w-8 h-8 rounded shrink-0 opacity-100 group-hover:opacity-40 transition-opacity"
-                            onError={(event) => handleCoverError(event, song.title, song.artist)}
+                            fallbackSrc={createBrandCover(song.title, song.artist)}
+                            className="w-8 h-8 rounded shrink-0 opacity-100 group-hover:opacity-40 transition-opacity overflow-hidden"
+                            imgClassName="w-full h-full object-cover"
                           />
                           <Play size={14} className="absolute text-white opacity-0 group-hover:opacity-100 drop-shadow-md" fill="currentColor" />
                         </div>
@@ -1992,11 +2303,12 @@ function App() {
         <div className="current-track-info">
           {track ? (
             <>
-                <img
+                <CoverArt
                   src={resolveCoverArt(track.title, track.artist, track.cover)}
-                  className="track-img"
+                  fallbackSrc={createBrandCover(track.title, track.artist)}
+                  className="track-img overflow-hidden"
+                  imgClassName="w-full h-full object-cover"
                   alt=""
-                  onError={(event) => handleCoverError(event, track.title, track.artist)}
                 />
               <div className="track-details">
                 <div className="track-name">{track.title}</div>
@@ -2022,13 +2334,13 @@ function App() {
 
         <div className="main-controls">
           <div className="control-buttons">
-            <button className="control-btn" onClick={() => jumpQueue(queueIndex - 1)} disabled={queueIndex <= 0}>
+            <button className="control-btn" onClick={() => moveQueue(-1, { wrap: repeatMode === 'all' })} disabled={!canGoPrevious}>
               <SkipBack size={20} fill="currentColor" />
             </button>
             <button className="play-pause-btn" onClick={handleTogglePlay}>
               {isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} className="ml-1" fill="currentColor" />}
             </button>
-            <button className="control-btn" onClick={() => jumpQueue(queueIndex + 1)} disabled={queueIndex < 0 || queueIndex >= playQueue.length - 1}>
+            <button className="control-btn" onClick={() => moveQueue(1, { wrap: repeatMode === 'all' })} disabled={!canGoNext}>
               <SkipForward size={20} fill="currentColor" />
             </button>
 
@@ -2108,8 +2420,14 @@ function App() {
         onTimeUpdate={onTimeUpdate}
         onError={handleAudioError}
         onEnded={() => {
-          if (queueIndex < playQueue.length - 1) jumpQueue(queueIndex + 1);
-          else setIsPlaying(false);
+          if (repeatMode === 'one' && audioRef.current) {
+            audioRef.current.currentTime = 0;
+            audioRef.current.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+            return;
+          }
+          if (!moveQueue(1, { wrap: repeatMode === 'all' })) {
+            setIsPlaying(false);
+          }
         }}
       />
 
@@ -2118,17 +2436,71 @@ function App() {
           track={track}
           audioRef={audioRef}
           audioDuration={duration}
-          playQueue={playQueue}
+          playQueue={orderedPlayQueue}
           queueIndex={queueIndex}
           jumpQueue={jumpQueue}
+          queueSource={queueSource}
+          queuePanelAvailable={queuePanelAvailable}
           isPlaying={isPlaying}
           handleTogglePlay={handleTogglePlay}
           currentTime={currentTime}
           formatTime={formatTime}
           isFavoriteItem={isFavoriteItem}
           toggleFavoriteItem={toggleFavoriteItem}
+          repeatMode={repeatMode}
+          onCycleRepeatMode={cycleRepeatMode}
+          shuffleEnabled={shuffleEnabled}
+          onToggleShuffle={() => syncQueueMode(!shuffleEnabled)}
+          canGoPrevious={canGoPrevious}
+          canGoNext={canGoNext}
+          onPreviousTrack={() => moveQueue(-1, { wrap: repeatMode === 'all' })}
+          onNextTrack={() => moveQueue(1, { wrap: repeatMode === 'all' })}
+          onDownloadTrack={handleDownload}
+          onShareTrack={async (item) => {
+            const shareText = `${item?.title || ''} - ${item?.artist || ''}`.trim();
+            try {
+              if (navigator.share) {
+                await navigator.share({
+                  title: item?.title || 'NAS 音乐器',
+                  text: shareText,
+                });
+              } else if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(shareText);
+                setNoticeText('已复制歌曲信息');
+              }
+            } catch (error) {
+              if (error?.name !== 'AbortError') {
+                setNoticeText('分享失败，请稍后重试');
+              }
+            }
+          }}
+          onCopyTrackInfo={async (item) => {
+            const shareText = `${item?.title || ''} - ${item?.artist || ''}`.trim();
+            try {
+              await navigator.clipboard.writeText(shareText);
+              setNoticeText('已复制歌曲信息');
+            } catch {
+              setNoticeText('复制失败，请手动重试');
+            }
+          }}
+          onSearchArtist={(artist) => {
+            if (!artist) return;
+            setVibeModeEnabled(false);
+            void runSearch(artist);
+          }}
+          onSearchTrack={(item) => {
+            const searchText = makeQuery(item?.title, item?.artist);
+            if (!searchText) return;
+            setVibeModeEnabled(false);
+            void runSearch(searchText);
+          }}
+          onViewCover={(item) => {
+            const coverUrl = resolveCoverArt(item?.title, item?.artist, item?.cover);
+            window.open(coverUrl, '_blank', 'noopener,noreferrer');
+          }}
           onClose={() => setVibeModeEnabled(false)}
           apiUrl={apiUrl}
+          resolveCoverArt={resolveCoverArt}
         />
       )}
     </div>
