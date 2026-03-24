@@ -26,6 +26,8 @@ mcs_server_manager/
 *.resolved
 *.bak
 build/
+build_stage/
+dist_stage/
 data/nas_local.db
 data/webview-storage/
 data/desktop-assets/

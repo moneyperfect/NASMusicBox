@@ -1,5 +1,6 @@
 param(
-  [switch]$SkipDesktopBuild
+  [switch]$SkipDesktopBuild,
+  [string]$BundlePath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,13 @@ if (Test-Path ".venv\Scripts\python.exe") {
 if (-not $SkipDesktopBuild) {
   & (Join-Path $PSScriptRoot "build-desktop.ps1")
 }
+
+if ($BundlePath) {
+  & (Join-Path $PSScriptRoot "build-release-assets.ps1") -BundlePath $BundlePath -CreatePortableZip
+} else {
+  & (Join-Path $PSScriptRoot "build-release-assets.ps1") -CreatePortableZip
+}
+Assert-LastExitCode "prepare release assets"
 
 $candidatePaths = @(
   "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
@@ -53,6 +61,7 @@ if (-not $iscc) {
 
 $version = & $python -c "from app_meta import APP_VERSION; print(APP_VERSION)"
 Assert-LastExitCode "resolve app version"
+$version = "$version".Trim()
 if (-not $version) {
   throw "Unable to resolve app version."
 }

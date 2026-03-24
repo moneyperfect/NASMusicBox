@@ -12,11 +12,20 @@ function Assert-LastExitCode([string]$StepName) {
   }
 }
 
+function Assert-DesktopBundleNotRunning() {
+  $runningProcesses = Get-Process -Name "NASMusicBox" -ErrorAction SilentlyContinue
+  if ($runningProcesses) {
+    throw "NAS Music Box is still running. Please fully exit the desktop app and any tray instance before building a new desktop version."
+  }
+}
+
 if (Test-Path ".venv\Scripts\python.exe") {
   $python = (Resolve-Path ".venv\Scripts\python.exe").Path
 } else {
   $python = "python"
 }
+
+Assert-DesktopBundleNotRunning
 
 Write-Host "[INFO] Installing Python dependencies..."
 & $python -m pip install --upgrade pip
@@ -49,4 +58,9 @@ Write-Host "[INFO] Building desktop bundle..."
 & $python -m PyInstaller packaging/NASMusicBox.spec --noconfirm --clean
 Assert-LastExitCode "PyInstaller desktop bundle"
 
+Write-Host "[INFO] Preparing versioned desktop artifacts..."
+& (Join-Path $PSScriptRoot "build-release-assets.ps1")
+Assert-LastExitCode "prepare versioned desktop artifacts"
+
 Write-Host "[INFO] Desktop build complete: $repoRoot\dist\NASMusicBox"
+Write-Host "[INFO] Open the latest build via: $repoRoot\dist\Open-Latest-NASMusicBox.bat"

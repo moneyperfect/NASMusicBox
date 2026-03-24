@@ -50,11 +50,9 @@ jobs:
         shell: pwsh
         run: ./scripts/build-installer.ps1 -SkipDesktopBuild
 
-      - name: Create portable zip
+      - name: Create portable zip and latest launch assets
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
-          Compress-Archive -Path dist/NASMusicBox/* -DestinationPath dist/release/NASMusicBox-portable.zip -Force
+        run: ./scripts/build-release-assets.ps1 -CreatePortableZip
 
       - name: Validate release assets
         shell: pwsh

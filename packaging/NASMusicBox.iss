@@ -3,7 +3,7 @@
 #define MyAppURL "https://github.com/moneyperfect/NASMusicBox"
 #define RepoRoot ".."
 #ifndef MyAppVersion
-  #define MyAppVersion "1.5.0"
+  #define MyAppVersion "1.5.1"
 #endif
 
 [Setup]
@@ -38,7 +38,7 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "{#RepoRoot}\dist\NASMusicBox\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RepoRoot}\dist\versions\NASMusicBox-v{#MyAppVersion}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\NASMusicBox.exe"
