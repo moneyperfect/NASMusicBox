@@ -296,6 +296,11 @@ const normalizeRecommendationSection = (section) => ({
   items: Array.isArray(section?.items) ? section.items.map(normalizeRecommendationItem) : [],
 });
 
+const normalizeSearchHistoryItem = (item) => ({
+  query: item?.query || '',
+  searchedAt: item?.searchedAt || '',
+});
+
 const heroBackgroundStyle = (colors) => ({
   background: `radial-gradient(circle at 20% 20%, ${colors[0]} 0%, transparent 32%), radial-gradient(circle at 82% 82%, ${colors[1]} 0%, transparent 35%), linear-gradient(135deg, ${colors[2]} 0%, #050913 58%, ${colors[1]} 100%)`,
 });
@@ -481,6 +486,7 @@ function App() {
 
   const [historyItems, setHistoryItems] = useState(() => readStorage(HISTORY_STORAGE_KEY, []).map(toHistoryRecord));
   const [favorites, setFavorites] = useState(() => readStorage(FAVORITES_STORAGE_KEY, []).map(toFavoriteRecord));
+  const [recentSearches, setRecentSearches] = useState([]);
   const [downloadHistory, setDownloadHistory] = useState(() => readStorage(DOWNLOAD_HISTORY_STORAGE_KEY, []).map(normalizeDownloadHistoryItem));
   const [downloadTasks, setDownloadTasks] = useState(() => readStorage(DOWNLOAD_CENTER_STORAGE_KEY, []).map((item) => {
     const task = normalizeDownloadTask(item);
@@ -534,8 +540,9 @@ function App() {
     () => JSON.stringify({
       favorites: favorites.slice(0, 8).map((item) => [item.key, item.savedAt || '']),
       history: historyItems.slice(0, 8).map((item) => [item.key, item.playedAt || '']),
+      searches: recentSearches.slice(0, 6).map((item) => [item.query, item.searchedAt || '']),
     }),
-    [favorites, historyItems],
+    [favorites, historyItems, recentSearches],
   );
 
   const discoverSections = useMemo(
@@ -624,6 +631,19 @@ function App() {
     setTimeout(() => setNotice(''), 3000);
   };
 
+  const rememberRecentSearch = (query) => {
+    const normalized = normalizeSearchQuery(query);
+    if (!normalized) return;
+    const nextEntry = {
+      query: normalized,
+      searchedAt: new Date().toISOString(),
+    };
+    setRecentSearches((previous) => {
+      const merged = [nextEntry, ...previous.filter((item) => item.query !== normalized)];
+      return merged.slice(0, 12);
+    });
+  };
+
   const openDownloadDirectory = async (jobId = '') => {
     try {
       if (jobId) {
@@ -683,6 +703,7 @@ function App() {
       const data = await apiRequest('/library', { cache: 'no-store' });
       const remoteFavorites = Array.isArray(data?.favorites) ? data.favorites.map(toFavoriteRecord) : [];
       const remoteHistory = Array.isArray(data?.history) ? data.history.map(toHistoryRecord) : [];
+      const remoteSearches = Array.isArray(data?.recentSearches) ? data.recentSearches.map(normalizeSearchHistoryItem) : [];
       const remoteDownloads = Array.isArray(data?.recentDownloads) ? data.recentDownloads.map(normalizeDownloadHistoryItem) : [];
 
       if (bootstrapLocal && !libraryMigrationRef.current) {
@@ -692,6 +713,7 @@ function App() {
 
         setFavorites(mergedFavorites);
         setHistoryItems(mergedHistory);
+        setRecentSearches(remoteSearches);
         setDownloadHistory(mergedDownloads);
 
         const remoteFavoriteKeys = new Set(remoteFavorites.map((item) => item.key));
@@ -718,6 +740,7 @@ function App() {
 
       setFavorites(remoteFavorites);
       setHistoryItems(remoteHistory);
+      setRecentSearches(remoteSearches);
       setDownloadHistory(mergeDownloadHistory(remoteDownloads, localDownloads, 30));
 
       if (!libraryMigrationRef.current) {
@@ -1218,9 +1241,12 @@ function App() {
     if (searchCache.has(q)) {
       setSearchResults(searchCache.get(q));
       setActivePage('search');
+      rememberRecentSearch(q);
       void apiRequest('/library/searches', {
         method: 'POST',
         body: JSON.stringify({ query: q, searchedAt: new Date().toISOString() }),
+      }).then(() => {
+        void refreshLibraryState();
       }).catch(() => {});
       return;
     }
@@ -1235,9 +1261,12 @@ function App() {
       setSearchResults(results);
       searchCache.set(q, results);
       setActivePage('search');
+      rememberRecentSearch(q);
       void apiRequest('/library/searches', {
         method: 'POST',
         body: JSON.stringify({ query: q, searchedAt: new Date().toISOString() }),
+      }).then(() => {
+        void refreshLibraryState();
       }).catch(() => {});
       if (results.length === 0) {
         setNoticeText('没有找到可用音源，试试加上歌手名');

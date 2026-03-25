@@ -3,7 +3,7 @@
 #define MyAppURL "https://github.com/moneyperfect/NASMusicBox"
 #define RepoRoot ".."
 #ifndef MyAppVersion
-  #define MyAppVersion "1.5.1"
+  #define MyAppVersion "1.6.0"
 #endif
 
 [Setup]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 import pytest
 
@@ -378,6 +379,50 @@ def test_local_library_payload_detects_duplicates(isolated_library, tmp_path):
     assert all(item["duplicateCount"] == 2 for item in payload["items"])
 
 
+def test_merge_library_databases_restores_legacy_favorites(tmp_path):
+    source_db = tmp_path / "source.db"
+    target_db = tmp_path / "target.db"
+
+    original_db = main.LIBRARY_DB
+    original_legacy_db = main.LEGACY_SOURCE_LIBRARY_DB
+    original_migration_done = main.LIBRARY_MIGRATION_DONE
+    try:
+        main.LEGACY_SOURCE_LIBRARY_DB = tmp_path / "missing-legacy.db"
+        main.LIBRARY_MIGRATION_DONE = True
+        main.LIBRARY_DB = source_db
+        main.init_library_db()
+        asyncio.run(
+            main.upsert_favorite(
+                main.LibraryTrack(
+                    key="legacy-fav",
+                    title="夜に駆ける",
+                    artist="YOASOBI",
+                    query="夜に駆ける YOASOBI",
+                    videoId="legacy-video",
+                )
+            )
+        )
+
+        main.LIBRARY_DB = target_db
+        main.init_library_db()
+        stats = main.merge_library_databases(source_db, target_db)
+
+        connection = sqlite3.connect(target_db)
+        try:
+            count = connection.execute("SELECT COUNT(*) FROM favorites").fetchone()[0]
+            row = connection.execute("SELECT title, artist FROM favorites WHERE track_key = 'legacy-fav'").fetchone()
+        finally:
+            connection.close()
+    finally:
+        main.LIBRARY_DB = original_db
+        main.LEGACY_SOURCE_LIBRARY_DB = original_legacy_db
+        main.LIBRARY_MIGRATION_DONE = original_migration_done
+
+    assert stats["favorites"] == 1
+    assert count == 1
+    assert row == ("夜に駆ける", "YOASOBI")
+
+
 def test_frontend_routes_disable_index_cache_and_do_not_fallback_missing_assets(isolated_library):
     response = asyncio.run(main.serve_index())
     assert response.headers["cache-control"].startswith("no-store")
@@ -445,32 +490,26 @@ def test_recommendations_mix_history_and_personalized_results(isolated_library, 
         )
     )
     asyncio.run(main.upsert_search_history(main.SearchHistoryEntry(query="The Weeknd")))
-    monkeypatch.setattr(main, "search_provider_order", lambda: ["ytmusicapi"])
 
-    def fake_search(query, limit):
+    def fake_search(query, limit, allow_network=True):
         normalized = query.lower()
         if "coldplay" in normalized:
             return [
-                {"id": "song-1", "title": "Clocks", "uploader": "Coldplay", "thumbnail": "", "duration": 307},
-                {"id": "song-2", "title": "Adventure of a Lifetime", "uploader": "Coldplay", "thumbnail": "", "duration": 264},
+                {"id": "song-1", "title": "Clocks", "uploader": "Coldplay", "thumbnail": "https://example.com/clocks.jpg", "duration": 307, "provider": "ytmusicapi"},
+                {"id": "song-2", "title": "Adventure of a Lifetime", "uploader": "Coldplay", "thumbnail": "https://example.com/adventure.jpg", "duration": 264, "provider": "ytmusicapi"},
             ][:limit]
         if "weeknd" in normalized:
             return [
-                {"id": "song-3", "title": "Save Your Tears", "uploader": "The Weeknd", "thumbnail": "", "duration": 215},
-                {"id": "song-4", "title": "Starboy", "uploader": "The Weeknd", "thumbnail": "", "duration": 230},
+                {"id": "song-3", "title": "Save Your Tears", "uploader": "The Weeknd", "thumbnail": "https://example.com/syt.jpg", "duration": 215, "provider": "ytmusicapi"},
+                {"id": "song-4", "title": "Starboy", "uploader": "The Weeknd", "thumbnail": "https://example.com/starboy.jpg", "duration": 230, "provider": "ytmusicapi"},
+            ][:limit]
+        if "a-ha" in normalized:
+            return [
+                {"id": "song-5", "title": "Hunting High and Low", "uploader": "a-ha", "thumbnail": "https://example.com/hhal.jpg", "duration": 221, "provider": "ytmusicapi"},
             ][:limit]
         return []
 
-    main.SEARCH_RESULTS_CACHE.set(
-        main.build_search_cache_key("Coldplay", 6, "ytmusicapi"),
-        fake_search("Coldplay", 6),
-        main.SEARCH_CACHE_TTL_SECONDS,
-    )
-    main.SEARCH_RESULTS_CACHE.set(
-        main.build_search_cache_key("The Weeknd", 6, "ytmusicapi"),
-        fake_search("The Weeknd", 6),
-        main.SEARCH_CACHE_TTL_SECONDS,
-    )
+    monkeypatch.setattr(main, "search_youtube_entries", fake_search)
 
     payload = main.build_recommendations_payload()
     sections = {section.id: section for section in payload["sections"]}
@@ -481,3 +520,5 @@ def test_recommendations_mix_history_and_personalized_results(isolated_library, 
     assert "nas-curated" in sections
     assert sections["continue-listening"].items[0].title == "Take On Me"
     assert len(sections["for-you"].items) >= 2
+    assert sections["for-you"].items[0].videoId
+    assert sections["nas-curated"].items[0].videoId

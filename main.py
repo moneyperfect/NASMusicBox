@@ -1,5 +1,6 @@
 ﻿from io import BytesIO
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from pathlib import Path
 from urllib.parse import quote
@@ -41,6 +42,7 @@ from app_paths import (
     FRONTEND_DIST,
     FRONTEND_INDEX,
     IS_FROZEN,
+    LEGACY_SOURCE_LIBRARY_DB,
     LIBRARY_DB,
     LOCAL_FFMPEG_BINARY,
     ensure_runtime_directories,
@@ -264,6 +266,9 @@ LYRICS_NEGATIVE_CACHE_TTL_SECONDS = 60 * 8
 COLOR_CACHE_TTL_SECONDS = 60 * 60 * 24
 RECOMMENDATIONS_CACHE_TTL_SECONDS = 45
 RECOMMENDATIONS_MIN_ITEMS = 4
+RECOMMENDATION_SEED_LIMIT = 4
+RECOMMENDATION_SEARCH_RESULTS_PER_SEED = 6
+RECOMMENDATION_NETWORK_WORKERS = 4
 CACHE_MISS = object()
 
 CURATED_RECOMMENDATION_SEEDS = [
@@ -319,6 +324,8 @@ APP_SETTING_DOWNLOAD_DIRECTORY = "download_directory"
 DOWNLOAD_JOBS: dict[str, dict[str, Any]] = {}
 DOWNLOAD_JOBS_LOCK = threading.Lock()
 LOCAL_AUDIO_EXTENSIONS = {".m4a", ".mp3", ".webm", ".ogg", ".wav", ".flac", ".aac", ".opus"}
+LIBRARY_MIGRATION_LOCK = threading.Lock()
+LIBRARY_MIGRATION_DONE = False
 
 YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_DATA_API_KEY", "").strip()
 NAS_SEARCH_PROVIDER = os.getenv("NAS_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
@@ -490,10 +497,330 @@ def request_media_response(url: str, *, headers: Optional[dict[str, str]] = None
 
 
 def get_db_connection() -> sqlite3.Connection:
+    maybe_migrate_legacy_library_db()
     ensure_runtime_directories()
     connection = sqlite3.connect(LIBRARY_DB)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def sqlite_table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    if not sqlite_table_exists(connection, table_name):
+        return set()
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] if not isinstance(row, sqlite3.Row) else row["name"] for row in rows}
+
+
+def read_sqlite_rows(connection: sqlite3.Connection, table_name: str, columns: dict[str, Any]) -> list[dict[str, Any]]:
+    available_columns = sqlite_table_columns(connection, table_name)
+    if not available_columns:
+        return []
+
+    selected_columns = [column for column in columns if column in available_columns]
+    if not selected_columns:
+        return []
+
+    rows = connection.execute(
+        f"SELECT {', '.join(selected_columns)} FROM {table_name}"
+    ).fetchall()
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        normalized = dict(columns)
+        if isinstance(row, sqlite3.Row):
+            for column in selected_columns:
+                normalized[column] = row[column]
+        else:
+            for column, value in zip(selected_columns, row):
+                normalized[column] = value
+        normalized_rows.append(normalized)
+    return normalized_rows
+
+
+def timestamp_sort_key(value: str) -> str:
+    return str(value or "")
+
+
+def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
+    if not source_db.exists() or source_db.resolve() == target_db.resolve():
+        return {"favorites": 0, "history": 0, "searches": 0, "downloads": 0, "lyricsOffsets": 0, "settings": 0}
+
+    merged_counts = {"favorites": 0, "history": 0, "searches": 0, "downloads": 0, "lyricsOffsets": 0, "settings": 0}
+    source_connection = sqlite3.connect(source_db)
+    target_connection = sqlite3.connect(target_db)
+    source_connection.row_factory = sqlite3.Row
+    target_connection.row_factory = sqlite3.Row
+
+    try:
+        target_connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS favorites (
+                track_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                cover TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL DEFAULT '',
+                video_id TEXT,
+                saved_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS play_history (
+                track_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                cover TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL DEFAULT '',
+                video_id TEXT,
+                played_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS search_history (
+                query TEXT PRIMARY KEY,
+                searched_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS download_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                track_key TEXT,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                filename TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                saved_path TEXT NOT NULL DEFAULT '',
+                cover TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL DEFAULT '',
+                video_id TEXT,
+                downloaded_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS lyrics_offsets (
+                track_key TEXT PRIMARY KEY,
+                video_id TEXT,
+                title TEXT NOT NULL DEFAULT '',
+                artist TEXT NOT NULL DEFAULT '',
+                offset_seconds REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        for table_name, key_column, timestamp_column, bucket_name, defaults in [
+            (
+                "favorites",
+                "track_key",
+                "saved_at",
+                "favorites",
+                {"track_key": "", "title": "", "artist": "", "cover": "", "query": "", "video_id": None, "saved_at": ""},
+            ),
+            (
+                "play_history",
+                "track_key",
+                "played_at",
+                "history",
+                {"track_key": "", "title": "", "artist": "", "cover": "", "query": "", "video_id": None, "played_at": ""},
+            ),
+            (
+                "search_history",
+                "query",
+                "searched_at",
+                "searches",
+                {"query": "", "searched_at": ""},
+            ),
+            (
+                "lyrics_offsets",
+                "track_key",
+                "updated_at",
+                "lyricsOffsets",
+                {"track_key": "", "video_id": None, "title": "", "artist": "", "offset_seconds": 0.0, "updated_at": ""},
+            ),
+        ]:
+            source_rows = read_sqlite_rows(source_connection, table_name, defaults)
+            if not source_rows:
+                continue
+
+            existing_rows = {
+                row[key_column]: row[timestamp_column]
+                for row in read_sqlite_rows(target_connection, table_name, defaults)
+                if row.get(key_column)
+            }
+            columns = list(defaults.keys())
+            placeholders = ", ".join(["?"] * len(columns))
+            updatable_columns = [column for column in columns if column != key_column]
+            update_sql = ", ".join(f"{column} = excluded.{column}" for column in updatable_columns)
+
+            for row in source_rows:
+                key_value = row.get(key_column)
+                if not key_value:
+                    continue
+                current_timestamp = existing_rows.get(key_value, "")
+                if key_value in existing_rows and timestamp_sort_key(current_timestamp) >= timestamp_sort_key(row.get(timestamp_column, "")):
+                    continue
+                target_connection.execute(
+                    f"""
+                    INSERT INTO {table_name} ({', '.join(columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT({key_column}) DO UPDATE SET {update_sql}
+                    """,
+                    tuple(row[column] for column in columns),
+                )
+                existing_rows[key_value] = row.get(timestamp_column, "")
+                merged_counts[bucket_name] += 1
+
+        source_download_rows = read_sqlite_rows(
+            source_connection,
+            "download_history",
+            {
+                "track_key": "",
+                "title": "",
+                "artist": "",
+                "filename": "",
+                "source_url": "",
+                "saved_path": "",
+                "cover": "",
+                "query": "",
+                "video_id": None,
+                "downloaded_at": "",
+            },
+        )
+        if source_download_rows:
+            existing_download_identities = {
+                (
+                    row["track_key"] or "",
+                    row["filename"] or "",
+                    row["saved_path"] or "",
+                    row["downloaded_at"] or "",
+                )
+                for row in read_sqlite_rows(
+                    target_connection,
+                    "download_history",
+                    {
+                        "track_key": "",
+                        "title": "",
+                        "artist": "",
+                        "filename": "",
+                        "source_url": "",
+                        "saved_path": "",
+                        "cover": "",
+                        "query": "",
+                        "video_id": None,
+                        "downloaded_at": "",
+                    },
+                )
+            }
+            for row in source_download_rows:
+                identity = (
+                    row["track_key"] or "",
+                    row["filename"] or "",
+                    row["saved_path"] or "",
+                    row["downloaded_at"] or "",
+                )
+                if identity in existing_download_identities:
+                    continue
+                target_connection.execute(
+                    """
+                    INSERT INTO download_history (
+                        track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, downloaded_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["track_key"],
+                        row["title"],
+                        row["artist"],
+                        row["filename"],
+                        row["source_url"],
+                        row["saved_path"],
+                        row["cover"],
+                        row["query"],
+                        row["video_id"],
+                        row["downloaded_at"],
+                    ),
+                )
+                existing_download_identities.add(identity)
+                merged_counts["downloads"] += 1
+
+        source_settings_rows = read_sqlite_rows(
+            source_connection,
+            "app_settings",
+            {"setting_key": "", "setting_value": "", "updated_at": ""},
+        )
+        if source_settings_rows:
+            existing_settings = {
+                row["setting_key"]: row
+                for row in read_sqlite_rows(
+                    target_connection,
+                    "app_settings",
+                    {"setting_key": "", "setting_value": "", "updated_at": ""},
+                )
+                if row.get("setting_key")
+            }
+            for row in source_settings_rows:
+                key_value = row.get("setting_key")
+                if not key_value:
+                    continue
+                current = existing_settings.get(key_value)
+                if current and str(current.get("setting_value") or "").strip():
+                    continue
+                target_connection.execute(
+                    """
+                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(setting_key) DO UPDATE SET
+                        setting_value = excluded.setting_value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (row["setting_key"], row["setting_value"], row["updated_at"] or utc_now_iso()),
+                )
+                existing_settings[key_value] = row
+                merged_counts["settings"] += 1
+
+        target_connection.commit()
+    finally:
+        source_connection.close()
+        target_connection.close()
+
+    return merged_counts
+
+
+def maybe_migrate_legacy_library_db() -> None:
+    global LIBRARY_MIGRATION_DONE
+    if LIBRARY_MIGRATION_DONE:
+        return
+
+    with LIBRARY_MIGRATION_LOCK:
+        if LIBRARY_MIGRATION_DONE:
+            return
+
+        ensure_runtime_directories()
+        legacy_db = LEGACY_SOURCE_LIBRARY_DB
+
+        try:
+            same_location = legacy_db.resolve() == LIBRARY_DB.resolve()
+        except OSError:
+            same_location = legacy_db == LIBRARY_DB
+
+        if not legacy_db.exists() or same_location:
+            LIBRARY_MIGRATION_DONE = True
+            return
+
+        if not LIBRARY_DB.exists():
+            shutil.copy2(legacy_db, LIBRARY_DB)
+            log_timing("library_migrated", mode="copy", source=str(legacy_db), target=str(LIBRARY_DB))
+            LIBRARY_MIGRATION_DONE = True
+            return
+
+        merged_counts = merge_library_databases(legacy_db, LIBRARY_DB)
+        if any(merged_counts.values()):
+            log_timing("library_migrated", mode="merge", source=str(legacy_db), target=str(LIBRARY_DB), **merged_counts)
+        LIBRARY_MIGRATION_DONE = True
 
 
 def ensure_column_exists(connection: sqlite3.Connection, table_name: str, column_name: str, definition_sql: str) -> None:
@@ -2330,7 +2657,67 @@ def personalized_recommendation_seeds(
     return seeds[:5]
 
 
-def curated_recommendation_items() -> list[SearchItem]:
+def resolve_recommendation_seed_items(
+    seed_queries: list[str],
+    *,
+    excluded_identities: set[str],
+    limit: int,
+) -> list[SearchItem]:
+    normalized_seed_queries: list[str] = []
+    seen_queries: set[str] = set()
+    for seed_query in seed_queries[: max(limit, RECOMMENDATION_SEED_LIMIT)]:
+        normalized_query = normalize_cache_text(seed_query)
+        if not normalized_query or normalized_query in seen_queries:
+            continue
+        seen_queries.add(normalized_query)
+        normalized_seed_queries.append(seed_query)
+
+    if not normalized_seed_queries:
+        return []
+
+    max_workers = max(1, min(RECOMMENDATION_NETWORK_WORKERS, len(normalized_seed_queries)))
+    collected_items: list[SearchItem] = []
+    seen_identities = set(excluded_identities)
+
+    def search_seed(query: str) -> list[dict]:
+        try:
+            return search_youtube_entries(
+                query,
+                RECOMMENDATION_SEARCH_RESULTS_PER_SEED,
+                allow_network=True,
+            )
+        except Exception as exc:
+            log_timing("recommendation_seed_failed", query=query, error=exc.__class__.__name__)
+            return []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results_iter = executor.map(search_seed, normalized_seed_queries)
+
+        for seed_query, entries in zip(normalized_seed_queries, results_iter):
+            for entry in entries:
+                candidate = search_item_from_entry(entry, fallback_query=seed_query)
+                if not candidate:
+                    continue
+                identity = recommendation_item_identity(candidate)
+                if identity in seen_identities:
+                    continue
+                seen_identities.add(identity)
+                collected_items.append(candidate)
+                if len(collected_items) >= limit:
+                    return collected_items
+
+    return collected_items
+
+
+def curated_recommendation_items(excluded_identities: set[str]) -> list[SearchItem]:
+    live_items = resolve_recommendation_seed_items(
+        [seed["query"] for seed in CURATED_RECOMMENDATION_SEEDS],
+        excluded_identities=excluded_identities,
+        limit=RECOMMENDATIONS_MIN_ITEMS,
+    )
+    if live_items:
+        return live_items
+
     items: list[SearchItem] = []
     for seed in CURATED_RECOMMENDATION_SEEDS[:RECOMMENDATIONS_MIN_ITEMS]:
         items.append(
@@ -2388,54 +2775,38 @@ def build_recommendations_payload() -> dict:
             )
         )
 
-    personalized_items: list[SearchItem] = []
-    personalized_seen = set(continue_seen)
-    for item in [*favorites, *history]:
-        candidate = search_item_from_library_track(item)
-        if not candidate:
-            continue
-        identity = recommendation_item_identity(candidate)
-        if identity in personalized_seen or identity in continue_seen:
-            continue
-        personalized_seen.add(identity)
-        personalized_items.append(candidate)
-        if len(personalized_items) >= RECOMMENDATIONS_MIN_ITEMS:
-            break
+    personalized_items = resolve_recommendation_seed_items(
+        personalized_recommendation_seeds(favorites, history, searches),
+        excluded_identities=excluded_identities.union(continue_seen),
+        limit=RECOMMENDATIONS_MIN_ITEMS,
+    )
 
-    for seed_query in personalized_recommendation_seeds(favorites, history, searches):
-        cached_results = CACHE_MISS
-        for provider in search_provider_order():
-            cached_results = SEARCH_RESULTS_CACHE.get(build_search_cache_key(seed_query, 6, provider))
-            if cached_results is not CACHE_MISS:
-                break
-        if cached_results is CACHE_MISS:
-            continue
-        for entry in cached_results:
-            candidate = search_item_from_entry(entry, fallback_query=seed_query)
+    personalized_seen = {recommendation_item_identity(item) for item in personalized_items}
+    if len(personalized_items) < RECOMMENDATIONS_MIN_ITEMS:
+        for item in [*favorites, *history]:
+            candidate = search_item_from_library_track(item)
             if not candidate:
                 continue
             identity = recommendation_item_identity(candidate)
-            if identity in personalized_seen or identity in excluded_identities:
+            if identity in personalized_seen or identity in continue_seen:
                 continue
             personalized_seen.add(identity)
             personalized_items.append(candidate)
             if len(personalized_items) >= RECOMMENDATIONS_MIN_ITEMS:
                 break
-        if len(personalized_items) >= RECOMMENDATIONS_MIN_ITEMS:
-            break
 
     if personalized_items:
         sections.append(
             RecommendationSection(
                 id="for-you",
                 title="为你推荐",
-                subtitle="基于收藏、最近播放和搜索行为混合生成",
+                subtitle="根据你的收藏、最近播放和搜索习惯实时生成",
                 items=personalized_items,
                 source="behavior",
             )
         )
 
-    curated_items = curated_recommendation_items()
+    curated_items = curated_recommendation_items(excluded_identities.union(personalized_seen))
     sections.append(
         RecommendationSection(
             id="nas-curated",
@@ -2524,7 +2895,12 @@ init_library_db()
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "runtimeMode": "packaged" if IS_FROZEN else "source",
+        "dataDir": str(DATA_DIR),
+        "libraryDb": str(LIBRARY_DB),
+    }
 
 
 @app.get("/system-check")

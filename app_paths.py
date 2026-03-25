@@ -21,7 +21,16 @@ def _windows_local_appdata() -> Path:
     return Path.home() / "AppData" / "Local"
 
 
+def use_source_data_root() -> bool:
+    return os.environ.get("NAS_USE_SOURCE_DATA", "").strip() == "1"
+
+
 def get_app_root() -> Path:
+    custom_root = os.environ.get("NAS_USER_DATA_ROOT", "").strip()
+    if custom_root:
+        return Path(custom_root).expanduser()
+    if os.name == "nt" and not use_source_data_root():
+        return _windows_local_appdata() / APP_ID
     if IS_FROZEN:
         return _windows_local_appdata() / APP_ID
     return SOURCE_ROOT
@@ -36,6 +45,8 @@ FRONTEND_DIST = BUNDLE_ROOT / "frontend" / "dist"
 FRONTEND_INDEX = FRONTEND_DIST / "index.html"
 LOCAL_FFMPEG_BINARY = BUNDLE_ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
 LIBRARY_DB = DATA_DIR / "nas_local.db"
+LEGACY_SOURCE_DATA_DIR = SOURCE_ROOT / "data"
+LEGACY_SOURCE_LIBRARY_DB = LEGACY_SOURCE_DATA_DIR / "nas_local.db"
 ASSETS_DIR = BUNDLE_ROOT / "assets"
 APP_ICON_PNG = ASSETS_DIR / "app-icon.png"
 APP_ICON_ICO = ASSETS_DIR / "app-icon.ico"
