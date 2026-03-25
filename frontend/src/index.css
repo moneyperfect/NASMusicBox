@@ -693,32 +693,23 @@ h5,
   gap: 80px;
   padding: 80px 40px;
   overflow: hidden;
-  align-items: stretch;
 }
 
 .vibe-left {
   display: flex;
-  align-items: stretch;
-  justify-content: center;
-  min-height: 0;
-}
-
-.vibe-left-inner {
-  width: 100%;
-  max-width: 420px;
-  margin: auto 0;
-  display: flex;
   flex-direction: column;
-  gap: 20px;
-  position: sticky;
-  top: 0;
+  align-items: center;
+  justify-content: flex-start;
+  padding-top: 4vh;
+  height: 100%;
 }
 
 .vibe-cover-container {
   position: relative;
-  width: min(340px, 100%);
+  width: min(340px, 80%);
   aspect-ratio: 1;
   border-radius: 12px;
+  margin-bottom: 8px;
 }
 
 .vibe-cover-shadow {
@@ -749,78 +740,42 @@ h5,
 }
 
 .vibe-title {
+  /* Using Tailwind in VibeOverlay.jsx, clearing inherited styles just in case */
   margin-bottom: 0px;
 }
 
 .vibe-artist {
+  /* Using Tailwind in VibeOverlay.jsx */
   margin-bottom: 0px;
-}
-
-.vibe-meta-card {
-  width: 100%;
-  border-radius: 28px;
-  padding: 24px 24px 18px;
-  background: rgba(5, 12, 20, 0.46);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.24);
-}
-
-.vibe-controls-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  width: 100%;
-  padding: 0 4px;
-}
-
-.vibe-repeat-badge {
-  position: absolute;
-  top: 0;
-  right: 0;
-  transform: translate(40%, -40%);
-  font-size: 8px;
-  font-weight: 700;
-  width: 12px;
-  height: 12px;
-  border-radius: 999px;
-  background: rgba(16, 16, 21, 0.92);
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
 
 .vibe-more-menu {
   position: absolute;
   top: calc(100% + 12px);
   right: 0;
-  width: 220px;
-  padding: 10px;
-  border-radius: 20px;
-  background: rgba(10, 16, 25, 0.94);
+  min-width: 196px;
+  padding: 8px;
+  border-radius: 16px;
+  background: rgba(9, 10, 18, 0.92);
+  backdrop-filter: blur(18px);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: 0 20px 36px rgba(0, 0, 0, 0.38);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  z-index: 35;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.28);
+  z-index: 30;
 }
 
 .vibe-more-item {
-  border: none;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.82);
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 10px;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.82);
   font-size: 13px;
   font-weight: 600;
-  padding: 10px 12px;
-  border-radius: 14px;
+  text-align: left;
   cursor: pointer;
   transition: background 0.2s ease, color 0.2s ease;
 }
@@ -828,39 +783,6 @@ h5,
 .vibe-more-item:hover {
   background: rgba(255, 255, 255, 0.08);
   color: #fff;
-}
-
-.vibe-queue-toggle {
-  margin-top: 8px;
-  width: 100%;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.86);
-  padding: 12px 14px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  cursor: pointer;
-  transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
-}
-
-.vibe-queue-toggle:hover,
-.vibe-queue-toggle.is-active {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.16);
-}
-
-.vibe-queue-count {
-  min-width: 24px;
-  height: 24px;
-  border-radius: 999px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(255, 255, 255, 0.12);
-  font-size: 12px;
 }
 
 /* Floating Vibe Settings Dock */
@@ -957,48 +879,11 @@ h5,
 }
 
 /* Lyrics */
-.cover-art-shell {
-  position: relative;
-  display: block;
-}
-
-.cover-art-image {
-  display: block;
-  width: 100%;
-  height: 100%;
-}
-
-.cover-art-image--loading {
-  filter: blur(12px) saturate(0.9);
-  transform: scale(1.03);
-  opacity: 0.74;
-  transition: filter 0.24s ease, transform 0.24s ease, opacity 0.24s ease;
-}
-
-.cover-art-image--ready {
-  filter: none;
-  transform: none;
-  opacity: 1;
-  transition: filter 0.24s ease, transform 0.24s ease, opacity 0.24s ease;
-}
-
-.vibe-lyrics-column {
-  position: relative;
-  min-height: 0;
-  overflow: hidden;
-  display: flex;
-}
-
-.vibe-lyrics-shell {
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-
 .vibe-lyrics-container {
   overflow-y: auto;
   scrollbar-width: none;
-  padding: 52px 24px 180px;
+  /* Firefox */
+  padding: 40px 20px 200px;
   mask-image: linear-gradient(to bottom, transparent, black 15%, black 85%, transparent);
   -webkit-mask-image: linear-gradient(to bottom, transparent, black 15%, black 85%, transparent);
   display: flex;
@@ -1035,134 +920,6 @@ h5,
   margin: auto;
   font-weight: 600;
   letter-spacing: 0.1em;
-}
-
-.vibe-queue-panel {
-  position: absolute;
-  top: 32px;
-  right: 0;
-  width: min(340px, 42vw);
-  height: calc(100% - 64px);
-  border-radius: 28px;
-  background: rgba(5, 12, 20, 0.78);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: 0 30px 60px rgba(0, 0, 0, 0.38);
-  backdrop-filter: blur(28px);
-  -webkit-backdrop-filter: blur(28px);
-  padding: 22px 18px 18px;
-  transform: translateX(calc(100% + 24px));
-  opacity: 0;
-  pointer-events: none;
-  transition: transform 0.28s ease, opacity 0.28s ease;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  z-index: 20;
-}
-
-.vibe-queue-panel.is-open {
-  transform: translateX(0);
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.vibe-queue-panel-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.vibe-queue-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  overflow-y: auto;
-  padding-right: 4px;
-}
-
-.vibe-queue-item {
-  width: 100%;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.04);
-  padding: 10px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  color: rgba(255, 255, 255, 0.82);
-  cursor: pointer;
-  transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease, opacity 0.2s ease;
-}
-
-.vibe-queue-item:hover {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(255, 255, 255, 0.12);
-}
-
-.vibe-queue-item.is-active {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.16);
-  transform: translateX(-2px);
-}
-
-@media (max-width: 1200px) {
-  .vibe-content {
-    grid-template-columns: 1fr;
-    gap: 32px;
-    padding: 96px 24px 32px;
-    overflow-y: auto;
-  }
-
-  .vibe-left-inner {
-    max-width: none;
-    position: relative;
-  }
-
-  .vibe-lyrics-column {
-    min-height: 42vh;
-  }
-
-  .vibe-queue-panel {
-    top: auto;
-    bottom: 12px;
-    width: min(360px, calc(100vw - 48px));
-    height: min(70vh, 560px);
-  }
-}
-
-@media (max-width: 768px) {
-  .vibe-content {
-    padding: 88px 18px 24px;
-    gap: 24px;
-  }
-
-  .vibe-meta-card {
-    padding: 18px;
-  }
-
-  .vibe-controls-row {
-    gap: 8px;
-  }
-
-  .vibe-lyrics-container {
-    padding: 24px 8px 140px;
-  }
-
-  .vibe-lyric-line {
-    font-size: 1.65rem;
-  }
-
-  .vibe-queue-panel {
-    width: calc(100vw - 36px);
-    left: 18px;
-    right: 18px;
-  }
-
-  .vibe-settings-dock {
-    right: 18px;
-    bottom: 20px;
-  }
 }
 
 

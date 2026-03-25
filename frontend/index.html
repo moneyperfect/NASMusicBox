@@ -28,9 +28,170 @@
       });
     }
   </script>
+  <style>
+    #boot-status {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: #06070b;
+      color: rgba(255, 255, 255, 0.84);
+      z-index: 9999;
+      transition: opacity .24s ease, visibility .24s ease;
+      font-family: "Manrope", "Segoe UI", sans-serif;
+    }
+
+    #boot-status[data-hidden="true"] {
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+    }
+
+    .boot-card {
+      width: min(720px, calc(100vw - 40px));
+      border-radius: 28px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+      box-shadow: 0 24px 60px rgba(0,0,0,0.45);
+      padding: 28px;
+    }
+
+    .boot-kicker {
+      font-size: 12px;
+      letter-spacing: .24em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.42);
+      margin-bottom: 12px;
+    }
+
+    .boot-title {
+      font-size: 28px;
+      font-weight: 800;
+      margin: 0 0 12px;
+    }
+
+    .boot-copy {
+      color: rgba(255,255,255,0.68);
+      line-height: 1.7;
+      margin: 0 0 16px;
+    }
+
+    .boot-detail {
+      border-radius: 18px;
+      background: rgba(0,0,0,0.35);
+      border: 1px solid rgba(255,255,255,0.08);
+      padding: 16px;
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #fca5a5;
+    }
+  </style>
+  <script>
+    (function () {
+      var bootStatus = null;
+      var mounted = false;
+
+      function ensureBootStatus() {
+        if (bootStatus) return bootStatus;
+        bootStatus = document.getElementById('boot-status');
+        return bootStatus;
+      }
+
+      function renderError(title, detail) {
+        var node = ensureBootStatus();
+        if (!node) return;
+        node.dataset.hidden = 'false';
+        node.innerHTML =
+          '<div class="boot-card">' +
+            '<div class="boot-kicker">NAS Diagnostics</div>' +
+            '<h1 class="boot-title">' + title + '</h1>' +
+            '<p class="boot-copy">应用启动阶段捕获到了前端错误，详细信息已经写入本地诊断日志。</p>' +
+            '<div class="boot-detail">' + (detail || '未知错误') + '</div>' +
+          '</div>';
+      }
+
+      function sendReport(eventType, payload) {
+        var body = JSON.stringify({
+          eventType: eventType,
+          message: payload && payload.message || '',
+          stack: payload && payload.stack || '',
+          componentStack: payload && payload.componentStack || '',
+          url: location.href,
+          userAgent: navigator.userAgent,
+          timestamp: new Date().toISOString(),
+          meta: payload && payload.meta || {},
+        });
+        try {
+          fetch('/diagnostics/frontend-error', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: body,
+            keepalive: true,
+          }).catch(function () {});
+        } catch (error) {}
+        try {
+          localStorage.setItem('nas_boot_last_error', body);
+        } catch (error) {}
+      }
+
+      window.__NAS_BOOT__ = {
+        markMounted: function () {
+          mounted = true;
+          var node = ensureBootStatus();
+          if (node) {
+            node.dataset.hidden = 'true';
+          }
+        },
+        reportError: function (eventType, payload) {
+          var detail = (payload && (payload.stack || payload.message)) || '未知错误';
+          renderError('前端启动失败', detail);
+          sendReport(eventType, payload || {});
+        }
+      };
+
+      window.addEventListener('error', function (event) {
+        var message = event && event.message ? event.message : '脚本加载失败';
+        var stack = event && event.error && event.error.stack ? event.error.stack : '';
+        window.__NAS_BOOT__.reportError('window-error', {
+          message: message,
+          stack: stack,
+          meta: {
+            filename: event && event.filename || '',
+            lineno: event && event.lineno || 0,
+            colno: event && event.colno || 0,
+          },
+        });
+      }, true);
+
+      window.addEventListener('unhandledrejection', function (event) {
+        var reason = event && event.reason;
+        window.__NAS_BOOT__.reportError('unhandled-rejection', {
+          message: reason && reason.message ? reason.message : String(reason || 'Promise rejected'),
+          stack: reason && reason.stack ? reason.stack : '',
+        });
+      });
+
+      window.setTimeout(function () {
+        if (!mounted) {
+          window.__NAS_BOOT__.reportError('boot-timeout', {
+            message: '应用在启动阶段超时，根节点没有在预期时间内完成挂载。',
+          });
+        }
+      }, 7000);
+    })();
+  </script>
 </head>
 
 <body>
+  <div id="boot-status">
+    <div class="boot-card">
+      <div class="boot-kicker">NAS Diagnostics</div>
+      <h1 class="boot-title">正在启动 NAS 音乐器</h1>
+      <p class="boot-copy">如果界面没有正常出现，这里会自动切换成诊断信息，而不是纯黑屏。</p>
+    </div>
+  </div>
   <div id="root"></div>
   <script type="module" src="/src/main.jsx"></script>
 </body>

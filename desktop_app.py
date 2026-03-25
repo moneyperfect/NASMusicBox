@@ -20,6 +20,7 @@ from pystray import Icon, Menu, MenuItem
 from app_meta import APP_BRAND_NAME, APP_ID, APP_VERSION, BACKEND_URL, GITHUB_RELEASES_URL
 from app_paths import (
     DESKTOP_ENTRYPOINT,
+    FRONTEND_INDEX,
     ICON_CACHE_DIR,
     IS_FROZEN,
     LOCAL_FFMPEG_BINARY,
@@ -69,6 +70,17 @@ class DesktopApp:
     def storage_path(self) -> str:
         WEBVIEW_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         return str(WEBVIEW_STORAGE_DIR)
+
+    def build_frontend_url(self, *, mini: bool = False) -> str:
+        try:
+            build_stamp = int(FRONTEND_INDEX.stat().st_mtime_ns)
+        except OSError:
+            build_stamp = int(time.time() * 1000)
+
+        params = [f"build={build_stamp}"]
+        if mini:
+            params.append("mini=1")
+        return f"{BACKEND_URL}/?{'&'.join(params)}"
 
     def build_startup_command(self) -> str:
         if IS_FROZEN:
@@ -278,7 +290,7 @@ class DesktopApp:
 
         self.mini_window = webview.create_window(
             f"{APP_BRAND_NAME} Mini Player",
-            f"{BACKEND_URL}/?mini=1",
+            self.build_frontend_url(mini=True),
             width=420,
             height=220,
             min_size=(420, 220),
@@ -510,7 +522,7 @@ class DesktopApp:
 
         self.main_window = webview.create_window(
             APP_BRAND_NAME,
-            f"{BACKEND_URL}/",
+            self.build_frontend_url(),
             width=1440,
             height=900,
             min_size=(1100, 720),

@@ -10,6 +10,7 @@ import socket
 import sys
 import difflib
 import html
+import json
 import re
 import sqlite3
 import threading
@@ -34,7 +35,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency in local dev
     YTMusic = None
 
-from app_meta import APP_BRAND_NAME, APP_NAME, APP_VERSION, BACKEND_HOST, BACKEND_PORT, UPDATE_CHANNEL
+from app_meta import APP_BRAND_NAME, APP_VERSION, BACKEND_HOST, BACKEND_PORT, UPDATE_CHANNEL
 from app_paths import (
     DATA_DIR,
     FRONTEND_DIST,
@@ -53,6 +54,21 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+FRONTEND_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+STATIC_ASSET_PREFIXES = (
+    "assets/",
+    "apple-touch-icon",
+    "favicon",
+    "pwa-",
+    "manifest",
+    "robots.txt",
 )
 
 
@@ -120,6 +136,9 @@ class DownloadHistoryEntry(BaseModel):
     filename: str = ""
     sourceUrl: str = ""
     savedPath: str = ""
+    cover: str = ""
+    query: str = ""
+    videoId: Optional[str] = None
     downloadedAt: Optional[str] = None
 
 
@@ -183,6 +202,43 @@ class DownloadJobResponse(BaseModel):
     createdAt: str
     startedAt: Optional[str] = None
     completedAt: Optional[str] = None
+
+
+class LocalLibraryItem(BaseModel):
+    key: str
+    title: str
+    artist: str
+    cover: str = ""
+    filename: str
+    savedPath: str
+    sourceUrl: str = ""
+    query: str = ""
+    videoId: Optional[str] = None
+    downloadedAt: Optional[str] = None
+    fileSize: int = 0
+    offlineUrl: str
+    duplicateGroup: str = ""
+    duplicateCount: int = 1
+
+
+class LocalLibraryResponse(BaseModel):
+    downloadDirectory: str
+    totalTracks: int
+    duplicateGroups: int
+    duplicateTracks: int
+    totalSize: int
+    items: list[LocalLibraryItem]
+
+
+class FrontendErrorReport(BaseModel):
+    eventType: str = "client-error"
+    message: str = ""
+    stack: str = ""
+    componentStack: str = ""
+    url: str = ""
+    userAgent: str = ""
+    timestamp: str = ""
+    meta: dict[str, Any] = {}
 
 
 class SilentYtdlpLogger:
@@ -262,6 +318,7 @@ YTMUSIC_CLIENT_LOCK = threading.Lock()
 APP_SETTING_DOWNLOAD_DIRECTORY = "download_directory"
 DOWNLOAD_JOBS: dict[str, dict[str, Any]] = {}
 DOWNLOAD_JOBS_LOCK = threading.Lock()
+LOCAL_AUDIO_EXTENSIONS = {".m4a", ".mp3", ".webm", ".ogg", ".wav", ".flac", ".aac", ".opus"}
 
 YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_DATA_API_KEY", "").strip()
 NAS_SEARCH_PROVIDER = os.getenv("NAS_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
@@ -450,7 +507,7 @@ def ensure_column_exists(connection: sqlite3.Connection, table_name: str, column
 
 def default_download_directory() -> Path:
     downloads_root = Path.home() / "Downloads"
-    return downloads_root / APP_NAME
+    return downloads_root / APP_BRAND_NAME
 
 
 def get_app_setting(key: str, default: str = "") -> str:
@@ -498,9 +555,8 @@ def resolve_download_directory_path(preferred_value: str = "") -> Path:
 
 
 def get_app_settings_payload() -> dict:
-    download_directory = str(resolve_download_directory_path())
     return {
-        "downloadDirectory": download_directory,
+        "downloadDirectory": str(resolve_download_directory_path()),
         "runtimeMode": "packaged" if IS_FROZEN else "source",
     }
 
@@ -563,7 +619,7 @@ def run_download_job(job_id: str, source_url: str, filename: str) -> None:
 
         upstream, transport_mode = request_media_response(
             source_url,
-            timeout=30,
+            timeout=60,
             stream=True,
         )
         total_bytes = int(upstream.headers.get("content-length") or 0)
@@ -618,6 +674,7 @@ def create_download_job(request: DownloadJobCreateRequest) -> dict:
     safe_filename = safe_download_filename(request.filename)
     if not safe_filename:
         raise HTTPException(status_code=422, detail="filename is required")
+
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     job_payload = {
         "id": job_id,
@@ -686,6 +743,9 @@ def init_library_db() -> None:
                 filename TEXT NOT NULL DEFAULT '',
                 source_url TEXT NOT NULL DEFAULT '',
                 saved_path TEXT NOT NULL DEFAULT '',
+                cover TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL DEFAULT '',
+                video_id TEXT,
                 downloaded_at TEXT NOT NULL
             );
 
@@ -718,6 +778,9 @@ def init_library_db() -> None:
             """
         )
         ensure_column_exists(connection, "download_history", "saved_path", "TEXT NOT NULL DEFAULT ''")
+        ensure_column_exists(connection, "download_history", "cover", "TEXT NOT NULL DEFAULT ''")
+        ensure_column_exists(connection, "download_history", "query", "TEXT NOT NULL DEFAULT ''")
+        ensure_column_exists(connection, "download_history", "video_id", "TEXT")
 
 
 def library_track_from_row(row: sqlite3.Row, timestamp_field: str) -> dict:
@@ -765,7 +828,7 @@ def fetch_recent_downloads(limit: int = 12) -> list[dict]:
     with get_db_connection() as connection:
         rows = connection.execute(
             """
-            SELECT track_key, title, artist, filename, source_url, saved_path, downloaded_at
+            SELECT track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, downloaded_at
             FROM download_history
             ORDER BY downloaded_at DESC, id DESC
             LIMIT ?
@@ -780,10 +843,190 @@ def fetch_recent_downloads(limit: int = 12) -> list[dict]:
             "filename": row["filename"],
             "sourceUrl": row["source_url"],
             "savedPath": row["saved_path"],
+            "cover": row["cover"],
+            "query": row["query"],
+            "videoId": row["video_id"],
             "downloadedAt": row["downloaded_at"],
         }
         for row in rows
     ]
+
+
+def fetch_download_history_rows(limit: int = 500) -> list[sqlite3.Row]:
+    with get_db_connection() as connection:
+        return connection.execute(
+            """
+            SELECT track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, downloaded_at
+            FROM download_history
+            ORDER BY downloaded_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def infer_track_metadata_from_filename(filename: str) -> tuple[str, str]:
+    stem = Path(filename or "").stem.strip()
+    if " - " in stem:
+        title, artist = stem.rsplit(" - ", 1)
+        return title.strip(), artist.strip()
+    return stem, ""
+
+
+def path_is_relative_to(path_value: Path, base_path: Path) -> bool:
+    try:
+        path_value.resolve().relative_to(base_path.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def allowed_local_media_paths() -> set[str]:
+    allowed: set[str] = set()
+    for row in fetch_download_history_rows(1000):
+        saved_path = str(row["saved_path"] or "").strip()
+        if not saved_path:
+            continue
+        try:
+            allowed.add(str(Path(saved_path).resolve()))
+        except OSError:
+            allowed.add(str(Path(saved_path)))
+    return allowed
+
+
+def resolve_local_media_path(raw_path: str) -> Path:
+    candidate = Path((raw_path or "").strip()).expanduser()
+    if not str(candidate):
+        raise HTTPException(status_code=422, detail="path is required")
+
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Local file not found") from exc
+
+    download_root = resolve_download_directory_path()
+    allowed_paths = allowed_local_media_paths()
+    if path_is_relative_to(resolved, download_root) or str(resolved) in allowed_paths:
+        return resolved
+    raise HTTPException(status_code=403, detail="Local file is outside the allowed media library")
+
+
+def build_local_media_url(path_value: Path) -> str:
+    return f"/local-media?path={quote(str(path_value))}"
+
+
+def build_local_library_payload() -> dict:
+    download_directory = resolve_download_directory_path()
+    history_rows = fetch_download_history_rows(1000)
+
+    metadata_by_path: dict[str, dict[str, Any]] = {}
+    metadata_by_filename: dict[str, dict[str, Any]] = {}
+    for row in history_rows:
+        payload = {
+            "key": row["track_key"] or "",
+            "title": row["title"] or "",
+            "artist": row["artist"] or "",
+            "filename": row["filename"] or "",
+            "sourceUrl": row["source_url"] or "",
+            "savedPath": row["saved_path"] or "",
+            "cover": row["cover"] or "",
+            "query": row["query"] or "",
+            "videoId": row["video_id"],
+            "downloadedAt": row["downloaded_at"] or "",
+        }
+        saved_path = str(payload["savedPath"]).strip()
+        if saved_path:
+            try:
+                metadata_by_path[str(Path(saved_path).resolve())] = payload
+            except OSError:
+                metadata_by_path[saved_path] = payload
+        if payload["filename"] and payload["filename"] not in metadata_by_filename:
+            metadata_by_filename[payload["filename"]] = payload
+
+    files = [
+        candidate
+        for candidate in download_directory.rglob("*")
+        if candidate.is_file() and candidate.suffix.lower() in LOCAL_AUDIO_EXTENSIONS
+    ]
+
+    items: list[dict[str, Any]] = []
+    duplicate_buckets: dict[str, list[int]] = {}
+    total_size = 0
+
+    for file_path in files:
+        try:
+            resolved_path = file_path.resolve()
+        except OSError:
+            resolved_path = file_path
+
+        stat = file_path.stat()
+        total_size += stat.st_size
+
+        metadata = metadata_by_path.get(str(resolved_path)) or metadata_by_filename.get(file_path.name) or {}
+        inferred_title, inferred_artist = infer_track_metadata_from_filename(file_path.name)
+        title = metadata.get("title") or inferred_title or file_path.stem
+        artist = metadata.get("artist") or inferred_artist or "本地文件"
+        query = metadata.get("query") or " ".join(part for part in [title, artist] if part and artist != "本地文件").strip()
+        key = metadata.get("key") or f"local::{normalize_cache_text(str(resolved_path))}"
+        duplicate_identity = metadata.get("videoId") or normalize_cache_text(f"{title}::{artist}")
+
+        item = {
+            "key": key,
+            "title": title,
+            "artist": artist,
+            "cover": metadata.get("cover") or "",
+            "filename": file_path.name,
+            "savedPath": str(resolved_path),
+            "sourceUrl": metadata.get("sourceUrl") or "",
+            "query": query,
+            "videoId": metadata.get("videoId"),
+            "downloadedAt": metadata.get("downloadedAt") or datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            "fileSize": stat.st_size,
+            "offlineUrl": build_local_media_url(resolved_path),
+            "duplicateGroup": duplicate_identity,
+            "duplicateCount": 1,
+        }
+        duplicate_buckets.setdefault(duplicate_identity, []).append(len(items))
+        items.append(item)
+
+    duplicate_groups = 0
+    duplicate_tracks = 0
+    for indexes in duplicate_buckets.values():
+        if len(indexes) <= 1:
+            continue
+        duplicate_groups += 1
+        duplicate_tracks += len(indexes)
+        for index in indexes:
+            items[index]["duplicateCount"] = len(indexes)
+
+    items.sort(key=lambda item: item.get("downloadedAt") or "", reverse=True)
+
+    return {
+        "downloadDirectory": str(download_directory),
+        "totalTracks": len(items),
+        "duplicateGroups": duplicate_groups,
+        "duplicateTracks": duplicate_tracks,
+        "totalSize": total_size,
+        "items": items,
+    }
+
+
+def append_frontend_error_report(report: FrontendErrorReport) -> Path:
+    ensure_runtime_directories()
+    log_path = DATA_DIR / "frontend-errors.log"
+    payload = {
+        "eventType": report.eventType or "client-error",
+        "message": report.message or "",
+        "stack": report.stack or "",
+        "componentStack": report.componentStack or "",
+        "url": report.url or "",
+        "userAgent": report.userAgent or "",
+        "timestamp": report.timestamp or utc_now_iso(),
+        "meta": report.meta or {},
+    }
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return log_path
 
 
 def fetch_saved_lyrics_offset(track_key: str = "", video_id: str = "") -> float:
@@ -1479,21 +1722,6 @@ def pick_thumbnail_url(thumbnails: Any) -> str:
     return ""
 
 
-def preferred_video_thumbnail(video_id: str = "", current_url: str = "") -> str:
-    normalized_video_id = (video_id or "").strip()
-    if not normalized_video_id:
-        return current_url or ""
-
-    high_res_candidate = f"https://i.ytimg.com/vi/{normalized_video_id}/hqdefault.jpg"
-    if not current_url:
-        return high_res_candidate
-
-    normalized_url = current_url.lower()
-    if any(marker in normalized_url for marker in ("=w60-", "=w120-", "/default.jpg", "/mqdefault.jpg", "/sddefault.jpg")):
-        return high_res_candidate
-    return current_url
-
-
 def normalize_ytmusic_language(value: str) -> str:
     normalized = (value or "").strip().replace("-", "_")
     if normalized in SUPPORTED_YTMUSIC_LANGUAGES:
@@ -1531,7 +1759,6 @@ def normalize_catalog_entry(entry: dict, provider: str) -> dict:
     normalized = dict(entry)
     normalized["provider"] = provider
     normalized["duration"] = normalize_duration_seconds(entry.get("duration"))
-    normalized["thumbnail"] = preferred_video_thumbnail(str(entry.get("id") or ""), str(entry.get("thumbnail") or ""))
     return normalized
 
 
@@ -1906,12 +2133,32 @@ def fetch_lyrics_payload(
     clean_track, clean_artist = extract_track_and_artist(track_name, artist_name)
     target_duration = normalize_duration_seconds(audio_duration)
     target_lang = get_target_language(track_name, artist_name)
+    best_plain_payload: dict | None = None
+
+    def remember_plain_candidate(payload: dict | None) -> None:
+        nonlocal best_plain_payload
+        if not payload or payload.get("syncedLyrics") or not payload.get("plainLyrics"):
+            return
+
+        if best_plain_payload is None:
+            best_plain_payload = payload
+            return
+
+        current_score = score_lyrics(
+            best_plain_payload.get("syncedLyrics") or best_plain_payload.get("plainLyrics") or "",
+            target_lang,
+        )
+        next_score = score_lyrics(
+            payload.get("syncedLyrics") or payload.get("plainLyrics") or "",
+            target_lang,
+        )
+        if next_score > current_score:
+            best_plain_payload = payload
 
     if video_id:
         ytmusic_payload = fetch_ytmusic_lyrics(video_id)
         if ytmusic_payload:
-            LYRICS_CACHE.set(cache_key, ytmusic_payload, LYRICS_CACHE_TTL_SECONDS)
-            return ytmusic_payload
+            remember_plain_candidate(ytmusic_payload)
 
     url_get = f"https://lrclib.net/api/get?track_name={quote(clean_track)}&artist_name={quote(clean_artist)}"
     try:
@@ -1927,8 +2174,10 @@ def fetch_lyrics_payload(
                     "plainLyrics": data.get("plainLyrics"),
                     "source": "lrclib",
                 }
-                LYRICS_CACHE.set(cache_key, payload, LYRICS_CACHE_TTL_SECONDS)
-                return payload
+                if payload.get("syncedLyrics"):
+                    LYRICS_CACHE.set(cache_key, payload, LYRICS_CACHE_TTL_SECONDS)
+                    return payload
+                remember_plain_candidate(payload)
     except Exception as exc:
         print(f"Exact match failed: {exc}")
 
@@ -2007,13 +2256,19 @@ def fetch_lyrics_payload(
     for fallback_query, target_track, target_artist in fallback_queries:
         result = do_search(fallback_query, target_track, target_artist)
         if result:
-            LYRICS_CACHE.set(cache_key, result, LYRICS_CACHE_TTL_SECONDS)
-            return result
+            if result.get("syncedLyrics"):
+                LYRICS_CACHE.set(cache_key, result, LYRICS_CACHE_TTL_SECONDS)
+                return result
+            remember_plain_candidate(result)
 
     youtube_caption_payload = fetch_youtube_captions(video_id, target_lang)
     if youtube_caption_payload:
         LYRICS_CACHE.set(cache_key, youtube_caption_payload, LYRICS_CACHE_TTL_SECONDS)
         return youtube_caption_payload
+
+    if best_plain_payload:
+        LYRICS_CACHE.set(cache_key, best_plain_payload, LYRICS_CACHE_TTL_SECONDS)
+        return best_plain_payload
 
     empty_payload = {
         "syncedLyrics": None,
@@ -2216,6 +2471,20 @@ def get_dist_file(path_value: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def frontend_index_response() -> FileResponse:
+    return FileResponse(FRONTEND_INDEX, headers=FRONTEND_NO_CACHE_HEADERS)
+
+
+def looks_like_static_asset_path(resource_path: str) -> bool:
+    normalized = (resource_path or "").strip().lstrip("/")
+    if not normalized:
+        return False
+    lowered = normalized.casefold()
+    if any(lowered.startswith(prefix) for prefix in STATIC_ASSET_PREFIXES):
+        return True
+    return bool(Path(normalized).suffix)
+
+
 def setup_page() -> str:
     return """
 <!doctype html>
@@ -2281,8 +2550,9 @@ async def update_app_settings(item: AppSettingsUpdateRequest):
 @app.post("/app-settings/open-download-directory")
 async def open_download_directory():
     init_library_db()
-    open_path_in_file_manager(resolve_download_directory_path())
-    return {"ok": True, "path": str(resolve_download_directory_path())}
+    directory = resolve_download_directory_path()
+    open_path_in_file_manager(directory)
+    return {"ok": True, "path": str(directory)}
 
 
 @app.get("/library", response_model=LibraryResponse)
@@ -2293,6 +2563,18 @@ async def get_library():
         "recentSearches": fetch_recent_searches(12),
         "recentDownloads": fetch_recent_downloads(30),
     }
+
+
+@app.get("/local-library", response_model=LocalLibraryResponse)
+async def get_local_library():
+    init_library_db()
+    return build_local_library_payload()
+
+
+@app.post("/diagnostics/frontend-error")
+async def log_frontend_error(report: FrontendErrorReport):
+    log_path = append_frontend_error_report(report)
+    return {"ok": True, "path": str(log_path)}
 
 
 @app.get("/recommendations", response_model=RecommendationsResponse)
@@ -2404,8 +2686,8 @@ async def create_download_history(item: DownloadHistoryEntry):
     with get_db_connection() as connection:
         connection.execute(
             """
-            INSERT INTO download_history (track_key, title, artist, filename, source_url, saved_path, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO download_history (track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, downloaded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item.key,
@@ -2414,6 +2696,9 @@ async def create_download_history(item: DownloadHistoryEntry):
                 item.filename,
                 item.sourceUrl,
                 item.savedPath,
+                item.cover,
+                item.query,
+                item.videoId,
                 downloaded_at,
             ),
         )
@@ -2425,6 +2710,9 @@ async def create_download_history(item: DownloadHistoryEntry):
         "filename": item.filename,
         "sourceUrl": item.sourceUrl,
         "savedPath": item.savedPath,
+        "cover": item.cover,
+        "query": item.query,
+        "videoId": item.videoId,
         "downloadedAt": downloaded_at,
     }
 
@@ -2870,6 +3158,16 @@ async def proxy_stream(url: str, request: Request):
         raise HTTPException(status_code=500, detail="Stream failed") from exc
 
 
+@app.get("/local-media")
+async def local_media(path: str):
+    media_path = resolve_local_media_path(path)
+    return FileResponse(
+        media_path,
+        media_type=guess_download_media_type(media_path.name, "application/octet-stream"),
+        filename=media_path.name,
+    )
+
+
 @app.get("/download")
 async def download_track(url: str, filename: str = "music.mp3"):
     try:
@@ -2922,7 +3220,7 @@ async def download_track(url: str, filename: str = "music.mp3"):
 @app.get("/")
 async def serve_index():
     if frontend_is_built():
-        return FileResponse(FRONTEND_INDEX)
+        return frontend_index_response()
     return HTMLResponse(setup_page(), status_code=503)
 
 
@@ -2930,15 +3228,18 @@ async def serve_index():
 async def serve_frontend_resource(resource_path: str):
     if not resource_path:
         if frontend_is_built():
-            return FileResponse(FRONTEND_INDEX)
+            return frontend_index_response()
         return HTMLResponse(setup_page(), status_code=503)
 
     file_path = get_dist_file(resource_path)
     if file_path:
         return FileResponse(file_path)
 
+    if looks_like_static_asset_path(resource_path):
+        raise HTTPException(status_code=404, detail="Static asset not found")
+
     if frontend_is_built():
-        return FileResponse(FRONTEND_INDEX)
+        return frontend_index_response()
 
     return HTMLResponse(setup_page(), status_code=503)
 

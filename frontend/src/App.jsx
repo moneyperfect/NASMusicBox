@@ -33,10 +33,10 @@ import {
   Trash2,
   FolderDown,
   FolderOpen,
+  HardDrive,
 } from 'lucide-react';
 
 import VibeOverlay from './components/VibeOverlay';
-import CoverArt from './components/CoverArt';
 
 const HISTORY_STORAGE_KEY = 'nsrl_local_history_v2';
 const FAVORITES_STORAGE_KEY = 'nsrl_local_favorites_v2';
@@ -93,9 +93,58 @@ const BROWSE_CATEGORIES = [
 ];
 
 const RADIO_STATIONS = [
-  { id: 'nas1', title: 'NAS 1', subtitle: '编辑精选与最新热单。', img: 'https://images.unsplash.com/photo-1598488035139-bdbb2231ce04?w=800' },
-  { id: 'naspulse', title: 'NAS Pulse', subtitle: '全天候氛围与电子律动。', img: 'https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=800' },
-  { id: 'nasrewind', title: 'NAS Rewind', subtitle: '经典回放与熟悉旋律。', img: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800' },
+  {
+    id: 'deep-night',
+    title: '深夜漂流',
+    subtitle: '适合灯光变暗之后，耳机里慢慢蔓延的夜色声场。',
+    badge: '深夜模式',
+    img: 'https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?w=1200',
+    queue: [
+      { title: 'Nightcall', artist: 'Kavinsky', query: 'Nightcall Kavinsky' },
+      { title: 'After Dark', artist: 'Mr.Kitty', query: 'After Dark Mr.Kitty' },
+      { title: 'Midnight City', artist: 'M83', query: 'Midnight City M83' },
+      { title: '505', artist: 'Arctic Monkeys', query: '505 Arctic Monkeys' },
+    ],
+  },
+  {
+    id: 'commute-flow',
+    title: '通勤流速',
+    subtitle: '适合走路、地铁和城市移动时保持节奏感的连续播放。',
+    badge: '通勤模式',
+    img: 'https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=1200',
+    queue: [
+      { title: 'Blinding Lights', artist: 'The Weeknd', query: 'Blinding Lights The Weeknd' },
+      { title: 'Levitating', artist: 'Dua Lipa', query: 'Levitating Dua Lipa' },
+      { title: 'Adventure of a Lifetime', artist: 'Coldplay', query: 'Adventure of a Lifetime Coldplay' },
+      { title: "Can't Hold Us", artist: 'Macklemore & Ryan Lewis', query: 'Cant Hold Us Macklemore Ryan Lewis' },
+    ],
+  },
+  {
+    id: 'focus-room',
+    title: '专注房间',
+    subtitle: '弱人声、低干扰、适合写作和长时间投入的背景流。',
+    badge: '专注模式',
+    img: 'https://images.unsplash.com/photo-1497366754035-f200968a6e72?w=1200',
+    queue: [
+      { title: 'Experience', artist: 'Ludovico Einaudi', query: 'Experience Ludovico Einaudi' },
+      { title: 'Nuvole Bianche', artist: 'Ludovico Einaudi', query: 'Nuvole Bianche Ludovico Einaudi' },
+      { title: 'Intro', artist: 'The xx', query: 'Intro The xx' },
+      { title: 'Awake', artist: 'Tycho', query: 'Awake Tycho' },
+    ],
+  },
+  {
+    id: 'jpop-spark',
+    title: '日语流行',
+    subtitle: '偏旋律和情绪推动的 J-Pop 连续推荐，适合直接刷着听。',
+    badge: 'J-Pop',
+    img: 'https://images.unsplash.com/photo-1549692520-acc6669e2f0c?w=1200',
+    queue: [
+      { title: '夜に駆ける', artist: 'YOASOBI', query: '夜に駆ける YOASOBI' },
+      { title: '群青', artist: 'YOASOBI', query: '群青 YOASOBI' },
+      { title: 'Pretender', artist: 'Official髭男dism', query: 'Pretender Official髭男dism' },
+      { title: 'ドライフラワー', artist: '優里', query: 'ドライフラワー 優里' },
+    ],
+  },
 ];
 
 const searchCache = new Map();
@@ -106,9 +155,7 @@ const DESKTOP_ACTION_STORAGE_KEY = 'nas_desktop_action_v1';
 const DESKTOP_SYNC_CHANNEL = 'nas_desktop_sync_v1';
 const LIBRARY_SYNC_INTERVAL_MS = 6000;
 const VISUALIZE_CACHE_TTL_MS = 75 * 1000;
-const MANAGED_DOWNLOAD_POLL_MS = 850;
-const QUEUE_PANEL_SOURCES = new Set(['search', 'discover', 'radio', 'continue']);
-const PLAYBACK_MODE_SEQUENCE = ['off', 'all', 'one'];
+const MANAGED_DOWNLOAD_POLL_MS = 1200;
 
 const trimTrailingSlash = (value) => value.replace(/\/+$/, '');
 const normalizeSearchQuery = (value) => (value || '').trim().replace(/\s+/g, ' ');
@@ -217,24 +264,6 @@ const handleCoverError = (event, song, artist) => {
 
 const recommendationIdentity = (item) => item?.videoId ? `vid:${item.videoId}` : `${(item?.title || '').trim().toLowerCase()}::${(item?.artist || '').trim().toLowerCase()}`;
 
-const shuffleArray = (items) => {
-  const next = [...items];
-  for (let index = next.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(Math.random() * (index + 1));
-    [next[index], next[swapIndex]] = [next[swapIndex], next[index]];
-  }
-  return next;
-};
-
-const buildQueueOrder = (queueLength, currentOriginalIndex = 0, shuffleEnabled = false) => {
-  if (!Number.isFinite(queueLength) || queueLength <= 0) return [];
-  const indices = Array.from({ length: queueLength }, (_, index) => index);
-  const safeCurrentIndex = Math.max(0, Math.min(currentOriginalIndex, queueLength - 1));
-  if (!shuffleEnabled || queueLength <= 1) return indices;
-  const remaining = shuffleArray(indices.filter((index) => index !== safeCurrentIndex));
-  return [safeCurrentIndex, ...remaining];
-};
-
 const buildFallbackRecommendations = () => ({
   mode: 'fallback',
   generatedAt: null,
@@ -312,6 +341,9 @@ const normalizeDownloadHistoryItem = (item) => ({
   filename: item?.filename || '',
   sourceUrl: item?.sourceUrl || '',
   savedPath: item?.savedPath || '',
+  cover: item?.cover || '',
+  query: item?.query || makeQuery(item?.title, item?.artist),
+  videoId: item?.videoId || null,
   downloadedAt: item?.downloadedAt || new Date().toISOString(),
 });
 
@@ -353,6 +385,30 @@ const normalizeDownloadTask = (item) => ({
   jobId: item?.jobId || '',
 });
 
+const normalizeLocalLibraryPayload = (payload) => ({
+  downloadDirectory: payload?.downloadDirectory || '',
+  totalTracks: Number(payload?.totalTracks || 0),
+  duplicateGroups: Number(payload?.duplicateGroups || 0),
+  duplicateTracks: Number(payload?.duplicateTracks || 0),
+  totalSize: Number(payload?.totalSize || 0),
+  items: Array.isArray(payload?.items) ? payload.items.map((item) => ({
+    key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+    title: item?.title || '',
+    artist: item?.artist || '',
+    cover: item?.cover || '',
+    filename: item?.filename || '',
+    savedPath: item?.savedPath || '',
+    sourceUrl: item?.sourceUrl || '',
+    query: item?.query || makeQuery(item?.title, item?.artist),
+    videoId: item?.videoId || null,
+    downloadedAt: item?.downloadedAt || '',
+    fileSize: Number(item?.fileSize || 0),
+    offlineUrl: item?.offlineUrl || '',
+    duplicateGroup: item?.duplicateGroup || '',
+    duplicateCount: Number(item?.duplicateCount || 1),
+  })) : [],
+});
+
 const waitWithAbort = (ms, signal) => new Promise((resolve, reject) => {
   const timer = window.setTimeout(() => {
     signal?.removeEventListener?.('abort', onAbort);
@@ -364,13 +420,7 @@ const waitWithAbort = (ms, signal) => new Promise((resolve, reject) => {
     reject(new DOMException('Aborted', 'AbortError'));
   };
 
-  if (signal) {
-    if (signal.aborted) {
-      onAbort();
-      return;
-    }
-    signal.addEventListener('abort', onAbort, { once: true });
-  }
+  signal?.addEventListener?.('abort', onAbort, { once: true });
 });
 
 const buildLibraryRecord = (item, timestampField) => {
@@ -427,11 +477,7 @@ function App() {
   const [resolvingTrack, setResolvingTrack] = useState(false);
   const [track, setTrack] = useState(null);
   const [playQueue, setPlayQueue] = useState([]);
-  const [queueOrder, setQueueOrder] = useState([]);
   const [queueIndex, setQueueIndex] = useState(-1);
-  const [queueSource, setQueueSource] = useState('direct');
-  const [repeatMode, setRepeatMode] = useState('off');
-  const [shuffleEnabled, setShuffleEnabled] = useState(false);
 
   const [historyItems, setHistoryItems] = useState(() => readStorage(HISTORY_STORAGE_KEY, []).map(toHistoryRecord));
   const [favorites, setFavorites] = useState(() => readStorage(FAVORITES_STORAGE_KEY, []).map(toFavoriteRecord));
@@ -453,6 +499,8 @@ function App() {
   const [backendStatus, setBackendStatus] = useState('checking');
   const [systemCheck, setSystemCheck] = useState(null);
   const [appSettings, setAppSettings] = useState(null);
+  const [localLibrary, setLocalLibrary] = useState(() => normalizeLocalLibraryPayload({}));
+  const [localLibraryLoading, setLocalLibraryLoading] = useState(false);
   const [notice, setNotice] = useState('');
   const [remotePlayerState, setRemotePlayerState] = useState(() => readObjectStorage(PLAYER_STATE_STORAGE_KEY, {
     track: null,
@@ -464,8 +512,6 @@ function App() {
     queueLength: 0,
     canGoPrevious: false,
     canGoNext: false,
-    repeatMode: 'off',
-    shuffleEnabled: false,
     vibeModeEnabled: false,
     updatedAt: 0,
   }));
@@ -499,6 +545,8 @@ function App() {
   const continueSection = discoverSections.find((section) => section.id === 'continue-listening') || null;
   const primaryDiscoverSection = discoverSections.find((section) => section.id === 'for-you') || continueSection || discoverSections[0] || null;
   const curatedSection = discoverSections.find((section) => section.id === 'nas-curated') || discoverSections[0] || null;
+  const managedDownloadsEnabled = systemCheck?.runtimeMode === 'packaged';
+  const currentDownloadDirectory = appSettings?.downloadDirectory || systemCheck?.downloadDirectory || '';
   const discoverSpotlightItems = useMemo(() => {
     const merged = [];
     const seen = new Set();
@@ -537,15 +585,6 @@ function App() {
     ],
     [primaryDiscoverSection, continueSection, curatedSection, discoverSpotlightItems, historyItems],
   );
-  const orderedPlayQueue = useMemo(
-    () => (queueOrder.length > 0 ? queueOrder.map((itemIndex) => playQueue[itemIndex]).filter(Boolean) : playQueue),
-    [playQueue, queueOrder],
-  );
-  const queuePanelAvailable = orderedPlayQueue.length >= 2 && QUEUE_PANEL_SOURCES.has(queueSource);
-  const canGoPrevious = orderedPlayQueue.length > 0 && (queueIndex > 0 || (repeatMode === 'all' && orderedPlayQueue.length > 1));
-  const canGoNext = orderedPlayQueue.length > 0 && (queueIndex < orderedPlayQueue.length - 1 || (repeatMode === 'all' && orderedPlayQueue.length > 1));
-  const managedDownloadsEnabled = systemCheck?.runtimeMode === 'packaged';
-  const currentDownloadDirectory = appSettings?.downloadDirectory || systemCheck?.downloadDirectory || '';
 
   const apiRequest = async (path, options = {}) => {
     const { headers, ...rest } = options;
@@ -585,47 +624,6 @@ function App() {
     setTimeout(() => setNotice(''), 3000);
   };
 
-  const applyQueueContext = (queue = [], orderedIndex = -1, nextQueueSource = 'direct', orderOverride = null) => {
-    const normalizedQueue = Array.isArray(queue) ? queue.filter(Boolean) : [];
-    if (normalizedQueue.length === 0 || orderedIndex < 0) {
-      setPlayQueue([]);
-      setQueueOrder([]);
-      setQueueIndex(-1);
-      setQueueSource(nextQueueSource || 'direct');
-      return;
-    }
-
-    const fallbackOriginalIndex = Math.max(0, Math.min(orderedIndex, normalizedQueue.length - 1));
-    const normalizedOrder = Array.isArray(orderOverride) && orderOverride.length === normalizedQueue.length
-      ? [...orderOverride]
-      : buildQueueOrder(normalizedQueue.length, fallbackOriginalIndex, shuffleEnabled);
-    const normalizedCursor = Array.isArray(orderOverride) && orderOverride.length === normalizedQueue.length
-      ? Math.max(0, Math.min(orderedIndex, normalizedOrder.length - 1))
-      : Math.max(0, normalizedOrder.findIndex((value) => value === fallbackOriginalIndex));
-
-    setPlayQueue(normalizedQueue);
-    setQueueOrder(normalizedOrder);
-    setQueueIndex(normalizedCursor);
-    setQueueSource(nextQueueSource || 'direct');
-  };
-
-  const syncQueueMode = (nextShuffleEnabled) => {
-    if (playQueue.length === 0) {
-      setShuffleEnabled(nextShuffleEnabled);
-      return;
-    }
-    const activeOriginalIndex = queueOrder[queueIndex] ?? Math.max(0, Math.min(queueIndex, playQueue.length - 1));
-    const nextOrder = buildQueueOrder(playQueue.length, activeOriginalIndex, nextShuffleEnabled);
-    const nextCursor = Math.max(0, nextOrder.findIndex((value) => value === activeOriginalIndex));
-    setQueueOrder(nextOrder);
-    setQueueIndex(nextCursor);
-    setShuffleEnabled(nextShuffleEnabled);
-  };
-
-  const cycleRepeatMode = () => {
-    setRepeatMode((previous) => PLAYBACK_MODE_SEQUENCE[(PLAYBACK_MODE_SEQUENCE.indexOf(previous) + 1) % PLAYBACK_MODE_SEQUENCE.length]);
-  };
-
   const openDownloadDirectory = async (jobId = '') => {
     try {
       if (jobId) {
@@ -650,8 +648,21 @@ function App() {
       setAppSettings(nextSettings);
       setNoticeText('下载目录已更新');
       void checkBackend();
+      void refreshLocalLibrary();
     } catch (error) {
       setNoticeText(error instanceof Error ? error.message : '更新下载目录失败');
+    }
+  };
+
+  const refreshLocalLibrary = async () => {
+    setLocalLibraryLoading(true);
+    try {
+      const data = await apiRequest('/local-library', { cache: 'no-store' });
+      setLocalLibrary(normalizeLocalLibraryPayload(data));
+    } catch {
+      setLocalLibrary(normalizeLocalLibraryPayload({}));
+    } finally {
+      setLocalLibraryLoading(false);
     }
   };
 
@@ -922,15 +933,17 @@ function App() {
 
       const plan = await resolveDownloadPlan(task);
       updateDownloadTask(task.id, {
+        status: 'downloading',
         filename: plan.filename,
         sourceUrl: plan.rawUrl,
         audioExt: plan.audioExt,
       });
-
       let downloadedAt = new Date().toISOString();
       let savedPath = '';
       let jobId = '';
       let resolvedFilename = plan.filename;
+      let received = 0;
+      let totalBytes = 0;
 
       if (managedDownloadsEnabled) {
         const createdJob = await apiRequest('/download-jobs', {
@@ -946,7 +959,7 @@ function App() {
         jobId = createdJob.id;
         updateDownloadTask(task.id, {
           jobId,
-          status: createdJob.status || 'downloading',
+          status: createdJob.status || 'queued',
           filename: createdJob.filename || plan.filename,
           sourceUrl: createdJob.sourceUrl || plan.rawUrl,
           savedPath: createdJob.savedPath || '',
@@ -972,6 +985,8 @@ function App() {
             downloadedAt = currentJob.completedAt || new Date().toISOString();
             savedPath = currentJob.savedPath || '';
             resolvedFilename = currentJob.filename || plan.filename;
+            received = Number(currentJob.bytesReceived || 0);
+            totalBytes = Number(currentJob.totalBytes || 0);
             break;
           }
           if (currentJob.status === 'failed') {
@@ -980,10 +995,6 @@ function App() {
           await waitWithAbort(MANAGED_DOWNLOAD_POLL_MS, controller.signal);
         }
       } else {
-        updateDownloadTask(task.id, {
-          status: 'downloading',
-        });
-
         const response = await fetch(plan.requestUrl, {
           signal: controller.signal,
         });
@@ -991,11 +1002,10 @@ function App() {
           throw new Error(`下载请求失败 (${response.status})`);
         }
 
-        const totalBytes = Number(response.headers.get('content-length') || 0);
+        totalBytes = Number(response.headers.get('content-length') || 0);
         const contentType = response.headers.get('content-type') || 'application/octet-stream';
         const reader = response.body?.getReader();
         const chunks = [];
-        let received = 0;
 
         if (reader) {
           while (true) {
@@ -1023,23 +1033,13 @@ function App() {
           : new Blob(chunks, { type: contentType });
 
         triggerBlobDownload(blob, plan.filename);
-        downloadedAt = new Date().toISOString();
-
-        updateDownloadTask(task.id, {
-          status: 'completed',
-          progress: 1,
-          bytesReceived: received || totalBytes,
-          totalBytes: totalBytes || received,
-          completedAt: downloadedAt,
-          error: '',
-          filename: plan.filename,
-          sourceUrl: plan.rawUrl,
-        });
       }
 
       updateDownloadTask(task.id, {
         status: 'completed',
         progress: 1,
+        bytesReceived: received || totalBytes,
+        totalBytes: totalBytes || received,
         completedAt: downloadedAt,
         error: '',
         filename: resolvedFilename,
@@ -1052,6 +1052,9 @@ function App() {
         key: task.key || trackKey(task.videoId, task.title, task.artist),
         title: task.title || '',
         artist: task.artist || '',
+        cover: task.cover || '',
+        query: task.query || makeQuery(task.title, task.artist),
+        videoId: task.videoId || null,
         filename: resolvedFilename,
         sourceUrl: plan.rawUrl,
         savedPath,
@@ -1064,6 +1067,7 @@ function App() {
       }).catch(() => {});
 
       setNoticeText(savedPath ? `已下载到: ${savedPath}` : `已完成下载: ${task.title || '音频文件'}`);
+      void refreshLocalLibrary();
     } catch (err) {
       if (err?.name === 'AbortError') {
         updateDownloadTask(task.id, {
@@ -1176,6 +1180,16 @@ function App() {
   }, []);
 
   useEffect(() => {
+    window.__NAS_BOOT__?.markMounted?.();
+  }, []);
+
+  useEffect(() => {
+    if (activePage !== 'downloads') return undefined;
+    void refreshLocalLibrary();
+    return undefined;
+  }, [activePage, currentDownloadDirectory]);
+
+  useEffect(() => {
     if (downloadRunnerRef.current) return undefined;
     const activeTask = downloadTasks.find((task) => task.status === 'resolving' || task.status === 'downloading');
     if (activeTask) return undefined;
@@ -1242,12 +1256,7 @@ function App() {
   };
 
   const resolveAndPlay = async (candidate, options = {}) => {
-    const {
-      queue = null,
-      index = -1,
-      queueSource: nextQueueSource = 'direct',
-      queueOrderOverride = null,
-    } = options;
+    const { queue = null, index = -1 } = options;
     const query = candidate.query || makeQuery(candidate.title, candidate.artist);
     const cacheKey = candidate.videoId ? `vid:${candidate.videoId}` : `query:${normalizeSearchQuery(query)}`;
     const cached = visualizeCache.get(cacheKey);
@@ -1271,7 +1280,7 @@ function App() {
         key: trackKey(data.videoId || candidate.videoId, data.title || candidate.title, data.artist || candidate.artist),
         title: data.title || candidate.title,
         artist: data.artist || candidate.artist,
-        cover: resolveCoverArt(data.title || candidate.title, data.artist || candidate.artist, data.cover || candidate.cover),
+        cover: data.cover || candidate.cover,
         theme: data.theme || 'Vibe Resonating',
         colors: data.colors || ['#22d3ee', '#000000'],
         audioSrc: resolveAudioUrl(data.audioSrc),
@@ -1291,7 +1300,10 @@ function App() {
       setDuration(0);
       setIsPlaying(false);
 
-      applyQueueContext(queue, index, nextQueueSource, queueOrderOverride);
+      if (queue) {
+        setPlayQueue(queue);
+        setQueueIndex(index);
+      }
 
       const historyEntry = toHistoryRecord({
         key: resolved.key,
@@ -1323,6 +1335,81 @@ function App() {
         setResolvingTrack(false);
       }
     }
+  };
+
+  const playLocalTrack = (item, options = {}) => {
+    if (!item?.offlineUrl) {
+      setNoticeText('本地文件路径不可用');
+      return;
+    }
+
+    const { queue = null, index = -1 } = options;
+    const resolved = {
+      key: item.key || trackKey(item.videoId, item.title, item.artist),
+      title: item.title || item.filename || '本地音频',
+      artist: item.artist || '本地文件',
+      cover: item.cover || '',
+      theme: 'Offline Session',
+      colors: ['#49dcb1', '#08111d', '#02060c'],
+      audioSrc: resolveAudioUrl(item.offlineUrl),
+      proxyAudioSrc: '',
+      audioExt: item.filename?.split('.').pop() || 'm4a',
+      videoId: item.videoId || null,
+      query: item.query || makeQuery(item.title, item.artist),
+      streamMode: 'local',
+    };
+
+    playbackMetricsRef.current = {
+      startedAt: performance.now(),
+      trackKey: resolved.key,
+    };
+    setTrack(resolved);
+    setCurrentTime(0);
+    setDuration(0);
+    setIsPlaying(false);
+
+    if (queue) {
+      setPlayQueue(queue);
+      setQueueIndex(index);
+    }
+
+    const historyEntry = toHistoryRecord({
+      key: resolved.key,
+      title: resolved.title,
+      artist: resolved.artist,
+      cover: resolved.cover,
+      query: resolved.query,
+      videoId: resolved.videoId,
+      playedAt: new Date().toISOString(),
+    });
+    setHistoryItems((prev) => mergeLibraryRecords([historyEntry], prev, 50, 'playedAt'));
+    void apiRequest('/library/history', {
+      method: 'POST',
+      body: JSON.stringify(historyEntry),
+    }).catch(() => {});
+
+    window.setTimeout(() => {
+      if (audioRef.current) {
+        audioRef.current.load();
+        audioRef.current.play().then(() => setIsPlaying(true)).catch(() => setNoticeText('请点击播放按钮'));
+      }
+    }, 24);
+  };
+
+  const playSceneStation = (station) => {
+    const queue = Array.isArray(station?.queue)
+      ? station.queue.map((item) => ({
+        ...item,
+        cover: station.img,
+      }))
+      : [];
+
+    if (queue.length === 0) {
+      setNoticeText('这个场景还没有可用曲目');
+      return;
+    }
+
+    void resolveAndPlay(queue[0], { queue, index: 0 });
   };
 
   const handleAudioError = () => {
@@ -1364,24 +1451,13 @@ function App() {
   };
 
   const jumpQueue = (nextIndex) => {
-    if (nextIndex < 0 || nextIndex >= orderedPlayQueue.length) return;
-    resolveAndPlay(orderedPlayQueue[nextIndex], {
-      queue: playQueue,
-      index: nextIndex,
-      queueSource,
-      queueOrderOverride: queueOrder,
-    });
-  };
-
-  const moveQueue = (direction, { wrap = false } = {}) => {
-    if (orderedPlayQueue.length === 0) return false;
-    let nextIndex = queueIndex + direction;
-    if (nextIndex < 0 || nextIndex >= orderedPlayQueue.length) {
-      if (!wrap) return false;
-      nextIndex = nextIndex < 0 ? orderedPlayQueue.length - 1 : 0;
+    if (nextIndex < 0 || nextIndex >= playQueue.length) return;
+    const nextItem = playQueue[nextIndex];
+    if (nextItem?.offlineUrl) {
+      playLocalTrack(nextItem, { queue: playQueue, index: nextIndex });
+      return;
     }
-    jumpQueue(nextIndex);
-    return true;
+    resolveAndPlay(nextItem, { queue: playQueue, index: nextIndex });
   };
 
   const onLoadedMetadata = () => {
@@ -1409,11 +1485,11 @@ function App() {
       return;
     }
     if (type === 'next') {
-      moveQueue(1, { wrap: repeatMode === 'all' });
+      jumpQueue(queueIndex + 1);
       return;
     }
     if (type === 'previous') {
-      moveQueue(-1, { wrap: repeatMode === 'all' });
+      jumpQueue(queueIndex - 1);
       return;
     }
     if (type === 'toggle-vibe') {
@@ -1459,7 +1535,7 @@ function App() {
       channel.close();
       if (syncChannelRef.current === channel) syncChannelRef.current = null;
     };
-  }, [isMiniMode, queueIndex, orderedPlayQueue.length, track, isPlaying, repeatMode]);
+  }, [isMiniMode, queueIndex, playQueue.length, track, isPlaying]);
 
   useEffect(() => {
     const handleStorage = (event) => {
@@ -1490,7 +1566,7 @@ function App() {
       window.removeEventListener('storage', handleStorage);
       window.removeEventListener('nas-desktop-shell-action', handleShellAction);
     };
-  }, [isMiniMode, remotePlayerState, queueIndex, orderedPlayQueue.length, track, isPlaying, repeatMode]);
+  }, [isMiniMode, remotePlayerState, queueIndex, playQueue.length, track, isPlaying]);
 
   useEffect(() => {
     if (isMiniMode) return undefined;
@@ -1502,11 +1578,9 @@ function App() {
       duration: Number(duration.toFixed(2)),
       volume,
       queueIndex,
-      queueLength: orderedPlayQueue.length,
-      canGoPrevious,
-      canGoNext,
-      repeatMode,
-      shuffleEnabled,
+      queueLength: playQueue.length,
+      canGoPrevious: queueIndex > 0,
+      canGoNext: queueIndex >= 0 && queueIndex < playQueue.length - 1,
       vibeModeEnabled,
       updatedAt: Date.now(),
     };
@@ -1514,22 +1588,20 @@ function App() {
     localStorage.setItem(PLAYER_STATE_STORAGE_KEY, JSON.stringify(payload));
     postDesktopMessage({ type: 'player-state', payload });
     return undefined;
-  }, [isMiniMode, track, isPlaying, currentTime, duration, volume, queueIndex, orderedPlayQueue.length, canGoPrevious, canGoNext, repeatMode, shuffleEnabled, vibeModeEnabled]);
+  }, [isMiniMode, track, isPlaying, currentTime, duration, volume, queueIndex, playQueue.length, vibeModeEnabled]);
 
   const renderCard = (song, artist, cover, onClick, isPlayable = true) => {
     const displayCover = resolveCoverArt(song, artist, cover);
-    const fallbackCover = createBrandCover(song, artist);
 
     return (
       <div className="music-card animate-slide-up group" onClick={onClick}>
         <div className="card-image-wrap">
-          <CoverArt
+          <img
             src={displayCover}
-            fallbackSrc={fallbackCover}
-            className="w-full h-full"
-            imgClassName="card-image"
+            className="card-image"
             alt=""
             loading="lazy"
+            onError={(event) => handleCoverError(event, song, artist)}
           />
           {isPlayable && (
             <div className="play-hover-btn">
@@ -1565,6 +1637,8 @@ function App() {
   const queuedDownloadCount = downloadTasks.filter((taskItem) => taskItem.status === 'queued').length;
   const failedDownloadCount = downloadTasks.filter((taskItem) => taskItem.status === 'failed').length;
   const completedDownloadCount = downloadTasks.filter((taskItem) => taskItem.status === 'completed').length;
+  const duplicateLibraryItems = localLibrary.items.filter((item) => item.duplicateCount > 1);
+  const recentLocalItems = localLibrary.items.slice(0, 8);
 
   if (isMiniMode) {
     return (
@@ -1764,13 +1838,7 @@ function App() {
                     style={heroBackgroundStyle(banner.accent)}
                     onClick={() => {
                       if (banner.item) {
-                        const spotlightIndex = discoverSpotlightItems.findIndex((item) => recommendationIdentity(item) === recommendationIdentity(banner.item));
-                        resolveAndPlay(
-                          banner.item,
-                          spotlightIndex >= 0
-                            ? { queue: discoverSpotlightItems, index: spotlightIndex, queueSource: 'discover' }
-                            : { queueSource: 'discover' },
-                        );
+                        resolveAndPlay(banner.item);
                       } else {
                         setActivePage('search');
                       }
@@ -1808,7 +1876,7 @@ function App() {
                   item.title,
                   item.artist,
                   item.cover,
-                  () => resolveAndPlay(item, { queue: discoverSpotlightItems, index: idx, queueSource: 'discover' }),
+                  () => resolveAndPlay(item, { queue: discoverSpotlightItems, index: idx }),
                 ))}
               </div>
 
@@ -1828,7 +1896,7 @@ function App() {
                       item.title,
                       item.artist,
                       item.cover,
-                      () => resolveAndPlay(item, { queue: continueSection.items, index: idx, queueSource: 'continue' }),
+                      () => resolveAndPlay(item, { queue: continueSection.items, index: idx }),
                     ))}
                   </div>
                 </>
@@ -1847,7 +1915,7 @@ function App() {
                     item.title,
                     item.artist,
                     item.cover,
-                    () => resolveAndPlay(item, { queue: searchResults, index: idx, queueSource: 'search' })
+                    () => resolveAndPlay(item, { queue: searchResults, index: idx })
                   ))}
                 </div>
               ) : (
@@ -1870,7 +1938,7 @@ function App() {
                     item.title,
                     item.artist,
                     item.cover,
-                    () => resolveAndPlay(item, { queueSource: 'favorites' })
+                    () => resolveAndPlay(item)
                   ))}
                 </div>
               ) : (
@@ -1891,7 +1959,7 @@ function App() {
                     item.title,
                     item.artist,
                     item.cover,
-                    () => resolveAndPlay(item, { queueSource: 'history' }),
+                    () => resolveAndPlay(item),
                     true
                   ))}
                 </div>
@@ -1909,29 +1977,9 @@ function App() {
               <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-6">
                 <div>
                   <h2 className="section-title mb-2 border-b-0 pb-0">下载中心</h2>
-                  <p className="text-sm text-white/45">
-                    {managedDownloadsEnabled
-                      ? '桌面端会直接保存到本地目录，支持路径查看、打开目录和最近下载记录。'
-                      : '源码浏览器模式下仍使用浏览器默认下载目录，最近记录只保留文件名与来源。'}
-                  </p>
+                  <p className="text-sm text-white/45">单任务顺序下载，支持进度跟踪、最近下载记录和离线播放入口。</p>
                 </div>
                 <div className="flex flex-wrap gap-3">
-                  {managedDownloadsEnabled && (
-                    <>
-                      <button
-                        className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/70 hover:bg-white/10 transition-colors"
-                        onClick={() => void openDownloadDirectory()}
-                      >
-                        打开目录
-                      </button>
-                      <button
-                        className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/70 hover:bg-white/10 transition-colors"
-                        onClick={updateDownloadDirectory}
-                      >
-                        修改目录
-                      </button>
-                    </>
-                  )}
                   <button
                     className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/70 hover:bg-white/10 transition-colors"
                     onClick={() => void refreshLibraryState()}
@@ -1948,6 +1996,36 @@ function App() {
                 </div>
               </div>
 
+              <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 mb-6">
+                <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                  <div className="min-w-0">
+                    <div className="text-[11px] uppercase tracking-[0.24em] text-white/30 mb-1">
+                      {managedDownloadsEnabled ? '桌面下载目录' : '离线曲库目录'}
+                    </div>
+                    <div className="text-sm text-white/75 truncate">{currentDownloadDirectory || '暂未设置目录'}</div>
+                    <div className="text-xs text-white/35 mt-1">
+                      {managedDownloadsEnabled
+                        ? '桌面版下载完成后会自动写入这里，并进入下方本地曲库。'
+                        : '源码模式下下载仍由浏览器处理，这里用于离线曲库扫描。'}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      className="px-3 py-1.5 rounded-lg bg-white/6 border border-white/10 text-xs text-white/60 hover:bg-white/10 transition-colors"
+                      onClick={updateDownloadDirectory}
+                    >
+                      选择目录
+                    </button>
+                    <button
+                      className="px-3 py-1.5 rounded-lg bg-white/6 border border-white/10 text-xs text-white/60 hover:bg-white/10 transition-colors"
+                      onClick={() => void openDownloadDirectory()}
+                    >
+                      <span className="inline-flex items-center gap-1.5"><FolderOpen size={13} /> 打开目录</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
                 {[
                   { label: '进行中', value: activeDownloadTask ? '1' : '0', accent: 'text-cyan-400' },
@@ -1960,18 +2038,6 @@ function App() {
                     <div className={`text-3xl font-black ${stat.accent}`}>{stat.value}</div>
                   </div>
                 ))}
-              </div>
-
-              <div className="rounded-3xl border border-white/10 bg-white/5 px-5 py-4 mb-8 flex flex-col gap-2">
-                <div className="text-xs uppercase tracking-[0.24em] text-white/35">当前下载位置</div>
-                <div className="text-sm text-white/80 break-all">
-                  {managedDownloadsEnabled ? (currentDownloadDirectory || '尚未设置下载目录') : '浏览器默认下载目录'}
-                </div>
-                {!managedDownloadsEnabled && (
-                  <div className="text-xs text-white/45">
-                    如果你是从浏览器运行源码版，文件会进入浏览器自己的下载目录；打包桌面版才支持自定义路径。
-                  </div>
-                )}
               </div>
 
               <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
@@ -2028,11 +2094,6 @@ function App() {
                                 </span>
                                 <span>{taskItem.filename || '等待生成文件名'}</span>
                               </div>
-                              {taskItem.savedPath && (
-                                <div className="mt-2 text-xs text-emerald-300/85 break-all">
-                                  保存位置：{taskItem.savedPath}
-                                </div>
-                              )}
                             </div>
 
                             <div className="mt-4 flex flex-wrap gap-2">
@@ -2044,20 +2105,20 @@ function App() {
                                   <span className="inline-flex items-center gap-2"><RefreshCw size={14} /> 重试</span>
                                 </button>
                               )}
-                              {taskItem.savedPath && taskItem.jobId && (
-                                <button
-                                  className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
-                                  onClick={() => void openDownloadDirectory(taskItem.jobId)}
-                                >
-                                  <span className="inline-flex items-center gap-2"><FolderOpen size={14} /> 打开目录</span>
-                                </button>
-                              )}
                               {taskItem.sourceUrl && (
                                 <button
                                   className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
                                   onClick={() => window.open(taskItem.sourceUrl, '_blank', 'noopener,noreferrer')}
                                 >
                                   <span className="inline-flex items-center gap-2"><ExternalLink size={14} /> 源地址</span>
+                                </button>
+                              )}
+                              {taskItem.savedPath && (
+                                <button
+                                  className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
+                                  onClick={() => void openDownloadDirectory(taskItem.jobId || '')}
+                                >
+                                  <span className="inline-flex items-center gap-2"><FolderOpen size={14} /> 打开目录</span>
                                 </button>
                               )}
                               <button
@@ -2067,6 +2128,10 @@ function App() {
                                 <span className="inline-flex items-center gap-2"><Trash2 size={14} /> 移除</span>
                               </button>
                             </div>
+
+                            {taskItem.savedPath && (
+                              <div className="mt-3 text-xs text-white/35 truncate">{taskItem.savedPath}</div>
+                            )}
                           </div>
                         );
                       })}
@@ -2098,15 +2163,25 @@ function App() {
                           </div>
                           <div className="mt-2 text-xs text-white/35 truncate">{entry.filename || '未记录文件名'}</div>
                           {entry.savedPath && (
-                            <div className="mt-2 text-xs text-emerald-300/85 break-all">{entry.savedPath}</div>
+                            <div className="mt-1 text-xs text-white/25 truncate">{entry.savedPath}</div>
                           )}
                           {entry.sourceUrl && (
-                            <button
-                              className="mt-3 text-xs text-cyan-300 hover:text-cyan-200 transition-colors inline-flex items-center gap-1"
-                              onClick={() => window.open(entry.sourceUrl, '_blank', 'noopener,noreferrer')}
-                            >
-                              查看源地址 <ChevronRight size={14} />
-                            </button>
+                            <div className="mt-3 flex flex-wrap gap-3">
+                              <button
+                                className="text-xs text-cyan-300 hover:text-cyan-200 transition-colors inline-flex items-center gap-1"
+                                onClick={() => window.open(entry.sourceUrl, '_blank', 'noopener,noreferrer')}
+                              >
+                                查看源地址 <ChevronRight size={14} />
+                              </button>
+                              {entry.savedPath && (
+                                <button
+                                  className="text-xs text-white/45 hover:text-white/70 transition-colors inline-flex items-center gap-1"
+                                  onClick={() => void openDownloadDirectory()}
+                                >
+                                  打开目录 <ChevronRight size={14} />
+                                </button>
+                              )}
+                            </div>
                           )}
                         </div>
                       ))}
@@ -2119,6 +2194,105 @@ function App() {
                   )}
                 </div>
               </div>
+
+              <div className="mt-6 rounded-3xl border border-white/10 bg-white/5 p-6">
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between mb-5">
+                  <div>
+                    <div className="flex items-center gap-2 text-white/85 mb-2">
+                      <HardDrive size={18} className="text-cyan-300" />
+                      <span className="font-semibold">本地歌曲</span>
+                    </div>
+                    <p className="text-sm text-white/40">这里会自动展示当前下载目录中的可离线播放曲目，并保留封面与元数据。</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    <span className="px-3 py-1 rounded-full bg-white/6 border border-white/10 text-white/60">
+                      {localLibrary.totalTracks} 首
+                    </span>
+                    <span className="px-3 py-1 rounded-full bg-white/6 border border-white/10 text-white/60">
+                      {formatBytes(localLibrary.totalSize)}
+                    </span>
+                    {localLibrary.duplicateGroups > 0 && (
+                      <span className="px-3 py-1 rounded-full bg-amber-500/10 border border-amber-400/20 text-amber-200">
+                        {localLibrary.duplicateGroups} 组重复 · {localLibrary.duplicateTracks} 首
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {localLibraryLoading ? (
+                  <div className="py-16 text-center text-white/45">
+                    <LoaderCircle size={28} className="mx-auto mb-3 animate-spin text-cyan-300" />
+                    <p>正在扫描本地曲库...</p>
+                  </div>
+                ) : localLibrary.totalTracks > 0 ? (
+                  <div className="space-y-5">
+                    {duplicateLibraryItems.length > 0 && (
+                      <div className="rounded-2xl border border-amber-400/15 bg-amber-500/8 px-4 py-3 text-sm text-amber-100">
+                        检测到重复文件。当前会按歌曲或视频来源做聚合标记，方便后续清理与管理。
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                      {recentLocalItems.map((item, index) => (
+                        <div key={`${item.savedPath}-${index}`} className="rounded-2xl border border-white/8 bg-black/20 p-4 flex gap-4">
+                          <img
+                            src={resolveCoverArt(item.title, item.artist, item.cover)}
+                            alt={item.title}
+                            className="w-16 h-16 rounded-2xl object-cover shrink-0"
+                            loading="lazy"
+                            onError={(event) => handleCoverError(event, item.title, item.artist)}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="font-semibold text-white truncate">{item.title || item.filename}</div>
+                                <div className="text-sm text-white/45 truncate">{item.artist || '本地文件'}</div>
+                              </div>
+                              {item.duplicateCount > 1 && (
+                                <span className="shrink-0 px-2 py-1 rounded-full bg-amber-500/10 border border-amber-400/20 text-[11px] text-amber-200">
+                                  重复 {item.duplicateCount}
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-2 text-xs text-white/35 truncate">{item.filename}</div>
+                            <div className="mt-1 text-xs text-white/30">
+                              {formatBytes(item.fileSize)} · {formatRelativeTime(item.downloadedAt)}
+                            </div>
+                            <div className="mt-1 text-xs text-white/25 truncate">{item.savedPath}</div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button
+                                className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
+                                onClick={() => playLocalTrack(item, { queue: localLibrary.items, index })}
+                              >
+                                <span className="inline-flex items-center gap-2"><Play size={14} fill="currentColor" /> 离线播放</span>
+                              </button>
+                              {item.sourceUrl && (
+                                <button
+                                  className="px-3 py-1.5 rounded-lg bg-white/8 border border-white/10 text-sm text-white/75 hover:bg-white/12 transition-colors"
+                                  onClick={() => window.open(item.sourceUrl, '_blank', 'noopener,noreferrer')}
+                                >
+                                  <span className="inline-flex items-center gap-2"><ExternalLink size={14} /> 原曲来源</span>
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {localLibrary.totalTracks > recentLocalItems.length && (
+                      <div className="text-xs text-white/35">
+                        当前展示最近 {recentLocalItems.length} 首，本地曲库共 {localLibrary.totalTracks} 首。
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="py-16 text-center text-white/45">
+                    <HardDrive size={52} className="mx-auto mb-4 opacity-30" />
+                    <p>目录里还没有扫描到音频文件。下载完成后，这里会自动出现离线入口。</p>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -2128,7 +2302,7 @@ function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {[
                   { label: '后端核心', status: backendStatus === 'online', val: backendStatus },
-                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.5.1' },
+                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.2.4' },
                   { label: '运行模式', status: true, val: systemCheck?.runtimeMode === 'packaged' ? '桌面安装版' : '源码模式' },
                   { label: 'ffmpeg', status: !!systemCheck?.ffmpegAvailable, val: systemCheck?.ffmpegAvailable ? '已启用' : '未检测到' },
                   { label: '本地数据库', status: !!systemCheck?.libraryDbAvailable, val: systemCheck?.libraryDbAvailable ? 'SQLite 已连接' : '未初始化' },
@@ -2138,7 +2312,6 @@ function App() {
                   { label: '收藏 / 历史', status: true, val: `${systemCheck?.libraryStats?.favorites ?? favorites.length} / ${systemCheck?.libraryStats?.history ?? historyItems.length}` },
                   { label: '下载记录', status: true, val: `${systemCheck?.libraryStats?.downloads ?? downloadHistory.length} 条` },
                   { label: '歌词偏移', status: true, val: `${systemCheck?.libraryStats?.lyricsOffsets ?? 0} 条` },
-                  { label: '下载目录', status: true, val: managedDownloadsEnabled ? '桌面目录已启用' : '浏览器默认目录' },
                 ].map((stat, i) => (
                   <div key={i} className="bg-white/5 border border-white/10 p-4 rounded-xl flex justify-between items-center">
                     <span className="text-sm font-medium text-slate-400">{stat.label}</span>
@@ -2147,28 +2320,6 @@ function App() {
                     </span>
                   </div>
                 ))}
-              </div>
-              <div className="mt-6 p-6 bg-white/5 border border-white/10 rounded-2xl">
-                <h4 className="flex items-center gap-2 mb-3 text-slate-200"><FolderDown size={18} /> 下载目录</h4>
-                <div className="text-sm text-slate-400 break-all mb-4">
-                  {managedDownloadsEnabled ? (currentDownloadDirectory || '尚未设置') : '当前为源码浏览器模式，下载位置由浏览器自身决定。'}
-                </div>
-                {managedDownloadsEnabled && (
-                  <div className="flex flex-wrap gap-3">
-                    <button
-                      className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/80 hover:bg-white/10 transition-colors"
-                      onClick={() => void openDownloadDirectory()}
-                    >
-                      打开当前目录
-                    </button>
-                    <button
-                      className="px-4 py-2 rounded-xl bg-white/6 border border-white/10 text-sm text-white/80 hover:bg-white/10 transition-colors"
-                      onClick={updateDownloadDirectory}
-                    >
-                      修改下载目录
-                    </button>
-                  </div>
-                )}
               </div>
               <div className="mt-8 p-6 bg-white/5 border border-white/10 rounded-2xl">
                 <h4 className="flex items-center gap-2 mb-2 text-slate-200"><Info size={18} /> 关于项目</h4>
@@ -2204,23 +2355,24 @@ function App() {
 
           {activePage === 'radio' && (
             <div className="animate-slide-up">
-              <h1 className="text-3xl font-bold text-white mb-6 tracking-tight">广播</h1>
+              <h1 className="text-3xl font-bold text-white mb-2 tracking-tight">广播</h1>
+              <p className="text-sm text-white/40 mb-6">按情绪和场景进入连续播放，不用先想好一首具体的歌。</p>
               <div className="flex flex-col gap-8">
                 {RADIO_STATIONS.map((station, i) => (
-                  <div key={station.id} className="relative rounded-2xl overflow-hidden h-64 md:h-80 cursor-pointer group hover:opacity-90 transition-opacity" onClick={() => resolveAndPlay({ title: station.title, artist: 'NAS Radio', cover: station.img, query: station.title + ' live mix' }, { queueSource: 'radio' })}>
-                    <CoverArt
+                  <div key={station.id} className="relative rounded-2xl overflow-hidden h-64 md:h-80 cursor-pointer group hover:opacity-90 transition-opacity" onClick={() => playSceneStation(station)}>
+                    <img
                       src={resolveCoverArt(station.title, 'NAS Radio', station.img)}
-                      fallbackSrc={createBrandCover(station.title, 'NAS Radio')}
                       alt={station.title}
-                      className="absolute inset-0 w-full h-full"
-                      imgClassName="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
+                      className="absolute inset-0 w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
                       loading="lazy"
+                      onError={(event) => handleCoverError(event, station.title, 'NAS Radio')}
                     />
                     <div className="absolute inset-0 bg-gradient-to-r from-black/80 via-black/40 to-transparent" />
                     <div className="absolute top-0 left-0 p-8 h-full flex flex-col justify-center">
-                      <p className="text-xs font-bold text-white/70 uppercase tracking-widest mb-3 border border-white/20 inline-block px-3 py-1 rounded-full backdrop-blur-md">LIVE 广播</p>
+                      <p className="text-xs font-bold text-white/70 uppercase tracking-widest mb-3 border border-white/20 inline-block px-3 py-1 rounded-full backdrop-blur-md">{station.badge}</p>
                       <h3 className="text-4xl md:text-5xl font-bold text-white mb-3 leading-tight drop-shadow-lg">{station.title}</h3>
                       <p className="text-lg text-white/60 font-medium">{station.subtitle}</p>
+                      <div className="mt-4 text-sm text-white/45">点击即开始连续播放</div>
                     </div>
                   </div>
                 ))}
@@ -2276,13 +2428,12 @@ function App() {
                       <span className="w-16 text-right">时长</span>
                     </div>
                     {allSongs.map((song, idx) => (
-                      <div key={song.key} className="grid grid-cols-[auto_1fr_1fr_auto] gap-4 px-4 py-3 items-center hover:bg-white/5 rounded-lg cursor-pointer group transition-colors" onClick={() => resolveAndPlay(song, { queueSource: 'songs' })}>
+                      <div key={song.key} className="grid grid-cols-[auto_1fr_1fr_auto] gap-4 px-4 py-3 items-center hover:bg-white/5 rounded-lg cursor-pointer group transition-colors" onClick={() => resolveAndPlay(song)}>
                         <div className="w-8 relative flex justify-center items-center">
-                          <CoverArt
+                          <img
                             src={resolveCoverArt(song.title, song.artist, song.cover)}
-                            fallbackSrc={createBrandCover(song.title, song.artist)}
-                            className="w-8 h-8 rounded shrink-0 opacity-100 group-hover:opacity-40 transition-opacity overflow-hidden"
-                            imgClassName="w-full h-full object-cover"
+                            className="w-8 h-8 rounded shrink-0 opacity-100 group-hover:opacity-40 transition-opacity"
+                            onError={(event) => handleCoverError(event, song.title, song.artist)}
                           />
                           <Play size={14} className="absolute text-white opacity-0 group-hover:opacity-100 drop-shadow-md" fill="currentColor" />
                         </div>
@@ -2303,12 +2454,11 @@ function App() {
         <div className="current-track-info">
           {track ? (
             <>
-                <CoverArt
+                <img
                   src={resolveCoverArt(track.title, track.artist, track.cover)}
-                  fallbackSrc={createBrandCover(track.title, track.artist)}
-                  className="track-img overflow-hidden"
-                  imgClassName="w-full h-full object-cover"
+                  className="track-img"
                   alt=""
+                  onError={(event) => handleCoverError(event, track.title, track.artist)}
                 />
               <div className="track-details">
                 <div className="track-name">{track.title}</div>
@@ -2334,13 +2484,13 @@ function App() {
 
         <div className="main-controls">
           <div className="control-buttons">
-            <button className="control-btn" onClick={() => moveQueue(-1, { wrap: repeatMode === 'all' })} disabled={!canGoPrevious}>
+            <button className="control-btn" onClick={() => jumpQueue(queueIndex - 1)} disabled={queueIndex <= 0}>
               <SkipBack size={20} fill="currentColor" />
             </button>
             <button className="play-pause-btn" onClick={handleTogglePlay}>
               {isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} className="ml-1" fill="currentColor" />}
             </button>
-            <button className="control-btn" onClick={() => moveQueue(1, { wrap: repeatMode === 'all' })} disabled={!canGoNext}>
+            <button className="control-btn" onClick={() => jumpQueue(queueIndex + 1)} disabled={queueIndex < 0 || queueIndex >= playQueue.length - 1}>
               <SkipForward size={20} fill="currentColor" />
             </button>
 
@@ -2420,14 +2570,8 @@ function App() {
         onTimeUpdate={onTimeUpdate}
         onError={handleAudioError}
         onEnded={() => {
-          if (repeatMode === 'one' && audioRef.current) {
-            audioRef.current.currentTime = 0;
-            audioRef.current.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
-            return;
-          }
-          if (!moveQueue(1, { wrap: repeatMode === 'all' })) {
-            setIsPlaying(false);
-          }
+          if (queueIndex < playQueue.length - 1) jumpQueue(queueIndex + 1);
+          else setIsPlaying(false);
         }}
       />
 
@@ -2436,26 +2580,15 @@ function App() {
           track={track}
           audioRef={audioRef}
           audioDuration={duration}
-          playQueue={orderedPlayQueue}
+          playQueue={playQueue}
           queueIndex={queueIndex}
           jumpQueue={jumpQueue}
-          queueSource={queueSource}
-          queuePanelAvailable={queuePanelAvailable}
           isPlaying={isPlaying}
           handleTogglePlay={handleTogglePlay}
           currentTime={currentTime}
           formatTime={formatTime}
           isFavoriteItem={isFavoriteItem}
           toggleFavoriteItem={toggleFavoriteItem}
-          repeatMode={repeatMode}
-          onCycleRepeatMode={cycleRepeatMode}
-          shuffleEnabled={shuffleEnabled}
-          onToggleShuffle={() => syncQueueMode(!shuffleEnabled)}
-          canGoPrevious={canGoPrevious}
-          canGoNext={canGoNext}
-          onPreviousTrack={() => moveQueue(-1, { wrap: repeatMode === 'all' })}
-          onNextTrack={() => moveQueue(1, { wrap: repeatMode === 'all' })}
-          onDownloadTrack={handleDownload}
           onShareTrack={async (item) => {
             const shareText = `${item?.title || ''} - ${item?.artist || ''}`.trim();
             try {
@@ -2488,19 +2621,8 @@ function App() {
             setVibeModeEnabled(false);
             void runSearch(artist);
           }}
-          onSearchTrack={(item) => {
-            const searchText = makeQuery(item?.title, item?.artist);
-            if (!searchText) return;
-            setVibeModeEnabled(false);
-            void runSearch(searchText);
-          }}
-          onViewCover={(item) => {
-            const coverUrl = resolveCoverArt(item?.title, item?.artist, item?.cover);
-            window.open(coverUrl, '_blank', 'noopener,noreferrer');
-          }}
           onClose={() => setVibeModeEnabled(false)}
           apiUrl={apiUrl}
-          resolveCoverArt={resolveCoverArt}
         />
       )}
     </div>

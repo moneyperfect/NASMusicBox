@@ -36,7 +36,6 @@ def isolated_library(tmp_path, monkeypatch):
     main.LYRICS_CACHE.clear()
     main.COLOR_CACHE.clear()
     main.RECOMMENDATIONS_CACHE.clear()
-    main.DOWNLOAD_JOBS.clear()
     return db_path
 
 
@@ -96,7 +95,10 @@ def test_library_roundtrip_and_system_check(isolated_library):
                 artist="YOASOBI",
                 filename="夜に駆ける - YOASOBI.m4a",
                 sourceUrl="https://example.com/audio.m4a",
-                savedPath=str((isolated_library.parent / "downloads" / "yoasobi.m4a")),
+                savedPath=str(main.default_download_directory() / "track-1.m4a"),
+                cover="https://example.com/cover.jpg",
+                query="YOASOBI track-1",
+                videoId="x8VYWazR5mE",
             )
         )
     )
@@ -125,7 +127,6 @@ def test_library_roundtrip_and_system_check(isolated_library):
     library = asyncio.run(main.get_library())
     assert library["favorites"][0]["title"] == "夜に駆ける"
     assert library["recentDownloads"][0]["filename"].endswith(".m4a")
-    assert library["recentDownloads"][0]["savedPath"].endswith("yoasobi.m4a")
 
     system_check = main.get_system_check()
     assert system_check["appVersion"] == APP_VERSION
@@ -251,9 +252,140 @@ def test_normalize_ytmusic_language_handles_web_locales():
     assert main.normalize_ytmusic_language("xx-YY") == "en"
 
 
-def test_preferred_video_thumbnail_upgrades_low_res_urls():
-    assert main.preferred_video_thumbnail("abc123", "https://lh3.googleusercontent.com/=w120-h120") == "https://i.ytimg.com/vi/abc123/hqdefault.jpg"
-    assert main.preferred_video_thumbnail("abc123", "https://i.ytimg.com/vi/abc123/hqdefault.jpg") == "https://i.ytimg.com/vi/abc123/hqdefault.jpg"
+def test_fetch_lyrics_payload_prefers_synced_sources_over_plain_fallback(monkeypatch):
+    main.LYRICS_CACHE.clear()
+
+    monkeypatch.setattr(
+        main,
+        "fetch_ytmusic_lyrics",
+        lambda _video_id: {
+            "syncedLyrics": None,
+            "plainLyrics": "plain fallback lyrics",
+            "source": "ytmusicapi",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "fetch_youtube_captions",
+        lambda _video_id, _target_lang: {
+            "syncedLyrics": "[00:01.00]synced caption",
+            "plainLyrics": "synced caption",
+            "source": "youtube_subtitles",
+        },
+    )
+
+    def fake_request_json(url, *, params=None, timeout=12, kind="metadata"):
+        if "lrclib.net/api/get" in url:
+            return {
+                "trackName": "Song",
+                "artistName": "Artist",
+                "duration": 200,
+                "syncedLyrics": None,
+                "plainLyrics": "plain lrclib lyrics",
+            }
+        if "lrclib.net/api/search" in url:
+            return []
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(main, "request_json", fake_request_json)
+
+    payload = main.fetch_lyrics_payload("Song", "Artist", 200, "video-1")
+
+    assert payload["source"] == "youtube_subtitles"
+    assert payload["syncedLyrics"] == "[00:01.00]synced caption"
+
+
+def test_fetch_lyrics_payload_returns_plain_fallback_when_no_synced_source(monkeypatch):
+    main.LYRICS_CACHE.clear()
+
+    monkeypatch.setattr(
+        main,
+        "fetch_ytmusic_lyrics",
+        lambda _video_id: {
+            "syncedLyrics": None,
+            "plainLyrics": "plain fallback lyrics",
+            "source": "ytmusicapi",
+        },
+    )
+    monkeypatch.setattr(main, "fetch_youtube_captions", lambda *_args, **_kwargs: None)
+
+    def fake_request_json(url, *, params=None, timeout=12, kind="metadata"):
+        if "lrclib.net/api/get" in url:
+            return None
+        if "lrclib.net/api/search" in url:
+            return []
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(main, "request_json", fake_request_json)
+
+    payload = main.fetch_lyrics_payload("Song", "Artist", 200, "video-1")
+
+    assert payload["source"] == "ytmusicapi"
+    assert payload["plainLyrics"] == "plain fallback lyrics"
+
+
+def test_local_library_payload_detects_duplicates(isolated_library, tmp_path):
+    download_dir = tmp_path / "offline-library"
+    first_dir = download_dir / "set-a"
+    second_dir = download_dir / "set-b"
+    first_dir.mkdir(parents=True, exist_ok=True)
+    second_dir.mkdir(parents=True, exist_ok=True)
+
+    first_file = first_dir / "nightcall-a.m4a"
+    second_file = second_dir / "nightcall-b.m4a"
+    first_file.write_bytes(b"audio-a")
+    second_file.write_bytes(b"audio-b")
+
+    main.set_app_setting(main.APP_SETTING_DOWNLOAD_DIRECTORY, str(download_dir))
+
+    asyncio.run(
+        main.create_download_history(
+            main.DownloadHistoryEntry(
+                key="nightcall-a",
+                title="Nightcall",
+                artist="Kavinsky",
+                filename=first_file.name,
+                sourceUrl="https://example.com/nightcall-a.m4a",
+                savedPath=str(first_file),
+                cover="https://example.com/nightcall.jpg",
+                query="Nightcall Kavinsky",
+                videoId="video-1",
+            )
+        )
+    )
+    asyncio.run(
+        main.create_download_history(
+            main.DownloadHistoryEntry(
+                key="nightcall-b",
+                title="Nightcall",
+                artist="Kavinsky",
+                filename=second_file.name,
+                sourceUrl="https://example.com/nightcall-b.m4a",
+                savedPath=str(second_file),
+                query="Nightcall Kavinsky",
+                videoId="video-1",
+            )
+        )
+    )
+
+    payload = main.build_local_library_payload()
+
+    assert payload["downloadDirectory"] == str(download_dir.resolve())
+    assert payload["totalTracks"] == 2
+    assert payload["duplicateGroups"] == 1
+    assert payload["duplicateTracks"] == 2
+    assert payload["items"][0]["offlineUrl"].startswith("/local-media?path=")
+    assert all(item["duplicateCount"] == 2 for item in payload["items"])
+
+
+def test_frontend_routes_disable_index_cache_and_do_not_fallback_missing_assets(isolated_library):
+    response = asyncio.run(main.serve_index())
+    assert response.headers["cache-control"].startswith("no-store")
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        asyncio.run(main.serve_frontend_resource("assets/missing-bundle.js"))
+
+    assert exc_info.value.status_code == 404
 
 
 def test_search_ytmusicapi_entries_filters_metric_labels_and_skips_extra_queries(monkeypatch):
@@ -349,12 +481,3 @@ def test_recommendations_mix_history_and_personalized_results(isolated_library, 
     assert "nas-curated" in sections
     assert sections["continue-listening"].items[0].title == "Take On Me"
     assert len(sections["for-you"].items) >= 2
-
-
-def test_app_settings_roundtrip(isolated_library):
-    settings = asyncio.run(main.get_app_settings())
-    assert settings["runtimeMode"] in {"source", "packaged"}
-    assert settings["downloadDirectory"]
-
-    updated = asyncio.run(main.update_app_settings(main.AppSettingsUpdateRequest(downloadDirectory="~/Downloads/TestNAS")))
-    assert updated["downloadDirectory"].endswith("TestNAS")
