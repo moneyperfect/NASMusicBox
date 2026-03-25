@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 import main
-from app_meta import APP_VERSION
+from app_meta import APP_VERSION, APP_VERSION_LABEL, display_version
 
 
 @pytest.fixture()
@@ -131,9 +131,17 @@ def test_library_roundtrip_and_system_check(isolated_library):
 
     system_check = main.get_system_check()
     assert system_check["appVersion"] == APP_VERSION
+    assert system_check["appVersionLabel"] == APP_VERSION_LABEL
     assert system_check["libraryDbAvailable"] is True
     assert system_check["frontendBuilt"] is True
+    assert "envProxyAvailable" in system_check
     assert system_check["downloadDirectory"]
+
+
+def test_display_version_formats_trailing_zero_patch():
+    assert display_version("1.6.0") == "1.60"
+    assert display_version("1.5.1") == "1.5.1"
+    assert display_version("2.10.0") == "2.10"
 
 
 def test_search_youtube_entries_uses_backend_cache(monkeypatch):
@@ -244,6 +252,41 @@ def test_search_provider_uses_youtube_data_api_when_available(monkeypatch):
     assert payload["provider"] == "youtube_data_api"
     assert payload["results"][0].videoId == "video-1"
     assert payload["results"][0].duration == 266
+
+
+def test_build_search_diagnostics_payload_reports_reachable_search(monkeypatch):
+    monkeypatch.setattr(main, "env_proxy_available", lambda: False)
+    monkeypatch.setattr(main, "metadata_proxy_mode", lambda: "direct")
+    monkeypatch.setattr(main, "YOUTUBE_DATA_API_KEY", "")
+    monkeypatch.setattr(main, "search_provider_order", lambda: ["ytmusicapi", "legacy_ytdlp"])
+    monkeypatch.setattr(
+        main,
+        "diagnose_http_endpoint",
+        lambda endpoint_id, label, url, timeout=6: {
+            "id": endpoint_id,
+            "label": label,
+            "url": url,
+            "ok": True,
+            "statusCode": 200,
+            "error": "",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "search_youtube_entries",
+        lambda query, limit: [
+            {"title": "Yellow", "uploader": "Coldplay", "provider": "ytmusicapi"},
+            {"title": "Clocks", "uploader": "Coldplay", "provider": "ytmusicapi"},
+        ][:limit],
+    )
+
+    payload = main.build_search_diagnostics_payload("Yellow Coldplay")
+
+    assert payload["appVersionLabel"] == APP_VERSION_LABEL
+    assert payload["searchProbe"]["ok"] is True
+    assert payload["searchProbe"]["provider"] == "ytmusicapi"
+    assert payload["likelyNeedsProxy"] is False
+    assert payload["checks"][0]["statusCode"] == 200
 
 
 def test_normalize_ytmusic_language_handles_web_locales():

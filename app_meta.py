@@ -17,5 +17,18 @@ GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHU
 UPDATE_CHANNEL = "stable"
 
 
+def display_version(value: str | None = None) -> str:
+    normalized = (value or APP_VERSION or "").strip()
+    parts = normalized.split(".")
+    if len(parts) == 3 and parts[2] == "0" and parts[0].isdigit() and parts[1].isdigit():
+        if len(parts[1]) == 1:
+            return f"{int(parts[0])}.{parts[1]}0"
+        return f"{int(parts[0])}.{parts[1]}"
+    return normalized
+
+
+APP_VERSION_LABEL = display_version()
+
+
 def release_tag() -> str:
     return f"v{APP_VERSION}"

@@ -33,7 +33,9 @@ jobs:
         shell: pwsh
         run: |
           $version = python -c "from app_meta import APP_VERSION; print(APP_VERSION)"
+          $versionLabel = python -c "from app_meta import APP_VERSION_LABEL; print(APP_VERSION_LABEL)"
           Add-Content -Path $env:GITHUB_ENV -Value "APP_VERSION=$version"
+          Add-Content -Path $env:GITHUB_ENV -Value "APP_VERSION_LABEL=$versionLabel"
           if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
             throw "Git tag $env:GITHUB_REF_NAME does not match APP_VERSION v$version."
           }
@@ -80,10 +82,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: NAS 音乐器 v${{ env.APP_VERSION }}
+          name: NAS 音乐器 v${{ env.APP_VERSION_LABEL }}
           body: |
             ## 本次更新
             - 发布 Windows 安装版与便携版
+            - 对外版本标识更新为 v${{ env.APP_VERSION_LABEL }}
             - 修复公开仓库下载链路，支持 GitHub Release 直接下载
             - 提供桌面端搜索、播放、歌词、收藏、下载与本地资料库能力
 

@@ -36,7 +36,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency in local dev
     YTMusic = None
 
-from app_meta import APP_BRAND_NAME, APP_VERSION, BACKEND_HOST, BACKEND_PORT, UPDATE_CHANNEL
+from app_meta import APP_BRAND_NAME, APP_VERSION, APP_VERSION_LABEL, BACKEND_HOST, BACKEND_PORT, UPDATE_CHANNEL
 from app_paths import (
     DATA_DIR,
     FRONTEND_DIST,
@@ -1340,7 +1340,7 @@ def build_local_library_payload() -> dict:
 
 def append_frontend_error_report(report: FrontendErrorReport) -> Path:
     ensure_runtime_directories()
-    log_path = DATA_DIR / "frontend-errors.log"
+    log_path = frontend_error_log_path()
     payload = {
         "eventType": report.eventType or "client-error",
         "message": report.message or "",
@@ -1458,6 +1458,8 @@ def get_system_check() -> dict:
     frontend_built = frontend_is_built()
     dev_frontend_running = port_is_open(5173)
     library_stats = get_library_stats()
+    proxy_available = env_proxy_available()
+    frontend_error_log = frontend_error_log_path()
 
     issues = []
     if not ffmpeg_available:
@@ -1469,6 +1471,7 @@ def get_system_check() -> dict:
 
     return {
         "appVersion": APP_VERSION,
+        "appVersionLabel": APP_VERSION_LABEL,
         "runtimeMode": "packaged" if IS_FROZEN else "source",
         "packaged": IS_FROZEN,
         "updateChannel": UPDATE_CHANNEL,
@@ -1478,7 +1481,9 @@ def get_system_check() -> dict:
         "ytMusicApiAvailable": YTMusic is not None,
         "youtubeDataApiEnabled": bool(YOUTUBE_DATA_API_KEY),
         "searchProvider": NAS_SEARCH_PROVIDER,
+        "searchProviderOrder": search_provider_order(),
         "metadataProxyMode": metadata_proxy_mode(),
+        "envProxyAvailable": proxy_available,
         "mediaTransport": NAS_MEDIA_TRANSPORT,
         "ffmpegAvailable": ffmpeg_available,
         "ffmpegBinary": ffmpeg_binary,
@@ -1490,10 +1495,117 @@ def get_system_check() -> dict:
         "dataDir": str(DATA_DIR),
         "libraryDb": str(LIBRARY_DB),
         "libraryDbAvailable": LIBRARY_DB.is_file(),
+        "frontendErrorLog": str(frontend_error_log),
+        "frontendErrorLogExists": frontend_error_log.is_file(),
         "libraryStats": library_stats,
         "downloadDirectory": str(resolve_download_directory_path()),
         "recommendedEntry": "http://localhost:8010",
         "issues": issues,
+    }
+
+
+def frontend_error_log_path() -> Path:
+    return DATA_DIR / "frontend-errors.log"
+
+
+def diagnose_http_endpoint(
+    endpoint_id: str,
+    label: str,
+    url: str,
+    *,
+    timeout: int = 6,
+) -> dict[str, Any]:
+    payload = {
+        "id": endpoint_id,
+        "label": label,
+        "url": url,
+        "ok": False,
+        "statusCode": None,
+        "error": "",
+    }
+    try:
+        response = metadata_session().get(url, timeout=timeout)
+        payload["statusCode"] = response.status_code
+        payload["ok"] = response.ok
+    except Exception as exc:
+        payload["error"] = f"{exc.__class__.__name__}: {exc}"
+    return payload
+
+
+def build_search_diagnostics_payload(sample_query: str = "Coldplay Yellow") -> dict[str, Any]:
+    checks = [
+        diagnose_http_endpoint("youtube", "YouTube", "https://www.youtube.com"),
+        diagnose_http_endpoint("ytmusic", "YT Music", "https://music.youtube.com"),
+        diagnose_http_endpoint("lrclib", "LRCLIB", "https://lrclib.net/api/search?q=yellow"),
+    ]
+    started_ms = perf_counter_ms()
+    search_probe = {
+        "query": sample_query,
+        "ok": False,
+        "count": 0,
+        "provider": "",
+        "elapsedMs": 0,
+        "error": "",
+        "items": [],
+    }
+
+    try:
+        results = search_youtube_entries(sample_query, 3)
+        search_probe["count"] = len(results)
+        search_probe["ok"] = bool(results)
+        if results:
+            search_probe["provider"] = str(results[0].get("provider") or "")
+            search_probe["items"] = [
+                {
+                    "title": entry.get("title") or "",
+                    "artist": entry.get("uploader") or "",
+                    "provider": entry.get("provider") or "",
+                }
+                for entry in results[:3]
+            ]
+    except Exception as exc:
+        search_probe["error"] = f"{exc.__class__.__name__}: {exc}"
+    finally:
+        search_probe["elapsedMs"] = int(perf_counter_ms() - started_ms)
+
+    proxy_mode = metadata_proxy_mode()
+    proxy_available = env_proxy_available()
+    youtube_reachable = any(check["id"] in {"youtube", "ytmusic"} and check["ok"] for check in checks)
+    advice: list[str] = []
+
+    if search_probe["ok"]:
+        if proxy_mode == "direct" and not proxy_available:
+            advice.append("当前环境下搜索可直连使用，并不是硬性要求开启代理。")
+        else:
+            advice.append("当前环境下搜索链路可用，是否需要代理主要取决于用户本机网络。")
+    elif not youtube_reachable:
+        advice.append("当前环境下 YouTube / YT Music 不可达，搜索通常会失败；如果所在网络限制访问，需要可用代理或 VPN。")
+    else:
+        advice.append("基础站点可达，但搜索探针仍失败，优先检查系统代理、杀毒/防火墙拦截，或让用户升级到最新版本后重试。")
+
+    if proxy_mode == "system":
+        advice.append("当前应用正在跟随系统代理设置访问搜索源。")
+    elif proxy_mode == "custom":
+        advice.append("当前应用正在使用自定义代理地址访问搜索源。")
+    else:
+        advice.append("当前应用正在以直连方式访问搜索源。")
+
+    if not YOUTUBE_DATA_API_KEY:
+        advice.append("当前未配置 YouTube Data API Key，搜索主要依赖 YT Music / yt-dlp。")
+
+    return {
+        "checkedAt": utc_now_iso(),
+        "appVersion": APP_VERSION,
+        "appVersionLabel": APP_VERSION_LABEL,
+        "metadataProxyMode": proxy_mode,
+        "envProxyAvailable": proxy_available,
+        "searchProvider": NAS_SEARCH_PROVIDER,
+        "searchProviderOrder": search_provider_order(),
+        "youtubeDataApiEnabled": bool(YOUTUBE_DATA_API_KEY),
+        "checks": checks,
+        "searchProbe": search_probe,
+        "likelyNeedsProxy": not search_probe["ok"] and not youtube_reachable and proxy_mode == "direct" and not proxy_available,
+        "advice": advice,
     }
 
 
@@ -2951,6 +3063,11 @@ async def get_local_library():
 async def log_frontend_error(report: FrontendErrorReport):
     log_path = append_frontend_error_report(report)
     return {"ok": True, "path": str(log_path)}
+
+
+@app.get("/diagnostics/search-network")
+async def diagnostics_search_network():
+    return await run_in_threadpool(build_search_diagnostics_payload)
 
 
 @app.get("/recommendations", response_model=RecommendationsResponse)

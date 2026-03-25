@@ -60,7 +60,7 @@ const LIBRARY_ITEMS = [
 
 const PLAYLIST_ITEMS = [
   { id: 'downloads', label: '下载中心', icon: FolderDown },
-  { id: 'system', label: '系统检测', icon: ShieldCheck },
+  { id: 'system', label: '诊断中心', icon: ShieldCheck },
 ];
 
 const BRAND = {
@@ -339,6 +339,33 @@ const formatRelativeTime = (timestamp) => {
   return `${days} 天前`;
 };
 
+const formatAbsoluteTime = (timestamp) => {
+  if (!timestamp) return '未记录';
+  const value = new Date(timestamp);
+  if (Number.isNaN(value.getTime())) return '未记录';
+  return value.toLocaleString('zh-CN', { hour12: false });
+};
+
+const formatProxyMode = (value) => {
+  const mapping = {
+    auto: '自动',
+    system: '系统代理',
+    custom: '自定义代理',
+    direct: '直连',
+  };
+  return mapping[value] || value || '未知';
+};
+
+const formatSearchProviderLabel = (value) => {
+  const mapping = {
+    auto: '自动',
+    ytmusicapi: 'YT Music',
+    legacy_ytdlp: 'yt-dlp',
+    youtube_data_api: 'YouTube Data API',
+  };
+  return mapping[value] || value || '未知';
+};
+
 const normalizeDownloadHistoryItem = (item) => ({
   key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
   title: item?.title || '',
@@ -505,6 +532,8 @@ function App() {
   const [backendStatus, setBackendStatus] = useState('checking');
   const [systemCheck, setSystemCheck] = useState(null);
   const [appSettings, setAppSettings] = useState(null);
+  const [searchDiagnostics, setSearchDiagnostics] = useState(null);
+  const [searchDiagnosticsLoading, setSearchDiagnosticsLoading] = useState(false);
   const [localLibrary, setLocalLibrary] = useState(() => normalizeLocalLibraryPayload({}));
   const [localLibraryLoading, setLocalLibraryLoading] = useState(false);
   const [notice, setNotice] = useState('');
@@ -527,6 +556,7 @@ function App() {
   const lastHandledActionIdRef = useRef('');
   const libraryMigrationRef = useRef(readBooleanStorage(LIBRARY_MIGRATION_KEY));
   const librarySyncInFlightRef = useRef(false);
+  const searchDiagnosticsBootstrappedRef = useRef(false);
   const downloadRunnerRef = useRef(false);
   const downloadAbortControllersRef = useRef(new Map());
   const [isPlaying, setIsPlaying] = useState(false);
@@ -671,6 +701,21 @@ function App() {
       void refreshLocalLibrary();
     } catch (error) {
       setNoticeText(error instanceof Error ? error.message : '更新下载目录失败');
+    }
+  };
+
+  const runSearchDiagnostics = async ({ silent = false } = {}) => {
+    setSearchDiagnosticsLoading(true);
+    try {
+      const data = await apiRequest('/diagnostics/search-network', { cache: 'no-store' });
+      setSearchDiagnostics(data);
+    } catch (error) {
+      setSearchDiagnostics(null);
+      if (!silent) {
+        setNoticeText(error instanceof Error ? error.message : '运行诊断失败');
+      }
+    } finally {
+      setSearchDiagnosticsLoading(false);
     }
   };
 
@@ -1193,7 +1238,26 @@ function App() {
       setBackendStatus('offline');
       setSystemCheck(null);
       setAppSettings(null);
+      setSearchDiagnostics(null);
     }
+  };
+
+  const toggleVibeMode = (nextValue) => {
+    if (typeof nextValue === 'boolean') {
+      if (nextValue && !track) {
+        setVibeModeEnabled(false);
+        setNoticeText('请先播放一首歌，再进入氛围模式');
+        return;
+      }
+      setVibeModeEnabled(nextValue);
+      return;
+    }
+    if (!track) {
+      setVibeModeEnabled(false);
+      setNoticeText('请先播放一首歌，再进入氛围模式');
+      return;
+    }
+    setVibeModeEnabled((prev) => !prev);
   };
 
   useEffect(() => {
@@ -1203,14 +1267,75 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (activePage !== 'system' || backendStatus !== 'online' || searchDiagnosticsLoading || searchDiagnosticsBootstrappedRef.current) return undefined;
+    searchDiagnosticsBootstrappedRef.current = true;
+    void runSearchDiagnostics({ silent: true });
+    return undefined;
+  }, [activePage, backendStatus, searchDiagnosticsLoading]);
+
+  useEffect(() => {
     window.__NAS_BOOT__?.markMounted?.();
   }, []);
+
+  useEffect(() => {
+    const reportFrontendError = (payload) => {
+      fetch(apiUrl('/diagnostics/frontend-error'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...payload,
+          url: window.location.href,
+          userAgent: navigator.userAgent,
+          timestamp: new Date().toISOString(),
+          meta: {
+            ...(payload.meta || {}),
+            isMiniMode,
+          },
+        }),
+      }).catch(() => {});
+    };
+
+    const handleError = (event) => {
+      reportFrontendError({
+        eventType: 'window-error',
+        message: event.message || 'Unhandled window error',
+        stack: event.error?.stack || '',
+        meta: {
+          filename: event.filename || '',
+          lineno: event.lineno || 0,
+          colno: event.colno || 0,
+        },
+      });
+    };
+
+    const handleUnhandledRejection = (event) => {
+      const reason = event.reason;
+      reportFrontendError({
+        eventType: 'unhandledrejection',
+        message: reason?.message || String(reason || 'Unhandled promise rejection'),
+        stack: reason?.stack || '',
+      });
+    };
+
+    window.addEventListener('error', handleError);
+    window.addEventListener('unhandledrejection', handleUnhandledRejection);
+    return () => {
+      window.removeEventListener('error', handleError);
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+    };
+  }, [isMiniMode]);
 
   useEffect(() => {
     if (activePage !== 'downloads') return undefined;
     void refreshLocalLibrary();
     return undefined;
   }, [activePage, currentDownloadDirectory]);
+
+  useEffect(() => {
+    if (track || !vibeModeEnabled) return undefined;
+    setVibeModeEnabled(false);
+    return undefined;
+  }, [track, vibeModeEnabled]);
 
   useEffect(() => {
     if (downloadRunnerRef.current) return undefined;
@@ -1237,10 +1362,11 @@ function App() {
       setQueryArtist('');
     }
     setSearchRan(true);
+    setActivePage('search');
 
     if (searchCache.has(q)) {
+      setSearching(false);
       setSearchResults(searchCache.get(q));
-      setActivePage('search');
       rememberRecentSearch(q);
       void apiRequest('/library/searches', {
         method: 'POST',
@@ -1251,6 +1377,7 @@ function App() {
       return;
     }
 
+    setSearchResults([]);
     setSearching(true);
     try {
       const data = await apiRequest('/search', {
@@ -1260,7 +1387,6 @@ function App() {
       const results = Array.isArray(data.results) ? data.results : [];
       setSearchResults(results);
       searchCache.set(q, results);
-      setActivePage('search');
       rememberRecentSearch(q);
       void apiRequest('/library/searches', {
         method: 'POST',
@@ -1522,7 +1648,7 @@ function App() {
       return;
     }
     if (type === 'toggle-vibe') {
-      setVibeModeEnabled((prev) => !prev);
+      toggleVibeMode();
       return;
     }
     if (type === 'volume-up') {
@@ -2326,44 +2452,187 @@ function App() {
           )}
 
           {activePage === 'system' && (
-            <div className="max-w-3xl">
-              <h2 className="section-title">系统状态</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="max-w-5xl animate-slide-up">
+              <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="section-title">诊断中心</h2>
+                  <p className="text-sm text-white/45 mt-2">
+                    这里会把运行状态、搜索链路和排查建议直接展示给用户，便于反馈问题时快速定位。
+                  </p>
+                </div>
+                <button
+                  className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-4 py-2 text-sm text-white/80 hover:bg-white/10 transition-colors disabled:opacity-60"
+                  onClick={() => {
+                    void checkBackend();
+                    void runSearchDiagnostics();
+                  }}
+                  disabled={searchDiagnosticsLoading}
+                >
+                  <RefreshCw size={15} className={searchDiagnosticsLoading ? 'animate-spin' : ''} />
+                  刷新诊断
+                </button>
+              </div>
+
+              <div className="mt-6 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
                 {[
-                  { label: '后端核心', status: backendStatus === 'online', val: backendStatus },
-                  { label: '应用版本', status: true, val: systemCheck?.appVersion || '1.2.4' },
+                  { label: '后端核心', status: backendStatus === 'online', val: backendStatus === 'online' ? '在线' : '离线' },
+                  { label: '应用版本', status: true, val: `v${systemCheck?.appVersionLabel || '1.60'}` },
                   { label: '运行模式', status: true, val: systemCheck?.runtimeMode === 'packaged' ? '桌面安装版' : '源码模式' },
-                  { label: 'ffmpeg', status: !!systemCheck?.ffmpegAvailable, val: systemCheck?.ffmpegAvailable ? '已启用' : '未检测到' },
+                  { label: '搜索代理', status: true, val: formatProxyMode(systemCheck?.metadataProxyMode) },
+                  { label: '系统代理', status: !!systemCheck?.envProxyAvailable, val: systemCheck?.envProxyAvailable ? '已检测到' : '未检测到' },
+                  { label: '搜索来源', status: true, val: (systemCheck?.searchProviderOrder || []).map(formatSearchProviderLabel).join(' -> ') || formatSearchProviderLabel(systemCheck?.searchProvider) },
                   { label: '本地数据库', status: !!systemCheck?.libraryDbAvailable, val: systemCheck?.libraryDbAvailable ? 'SQLite 已连接' : '未初始化' },
                   { label: '前端构建', status: !!systemCheck?.frontendBuilt, val: systemCheck?.frontendBuilt ? '生产模式' : '开发模式' },
-                  { label: 'Python', status: true, val: systemCheck?.pythonVersion },
-                  { label: 'yt-dlp', status: true, val: systemCheck?.ytDlpVersion },
+                  { label: 'ffmpeg', status: !!systemCheck?.ffmpegAvailable, val: systemCheck?.ffmpegAvailable ? '已启用' : '未检测到' },
+                  { label: 'yt-dlp', status: true, val: systemCheck?.ytDlpVersion || '未检测' },
                   { label: '收藏 / 历史', status: true, val: `${systemCheck?.libraryStats?.favorites ?? favorites.length} / ${systemCheck?.libraryStats?.history ?? historyItems.length}` },
-                  { label: '下载记录', status: true, val: `${systemCheck?.libraryStats?.downloads ?? downloadHistory.length} 条` },
-                  { label: '歌词偏移', status: true, val: `${systemCheck?.libraryStats?.lyricsOffsets ?? 0} 条` },
+                  { label: '下载 / 歌词偏移', status: true, val: `${systemCheck?.libraryStats?.downloads ?? downloadHistory.length} / ${systemCheck?.libraryStats?.lyricsOffsets ?? 0}` },
                 ].map((stat, i) => (
-                  <div key={i} className="bg-white/5 border border-white/10 p-4 rounded-xl flex justify-between items-center">
+                  <div key={i} className="bg-white/5 border border-white/10 p-4 rounded-2xl flex flex-col gap-3">
                     <span className="text-sm font-medium text-slate-400">{stat.label}</span>
-                    <span className={`text-xs font-bold px-3 py-1 rounded-full ${stat.status ? 'bg-cyan-500/10 text-cyan-400' : 'bg-slate-500/10 text-slate-400'}`}>
+                    <span className={`text-sm font-bold px-3 py-2 rounded-xl w-fit ${stat.status ? 'bg-cyan-500/10 text-cyan-300' : 'bg-slate-500/10 text-slate-400'}`}>
                       {stat.val}
                     </span>
                   </div>
                 ))}
               </div>
-              <div className="mt-8 p-6 bg-white/5 border border-white/10 rounded-2xl">
-                <h4 className="flex items-center gap-2 mb-2 text-slate-200"><Info size={18} /> 关于项目</h4>
-                <p className="text-sm text-slate-400 leading-relaxed">
-                  NAS Local 是一个面向个人桌面的本地音乐终端，整合了 yt-dlp、FastAPI 与沉浸式歌词视图。
-                  现在的界面与品牌元素已经统一为 NAS，更适合继续向个人音乐工作台方向扩展。
-                </p>
+
+              {Array.isArray(systemCheck?.issues) && systemCheck.issues.length > 0 && (
+                <div className="mt-6 rounded-2xl border border-amber-400/20 bg-amber-500/8 p-5">
+                  <div className="flex items-center gap-2 text-amber-100 font-semibold mb-3">
+                    <AlertTriangle size={18} />
+                    当前环境提醒
+                  </div>
+                  <div className="flex flex-col gap-2 text-sm text-amber-50/90">
+                    {systemCheck.issues.map((issue, index) => (
+                      <p key={`${issue}-${index}`}>{issue}</p>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-6 p-6 bg-white/5 border border-white/10 rounded-3xl">
+                <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <h4 className="flex items-center gap-2 text-slate-100"><ShieldCheck size={18} /> 搜索 / 网络诊断</h4>
+                    <p className="text-sm text-slate-400 mt-2">
+                      用来判断“搜不到歌”到底是版本问题、网络问题，还是代理没有生效。
+                    </p>
+                  </div>
+                  <div className="text-xs text-white/35">
+                    上次检查：{searchDiagnostics?.checkedAt ? formatAbsoluteTime(searchDiagnostics.checkedAt) : '未运行'}
+                  </div>
+                </div>
+
+                {searchDiagnostics ? (
+                  <>
+                    <div className="mt-5 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                      <div className="rounded-2xl border border-white/8 bg-black/20 p-4">
+                        <div className="text-xs uppercase tracking-[0.18em] text-white/35">代理模式</div>
+                        <div className="mt-2 text-lg font-semibold text-white">{formatProxyMode(searchDiagnostics.metadataProxyMode)}</div>
+                      </div>
+                      <div className="rounded-2xl border border-white/8 bg-black/20 p-4">
+                        <div className="text-xs uppercase tracking-[0.18em] text-white/35">系统代理</div>
+                        <div className="mt-2 text-lg font-semibold text-white">{searchDiagnostics.envProxyAvailable ? '已检测到' : '未检测到'}</div>
+                      </div>
+                      <div className="rounded-2xl border border-white/8 bg-black/20 p-4">
+                        <div className="text-xs uppercase tracking-[0.18em] text-white/35">示例搜索</div>
+                        <div className="mt-2 text-lg font-semibold text-white">{searchDiagnostics.searchProbe?.ok ? '可用' : '失败'}</div>
+                      </div>
+                      <div className="rounded-2xl border border-white/8 bg-black/20 p-4">
+                        <div className="text-xs uppercase tracking-[0.18em] text-white/35">搜索来源</div>
+                        <div className="mt-2 text-lg font-semibold text-white">
+                          {formatSearchProviderLabel(searchDiagnostics.searchProbe?.provider || searchDiagnostics.searchProvider)}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {(searchDiagnostics.checks || []).map((check) => (
+                        <div key={check.id} className="rounded-2xl border border-white/8 bg-black/20 p-4">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="text-sm font-semibold text-white">{check.label}</div>
+                              <div className="text-xs text-white/35 mt-1 break-all">{check.url}</div>
+                            </div>
+                            <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${check.ok ? 'bg-cyan-500/10 text-cyan-300' : 'bg-rose-500/10 text-rose-200'}`}>
+                              {check.ok ? `可达 ${check.statusCode || ''}`.trim() : '失败'}
+                            </span>
+                          </div>
+                          {!check.ok && (
+                            <div className="mt-3 text-sm text-rose-200/90 break-all">
+                              {check.error || '请求未成功返回。'}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="mt-5 rounded-2xl border border-white/8 bg-black/20 p-5">
+                      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                        <div>
+                          <div className="text-xs uppercase tracking-[0.18em] text-white/35">示例搜索探针</div>
+                          <div className="mt-1 text-lg font-semibold text-white">{searchDiagnostics.searchProbe?.query || '未提供'}</div>
+                        </div>
+                        <span className={`rounded-full px-3 py-1 text-xs font-semibold ${searchDiagnostics.searchProbe?.ok ? 'bg-cyan-500/10 text-cyan-300' : 'bg-rose-500/10 text-rose-200'}`}>
+                          {searchDiagnostics.searchProbe?.ok ? `成功 · ${searchDiagnostics.searchProbe?.elapsedMs || 0} ms` : `失败 · ${searchDiagnostics.searchProbe?.elapsedMs || 0} ms`}
+                        </span>
+                      </div>
+
+                      {Array.isArray(searchDiagnostics.searchProbe?.items) && searchDiagnostics.searchProbe.items.length > 0 ? (
+                        <div className="mt-4 flex flex-col gap-3">
+                          {searchDiagnostics.searchProbe.items.map((item, index) => (
+                            <div key={`${item.title}-${item.artist}-${index}`} className="rounded-xl border border-white/8 bg-white/5 px-4 py-3 flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="text-sm font-semibold text-white truncate">{item.title}</div>
+                                <div className="text-xs text-white/40 truncate">{item.artist || '未知歌手'}</div>
+                              </div>
+                              <span className="shrink-0 text-xs text-cyan-300">{formatSearchProviderLabel(item.provider)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="mt-4 text-sm text-white/45">
+                          {searchDiagnostics.searchProbe?.error || '本次探针没有返回结果。'}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="mt-5 rounded-2xl border border-white/8 bg-black/20 p-5">
+                      <div className="text-xs uppercase tracking-[0.18em] text-white/35 mb-3">诊断结论</div>
+                      <div className="flex flex-col gap-2 text-sm text-slate-300">
+                        {(searchDiagnostics.advice || []).map((item, index) => (
+                          <p key={`${item}-${index}`}>{item}</p>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="mt-5 rounded-2xl border border-white/8 bg-black/20 p-5 text-sm text-white/45">
+                    点击“刷新诊断”后，会立刻测试 YouTube / YT Music 是否可达，并跑一次真实搜索探针。
+                  </div>
+                )}
               </div>
-              <div className="mt-6 p-6 bg-white/5 border border-white/10 rounded-2xl">
-                <h4 className="flex items-center gap-2 mb-3 text-slate-200"><ShieldCheck size={18} /> 桌面控制</h4>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm text-slate-400">
-                  <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">托盘菜单：`显示 NAS` / `隐藏 NAS` / `沉浸式全屏`</div>
-                  <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">启动即全屏：`start-desktop.bat --fullscreen`</div>
-                  <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`Ctrl + Alt + M`：切换迷你播放器</div>
-                  <div className="rounded-xl border border-amber-400/20 bg-amber-500/8 px-4 py-3 text-amber-100">为避免键盘输入卡顿，桌面端已停用本轮新增的全屏与隐藏热键。</div>
+
+              <div className="mt-6 grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <div className="p-6 bg-white/5 border border-white/10 rounded-3xl">
+                  <h4 className="flex items-center gap-2 mb-3 text-slate-200"><Info size={18} /> 更新与日志</h4>
+                  <div className="flex flex-col gap-3 text-sm text-slate-400 leading-relaxed">
+                    <p>当前对外版本号显示为 `v{systemCheck?.appVersionLabel || '1.60'}`，内部构建版本仍保持 `{systemCheck?.appVersion || '1.6.0'}` 以兼容现有更新链路。</p>
+                    <p>桌面端从这一版开始，托盘点击“检查更新”后，若发现新版本会自动下载并拉起安装包。</p>
+                    <p>前端错误日志：{systemCheck?.frontendErrorLogExists ? '已启用' : '暂未生成'}。</p>
+                    <p className="break-all text-white/35">{systemCheck?.frontendErrorLog || '日志路径暂不可用'}</p>
+                  </div>
+                </div>
+
+                <div className="p-6 bg-white/5 border border-white/10 rounded-3xl">
+                  <h4 className="flex items-center gap-2 mb-3 text-slate-200"><ShieldCheck size={18} /> 桌面控制</h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm text-slate-400">
+                    <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">托盘菜单：`显示 NAS` / `隐藏 NAS` / `沉浸式全屏`</div>
+                    <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">启动即全屏：`start-desktop.bat --fullscreen`</div>
+                    <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`Ctrl + Alt + M`：切换迷你播放器</div>
+                    <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">如果朋友反馈无法搜索，先进入这里看网络诊断，再决定是否需要代理。</div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2526,7 +2795,8 @@ function App() {
             <button
               className={`ml-4 transition-all duration-300 flex items-center justify-center w-10 h-10 rounded-full border border-white/10 ${vibeModeEnabled ? 'bg-white/10 border-white/30 shadow-[0_0_15px_rgba(255,255,255,0.1)]' : 'bg-transparent hover:bg-white/5'}`}
               title="Toggle Vibe Mode"
-              onClick={() => setVibeModeEnabled(!vibeModeEnabled)}
+              onClick={() => toggleVibeMode()}
+              disabled={!track}
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -2604,7 +2874,7 @@ function App() {
         }}
       />
 
-      {vibeModeEnabled && (
+      {vibeModeEnabled && track && (
         <VibeOverlay
           track={track}
           audioRef={audioRef}

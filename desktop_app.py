@@ -17,7 +17,7 @@ import requests
 import webview
 from pystray import Icon, Menu, MenuItem
 
-from app_meta import APP_BRAND_NAME, APP_ID, APP_VERSION, BACKEND_URL, GITHUB_RELEASES_URL
+from app_meta import APP_BRAND_NAME, APP_ID, APP_VERSION, APP_VERSION_LABEL, BACKEND_URL, GITHUB_RELEASES_URL
 from app_paths import (
     DESKTOP_ENTRYPOINT,
     FRONTEND_INDEX,
@@ -355,7 +355,7 @@ class DesktopApp:
             return "更新：检查失败"
         if self.available_release and is_newer_version(self.available_release.version, APP_VERSION):
             return f"发现新版本：v{self.available_release.version}"
-        return f"更新：当前版本 v{APP_VERSION}"
+        return f"更新：当前版本 v{APP_VERSION_LABEL}"
 
     def download_update_label(self, _item=None) -> str:
         if self.update_download_in_progress:
@@ -386,6 +386,8 @@ class DesktopApp:
             release = fetch_latest_release()
             if release and is_newer_version(release.version, APP_VERSION):
                 self.available_release = release
+                if not background:
+                    self.download_latest_update()
             else:
                 self.available_release = None
         except Exception as exc:
