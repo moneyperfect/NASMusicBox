@@ -35,6 +35,7 @@ const lyricsCache = new Map();
 
 const getLyricsSourceLabel = (source) => {
     if (source === 'lrclib') return 'LRCLIB';
+    if (source === 'qqmusic') return 'QQ 音乐歌词';
     if (source === 'ytmusicapi') return 'YT Music 歌词';
     if (source === 'youtube_subtitles') return 'YouTube 字幕';
     if (source === 'youtube_auto_captions') return 'YouTube 自动字幕';
@@ -109,7 +110,7 @@ export default function VibeOverlay({
         if (lyricsViewportRef.current) {
             lyricsViewportRef.current.scrollTop = 0;
         }
-    }, [track?.key, track?.videoId, track?.query]);
+    }, [track?.key, track?.videoId, track?.source, track?.sourceId, track?.query]);
 
     useEffect(() => () => {
         if (noticeTimerRef.current) {
@@ -198,6 +199,8 @@ export default function VibeOverlay({
             track_name: track.title || '',
             artist_name: track.artist || '',
             video_id: track.videoId || '',
+            source: track.source || '',
+            source_id: track.sourceId || '',
             track_key: track.key || '',
         });
 
@@ -251,7 +254,7 @@ export default function VibeOverlay({
             });
 
         return () => { active = false; };
-    }, [track?.key, track?.videoId, track?.query, audioDuration, apiUrl]);
+    }, [track?.key, track?.videoId, track?.source, track?.sourceId, track?.query, audioDuration, apiUrl]);
 
     useEffect(() => {
         const cacheKey = track?.key || track?.videoId || track?.title || '';
@@ -269,6 +272,8 @@ export default function VibeOverlay({
                 body: JSON.stringify({
                     trackKey: track?.key || cacheKey,
                     videoId: track?.videoId || null,
+                    source: track?.source || null,
+                    sourceId: track?.sourceId || null,
                     title: track?.title || '',
                     artist: track?.artist || '',
                     offsetSeconds: Number(timeOffset.toFixed(2)),
@@ -286,7 +291,7 @@ export default function VibeOverlay({
         }, 450);
 
         return () => window.clearTimeout(timer);
-    }, [timeOffset, track?.key, track?.videoId, track?.title, track?.artist, apiUrl, lyricsSource]);
+    }, [timeOffset, track?.key, track?.videoId, track?.source, track?.sourceId, track?.title, track?.artist, apiUrl, lyricsSource]);
 
     useEffect(() => {
         if (lyrics.length <= 1) return;

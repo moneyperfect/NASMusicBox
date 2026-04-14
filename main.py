@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from pathlib import Path
 from urllib.parse import quote
+import base64
 import os
 import platform
 import shutil
@@ -50,6 +51,14 @@ from app_paths import (
 
 app = FastAPI(title=APP_BRAND_NAME, description=f"{APP_BRAND_NAME} local music visualize and stream API")
 
+
+class QQMusicResolveError(RuntimeError):
+    def __init__(self, reason: str, detail: str = "", attempts: Optional[list[dict[str, Any]]] = None):
+        self.reason = reason or QQMUSIC_FAILURE_UNKNOWN
+        self.detail = detail or self.reason
+        self.attempts = attempts or []
+        super().__init__(self.detail)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -77,17 +86,21 @@ STATIC_ASSET_PREFIXES = (
 class SearchRequest(BaseModel):
     query: str
     limit: int = 8
+    source: Optional[str] = None
 
 
 class SearchItem(BaseModel):
     title: str
     artist: str
     cover: str
-    videoId: str
+    videoId: str = ""
     query: str
     duration: Optional[int] = None
     durationText: Optional[str] = None
     provider: Optional[str] = None
+    source: Optional[str] = None
+    sourceId: Optional[str] = None
+    trackKey: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -98,6 +111,10 @@ class SearchResponse(BaseModel):
 class VisualizeRequest(BaseModel):
     query: Optional[str] = None
     videoId: Optional[str] = None
+    source: Optional[str] = None
+    sourceId: Optional[str] = None
+    trackKey: Optional[str] = None
+    sourceMode: Optional[str] = None
 
 
 class VisualizeResponse(BaseModel):
@@ -113,6 +130,11 @@ class VisualizeResponse(BaseModel):
     query: Optional[str] = None
     provider: Optional[str] = None
     streamMode: Optional[str] = None
+    source: Optional[str] = None
+    sourceId: Optional[str] = None
+    trackKey: Optional[str] = None
+    fallbackReason: Optional[str] = None
+    fallbackTrace: Optional[list[dict[str, Any]]] = None
 
 
 class LibraryTrack(BaseModel):
@@ -122,6 +144,8 @@ class LibraryTrack(BaseModel):
     cover: str = ""
     query: str = ""
     videoId: Optional[str] = None
+    source: Optional[str] = None
+    sourceId: Optional[str] = None
     savedAt: Optional[str] = None
     playedAt: Optional[str] = None
 
@@ -141,6 +165,8 @@ class DownloadHistoryEntry(BaseModel):
     cover: str = ""
     query: str = ""
     videoId: Optional[str] = None
+    source: Optional[str] = None
+    sourceId: Optional[str] = None
     downloadedAt: Optional[str] = None
 
 
@@ -168,6 +194,8 @@ class RecommendationsResponse(BaseModel):
 class LyricsOffsetEntry(BaseModel):
     trackKey: str
     videoId: Optional[str] = None
+    source: Optional[str] = None
+    sourceId: Optional[str] = None
     title: str = ""
     artist: str = ""
     offsetSeconds: float = 0
@@ -216,6 +244,8 @@ class LocalLibraryItem(BaseModel):
     sourceUrl: str = ""
     query: str = ""
     videoId: Optional[str] = None
+    source: Optional[str] = None
+    sourceId: Optional[str] = None
     downloadedAt: Optional[str] = None
     fileSize: int = 0
     offlineUrl: str
@@ -329,6 +359,7 @@ LIBRARY_MIGRATION_DONE = False
 
 YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_DATA_API_KEY", "").strip()
 NAS_SEARCH_PROVIDER = os.getenv("NAS_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
+NAS_ENABLE_YOUTUBE_FALLBACK = os.getenv("NAS_ENABLE_YOUTUBE_FALLBACK", "true").strip().lower() not in {"0", "false", "no", "off"}
 NAS_METADATA_PROXY_MODE = os.getenv("NAS_METADATA_PROXY_MODE", "auto").strip().lower() or "auto"
 NAS_MEDIA_TRANSPORT = os.getenv("NAS_MEDIA_TRANSPORT", "auto").strip().lower() or "auto"
 NAS_CUSTOM_PROXY_URL = os.getenv("NAS_CUSTOM_PROXY_URL", "").strip()
@@ -339,6 +370,27 @@ DEFAULT_HTTP_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+SOURCE_QQMUSIC = "qqmusic"
+SOURCE_YOUTUBE = "youtube"
+SOURCE_LOCAL = "local"
+QQMUSIC_FAILURE_EMPTY_PURL = "empty_purl"
+QQMUSIC_FAILURE_PREVIEW_ONLY = "preview_only"
+QQMUSIC_FAILURE_VIP_REQUIRED = "vip_required"
+QQMUSIC_FAILURE_COPYRIGHT_RESTRICTED = "copyright_restricted"
+QQMUSIC_FAILURE_HTTP_403 = "http_403"
+QQMUSIC_FAILURE_STALE_VKEY = "stale_vkey"
+QQMUSIC_FAILURE_NETWORK = "network_error"
+QQMUSIC_FAILURE_TRACK_DETAIL = "missing_track_detail"
+QQMUSIC_FAILURE_UNKNOWN = "unknown"
+QQMUSIC_MUSICU_URL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+QQMUSIC_AUDIO_FALLBACK_DOMAIN = "https://isure.stream.qqmusic.qq.com/"
+QQMUSIC_COVER_URL = "https://y.gtimg.cn/music/photo_new/T002R500x500M000{album_mid}.jpg"
+QQMUSIC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+YOUTUBE_SEARCH_PROVIDERS = {"youtube", "youtube_data_api", "ytmusicapi", "legacy_ytdlp"}
 SUPPORTED_YTMUSIC_LANGUAGES = {
     "ar",
     "cs",
@@ -479,6 +531,35 @@ def request_text(url: str, *, timeout: int = 12, kind: str = "metadata") -> str:
     return response.text
 
 
+def request_qqmusic_api(request_item: dict[str, Any], *, timeout: int = 12) -> dict[str, Any]:
+    payload = {
+        "comm": {
+            "ct": 24,
+            "cv": 0,
+            "format": "json",
+            "inCharset": "utf-8",
+            "outCharset": "utf-8",
+        },
+        "req_0": request_item,
+    }
+    response = get_http_session("qqmusic", "direct").post(
+        QQMUSIC_MUSICU_URL,
+        json=payload,
+        headers={
+            "User-Agent": QQMUSIC_USER_AGENT,
+            "Referer": "https://y.qq.com/",
+            "Origin": "https://y.qq.com",
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    data = response.json()
+    item = data.get("req_0") or {}
+    if item.get("code") not in (None, 0):
+        raise requests.RequestException(f"QQ Music API error: {item.get('code')}")
+    return item.get("data") or {}
+
+
 def request_media_response(url: str, *, headers: Optional[dict[str, str]] = None, timeout: int = 25, stream: bool = True) -> tuple[requests.Response, str]:
     last_error: Exception | None = None
     for mode in media_attempt_modes():
@@ -568,6 +649,8 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                 cover TEXT NOT NULL DEFAULT '',
                 query TEXT NOT NULL DEFAULT '',
                 video_id TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
                 saved_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS play_history (
@@ -577,6 +660,8 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                 cover TEXT NOT NULL DEFAULT '',
                 query TEXT NOT NULL DEFAULT '',
                 video_id TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
                 played_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS search_history (
@@ -594,11 +679,15 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                 cover TEXT NOT NULL DEFAULT '',
                 query TEXT NOT NULL DEFAULT '',
                 video_id TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
                 downloaded_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS lyrics_offsets (
                 track_key TEXT PRIMARY KEY,
                 video_id TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL DEFAULT '',
                 artist TEXT NOT NULL DEFAULT '',
                 offset_seconds REAL NOT NULL DEFAULT 0,
@@ -611,6 +700,9 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
             );
             """
         )
+        for table_name in ("favorites", "play_history", "download_history", "lyrics_offsets"):
+            ensure_column_exists(target_connection, table_name, "source", "TEXT NOT NULL DEFAULT ''")
+            ensure_column_exists(target_connection, table_name, "source_id", "TEXT NOT NULL DEFAULT ''")
 
         for table_name, key_column, timestamp_column, bucket_name, defaults in [
             (
@@ -618,14 +710,14 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                 "track_key",
                 "saved_at",
                 "favorites",
-                {"track_key": "", "title": "", "artist": "", "cover": "", "query": "", "video_id": None, "saved_at": ""},
+                {"track_key": "", "title": "", "artist": "", "cover": "", "query": "", "video_id": None, "source": "", "source_id": "", "saved_at": ""},
             ),
             (
                 "play_history",
                 "track_key",
                 "played_at",
                 "history",
-                {"track_key": "", "title": "", "artist": "", "cover": "", "query": "", "video_id": None, "played_at": ""},
+                {"track_key": "", "title": "", "artist": "", "cover": "", "query": "", "video_id": None, "source": "", "source_id": "", "played_at": ""},
             ),
             (
                 "search_history",
@@ -639,7 +731,7 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                 "track_key",
                 "updated_at",
                 "lyricsOffsets",
-                {"track_key": "", "video_id": None, "title": "", "artist": "", "offset_seconds": 0.0, "updated_at": ""},
+                {"track_key": "", "video_id": None, "source": "", "source_id": "", "title": "", "artist": "", "offset_seconds": 0.0, "updated_at": ""},
             ),
         ]:
             source_rows = read_sqlite_rows(source_connection, table_name, defaults)
@@ -687,6 +779,8 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                 "cover": "",
                 "query": "",
                 "video_id": None,
+                "source": "",
+                "source_id": "",
                 "downloaded_at": "",
             },
         )
@@ -711,6 +805,8 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                         "cover": "",
                         "query": "",
                         "video_id": None,
+                        "source": "",
+                        "source_id": "",
                         "downloaded_at": "",
                     },
                 )
@@ -727,9 +823,9 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                 target_connection.execute(
                     """
                     INSERT INTO download_history (
-                        track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, downloaded_at
+                        track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, source, source_id, downloaded_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["track_key"],
@@ -741,6 +837,8 @@ def merge_library_databases(source_db: Path, target_db: Path) -> dict[str, int]:
                         row["cover"],
                         row["query"],
                         row["video_id"],
+                        row["source"],
+                        row["source_id"],
                         row["downloaded_at"],
                     ),
                 )
@@ -1044,6 +1142,8 @@ def init_library_db() -> None:
                 cover TEXT NOT NULL DEFAULT '',
                 query TEXT NOT NULL DEFAULT '',
                 video_id TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
                 saved_at TEXT NOT NULL
             );
 
@@ -1054,6 +1154,8 @@ def init_library_db() -> None:
                 cover TEXT NOT NULL DEFAULT '',
                 query TEXT NOT NULL DEFAULT '',
                 video_id TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
                 played_at TEXT NOT NULL
             );
 
@@ -1073,12 +1175,16 @@ def init_library_db() -> None:
                 cover TEXT NOT NULL DEFAULT '',
                 query TEXT NOT NULL DEFAULT '',
                 video_id TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
                 downloaded_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS lyrics_offsets (
                 track_key TEXT PRIMARY KEY,
                 video_id TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL DEFAULT '',
                 artist TEXT NOT NULL DEFAULT '',
                 offset_seconds REAL NOT NULL DEFAULT 0,
@@ -1108,16 +1214,23 @@ def init_library_db() -> None:
         ensure_column_exists(connection, "download_history", "cover", "TEXT NOT NULL DEFAULT ''")
         ensure_column_exists(connection, "download_history", "query", "TEXT NOT NULL DEFAULT ''")
         ensure_column_exists(connection, "download_history", "video_id", "TEXT")
+        for table_name in ("favorites", "play_history", "download_history", "lyrics_offsets"):
+            ensure_column_exists(connection, table_name, "source", "TEXT NOT NULL DEFAULT ''")
+            ensure_column_exists(connection, table_name, "source_id", "TEXT NOT NULL DEFAULT ''")
 
 
 def library_track_from_row(row: sqlite3.Row, timestamp_field: str) -> dict:
+    source, source_id = legacy_source_fields(row["source"], row["source_id"], row["video_id"])
+    key = stable_track_key(row["track_key"], source, source_id, row["video_id"], row["title"], row["artist"])
     return {
-        "key": row["track_key"],
+        "key": key,
         "title": row["title"],
         "artist": row["artist"],
         "cover": row["cover"],
         "query": row["query"],
         "videoId": row["video_id"],
+        "source": source or None,
+        "sourceId": source_id or None,
         "savedAt": row["saved_at"] if timestamp_field == "saved_at" else None,
         "playedAt": row["played_at"] if timestamp_field == "played_at" else None,
     }
@@ -1127,14 +1240,24 @@ def fetch_library_tracks(table_name: str, timestamp_field: str, limit: int) -> l
     with get_db_connection() as connection:
         rows = connection.execute(
             f"""
-            SELECT track_key, title, artist, cover, query, video_id, {timestamp_field}
+            SELECT track_key, title, artist, cover, query, video_id, source, source_id, {timestamp_field}
             FROM {table_name}
             ORDER BY {timestamp_field} DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-    return [library_track_from_row(row, timestamp_field) for row in rows]
+    items = [library_track_from_row(row, timestamp_field) for row in rows]
+    deduped: list[dict] = []
+    seen_keys: set[str] = set()
+    for item in items:
+        key = item.get("key") or ""
+        if key and key in seen_keys:
+            continue
+        if key:
+            seen_keys.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def fetch_recent_searches(limit: int = 12) -> list[dict]:
@@ -1155,16 +1278,18 @@ def fetch_recent_downloads(limit: int = 12) -> list[dict]:
     with get_db_connection() as connection:
         rows = connection.execute(
             """
-            SELECT track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, downloaded_at
+            SELECT track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, source, source_id, downloaded_at
             FROM download_history
             ORDER BY downloaded_at DESC, id DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-    return [
-        {
-            "key": row["track_key"],
+    items = []
+    for row in rows:
+        source, source_id = legacy_source_fields(row["source"], row["source_id"], row["video_id"])
+        items.append({
+            "key": stable_track_key(row["track_key"], source, source_id, row["video_id"], row["title"], row["artist"]),
             "title": row["title"],
             "artist": row["artist"],
             "filename": row["filename"],
@@ -1173,17 +1298,18 @@ def fetch_recent_downloads(limit: int = 12) -> list[dict]:
             "cover": row["cover"],
             "query": row["query"],
             "videoId": row["video_id"],
+            "source": source or None,
+            "sourceId": source_id or None,
             "downloadedAt": row["downloaded_at"],
-        }
-        for row in rows
-    ]
+        })
+    return items
 
 
 def fetch_download_history_rows(limit: int = 500) -> list[sqlite3.Row]:
     with get_db_connection() as connection:
         return connection.execute(
             """
-            SELECT track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, downloaded_at
+            SELECT track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, source, source_id, downloaded_at
             FROM download_history
             ORDER BY downloaded_at DESC, id DESC
             LIMIT ?
@@ -1249,8 +1375,9 @@ def build_local_library_payload() -> dict:
     metadata_by_path: dict[str, dict[str, Any]] = {}
     metadata_by_filename: dict[str, dict[str, Any]] = {}
     for row in history_rows:
+        source, source_id = legacy_source_fields(row["source"], row["source_id"], row["video_id"])
         payload = {
-            "key": row["track_key"] or "",
+            "key": stable_track_key(row["track_key"], source, source_id, row["video_id"], row["title"], row["artist"]),
             "title": row["title"] or "",
             "artist": row["artist"] or "",
             "filename": row["filename"] or "",
@@ -1259,6 +1386,8 @@ def build_local_library_payload() -> dict:
             "cover": row["cover"] or "",
             "query": row["query"] or "",
             "videoId": row["video_id"],
+            "source": source or None,
+            "sourceId": source_id or None,
             "downloadedAt": row["downloaded_at"] or "",
         }
         saved_path = str(payload["savedPath"]).strip()
@@ -1295,7 +1424,7 @@ def build_local_library_payload() -> dict:
         artist = metadata.get("artist") or inferred_artist or "本地文件"
         query = metadata.get("query") or " ".join(part for part in [title, artist] if part and artist != "本地文件").strip()
         key = metadata.get("key") or f"local::{normalize_cache_text(str(resolved_path))}"
-        duplicate_identity = metadata.get("videoId") or normalize_cache_text(f"{title}::{artist}")
+        duplicate_identity = metadata.get("sourceId") or metadata.get("videoId") or normalize_cache_text(f"{title}::{artist}")
 
         item = {
             "key": key,
@@ -1307,6 +1436,8 @@ def build_local_library_payload() -> dict:
             "sourceUrl": metadata.get("sourceUrl") or "",
             "query": query,
             "videoId": metadata.get("videoId"),
+            "source": metadata.get("source"),
+            "sourceId": metadata.get("sourceId"),
             "downloadedAt": metadata.get("downloadedAt") or datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
             "fileSize": stat.st_size,
             "offlineUrl": build_local_media_url(resolved_path),
@@ -1356,9 +1487,10 @@ def append_frontend_error_report(report: FrontendErrorReport) -> Path:
     return log_path
 
 
-def fetch_saved_lyrics_offset(track_key: str = "", video_id: str = "") -> float:
+def fetch_saved_lyrics_offset(track_key: str = "", video_id: str = "", source: str = "", source_id: str = "") -> float:
     query = None
     params: tuple[str, ...] = ()
+    resolved_source, resolved_source_id = legacy_source_fields(source, source_id, video_id)
 
     if track_key:
         query = """
@@ -1376,6 +1508,15 @@ def fetch_saved_lyrics_offset(track_key: str = "", video_id: str = "") -> float:
             LIMIT 1
         """
         params = (video_id,)
+    elif resolved_source and resolved_source_id:
+        query = """
+            SELECT offset_seconds
+            FROM lyrics_offsets
+            WHERE source = ? AND source_id = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """
+        params = (resolved_source, resolved_source_id)
 
     if not query:
         return 0.0
@@ -1391,14 +1532,19 @@ def upsert_lyrics_offset(entry: LyricsOffsetEntry) -> dict:
         raise HTTPException(status_code=422, detail="trackKey is required")
 
     updated_at = entry.updatedAt or utc_now_iso()
+    source, source_id = legacy_source_fields(entry.source, entry.sourceId, entry.videoId)
+    track_key = stable_track_key(track_key, source, source_id, entry.videoId, entry.title, entry.artist)
 
     with get_db_connection() as connection:
+        delete_duplicate_source_rows(connection, "lyrics_offsets", track_key, source, source_id, entry.videoId)
         connection.execute(
             """
-            INSERT INTO lyrics_offsets (track_key, video_id, title, artist, offset_seconds, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO lyrics_offsets (track_key, video_id, source, source_id, title, artist, offset_seconds, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(track_key) DO UPDATE SET
                 video_id = excluded.video_id,
+                source = excluded.source,
+                source_id = excluded.source_id,
                 title = excluded.title,
                 artist = excluded.artist,
                 offset_seconds = excluded.offset_seconds,
@@ -1407,6 +1553,8 @@ def upsert_lyrics_offset(entry: LyricsOffsetEntry) -> dict:
             (
                 track_key,
                 entry.videoId,
+                source,
+                source_id,
                 entry.title,
                 entry.artist,
                 float(entry.offsetSeconds),
@@ -1417,6 +1565,8 @@ def upsert_lyrics_offset(entry: LyricsOffsetEntry) -> dict:
     return {
         "trackKey": track_key,
         "videoId": entry.videoId,
+        "source": source or None,
+        "sourceId": source_id or None,
         "title": entry.title,
         "artist": entry.artist,
         "offsetSeconds": float(entry.offsetSeconds),
@@ -1480,8 +1630,10 @@ def get_system_check() -> dict:
         "ytDlpVersion": yt_dlp.version.__version__,
         "ytMusicApiAvailable": YTMusic is not None,
         "youtubeDataApiEnabled": bool(YOUTUBE_DATA_API_KEY),
+        "youtubeFallbackEnabled": NAS_ENABLE_YOUTUBE_FALLBACK,
         "searchProvider": NAS_SEARCH_PROVIDER,
         "searchProviderOrder": search_provider_order(),
+        "youtubeSearchProviderOrder": youtube_search_provider_order(),
         "metadataProxyMode": metadata_proxy_mode(),
         "envProxyAvailable": proxy_available,
         "mediaTransport": NAS_MEDIA_TRANSPORT,
@@ -1534,6 +1686,7 @@ def diagnose_http_endpoint(
 
 def build_search_diagnostics_payload(sample_query: str = "Coldplay Yellow") -> dict[str, Any]:
     checks = [
+        diagnose_http_endpoint("qqmusic", "QQ 音乐", "https://y.qq.com"),
         diagnose_http_endpoint("youtube", "YouTube", "https://www.youtube.com"),
         diagnose_http_endpoint("ytmusic", "YT Music", "https://music.youtube.com"),
         diagnose_http_endpoint("lrclib", "LRCLIB", "https://lrclib.net/api/search?q=yellow"),
@@ -1550,16 +1703,16 @@ def build_search_diagnostics_payload(sample_query: str = "Coldplay Yellow") -> d
     }
 
     try:
-        results = search_youtube_entries(sample_query, 3)
+        results = search_catalog_entries(sample_query, 3)
         search_probe["count"] = len(results)
         search_probe["ok"] = bool(results)
         if results:
-            search_probe["provider"] = str(results[0].get("provider") or "")
+            search_probe["provider"] = str(results[0].get("source") or results[0].get("provider") or "")
             search_probe["items"] = [
                 {
                     "title": entry.get("title") or "",
                     "artist": entry.get("uploader") or "",
-                    "provider": entry.get("provider") or "",
+                    "provider": entry.get("source") or entry.get("provider") or "",
                 }
                 for entry in results[:3]
             ]
@@ -1571,17 +1724,24 @@ def build_search_diagnostics_payload(sample_query: str = "Coldplay Yellow") -> d
     proxy_mode = metadata_proxy_mode()
     proxy_available = env_proxy_available()
     youtube_reachable = any(check["id"] in {"youtube", "ytmusic"} and check["ok"] for check in checks)
+    qqmusic_reachable = any(check["id"] == "qqmusic" and check["ok"] for check in checks)
     advice: list[str] = []
 
     if search_probe["ok"]:
-        if proxy_mode == "direct" and not proxy_available:
+        if search_probe["provider"] == SOURCE_QQMUSIC:
+            advice.append("当前 QQ 音乐搜索链路可用，日常搜索不需要依赖 YouTube 代理。")
+        elif proxy_mode == "direct" and not proxy_available:
             advice.append("当前环境下搜索可直连使用，并不是硬性要求开启代理。")
         else:
             advice.append("当前环境下搜索链路可用，是否需要代理主要取决于用户本机网络。")
-    elif not youtube_reachable:
-        advice.append("当前环境下 YouTube / YT Music 不可达，搜索通常会失败；如果所在网络限制访问，需要可用代理或 VPN。")
+    elif not qqmusic_reachable and not youtube_reachable:
+        advice.append("当前环境下 QQ 音乐与 YouTube / YT Music 都不可达，搜索通常会失败；优先检查本机网络。")
+    elif not qqmusic_reachable:
+        advice.append("当前环境下 QQ 音乐不可达，国内音源搜索会失败；如启用 YouTube 兜底，仍可能需要代理。")
+    elif not youtube_reachable and NAS_ENABLE_YOUTUBE_FALLBACK:
+        advice.append("当前环境下 YouTube / YT Music 不可达，但 QQ 音乐仍可作为主搜索源使用。")
     else:
-        advice.append("基础站点可达，但搜索探针仍失败，优先检查系统代理、杀毒/防火墙拦截，或让用户升级到最新版本后重试。")
+        advice.append("基础站点可达，但搜索探针仍失败，优先检查音源接口变化、系统代理或防火墙拦截。")
 
     if proxy_mode == "system":
         advice.append("当前应用正在跟随系统代理设置访问搜索源。")
@@ -1601,16 +1761,105 @@ def build_search_diagnostics_payload(sample_query: str = "Coldplay Yellow") -> d
         "envProxyAvailable": proxy_available,
         "searchProvider": NAS_SEARCH_PROVIDER,
         "searchProviderOrder": search_provider_order(),
+        "youtubeSearchProviderOrder": youtube_search_provider_order(),
+        "youtubeFallbackEnabled": NAS_ENABLE_YOUTUBE_FALLBACK,
         "youtubeDataApiEnabled": bool(YOUTUBE_DATA_API_KEY),
         "checks": checks,
         "searchProbe": search_probe,
-        "likelyNeedsProxy": not search_probe["ok"] and not youtube_reachable and proxy_mode == "direct" and not proxy_available,
+        "likelyNeedsProxy": not search_probe["ok"] and not qqmusic_reachable and not youtube_reachable and proxy_mode == "direct" and not proxy_available,
         "advice": advice,
     }
 
 
 def normalize_cache_text(value: str) -> str:
     return " ".join((value or "").strip().casefold().split())
+
+
+def normalize_source(value: Optional[str], *, video_id: str = "", source_id: str = "") -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {SOURCE_QQMUSIC, SOURCE_YOUTUBE, SOURCE_LOCAL}:
+        return normalized
+    if normalized in YOUTUBE_SEARCH_PROVIDERS or video_id:
+        return SOURCE_YOUTUBE
+    if source_id:
+        return SOURCE_QQMUSIC
+    return ""
+
+
+def make_track_key(source: Optional[str], source_id: Optional[str], title: str = "", artist: str = "", video_id: Optional[str] = None) -> str:
+    normalized_source = normalize_source(source, video_id=video_id or "", source_id=source_id or "")
+    normalized_source_id = (source_id or video_id or "").strip()
+    if normalized_source and normalized_source_id:
+        return f"{normalized_source}:{normalized_source_id}"
+    if video_id:
+        return f"{SOURCE_YOUTUBE}:{video_id}"
+    return f"{normalize_cache_text(title)}::{normalize_cache_text(artist)}"
+
+
+def legacy_source_fields(source: Optional[str], source_id: Optional[str], video_id: Optional[str]) -> tuple[str, str]:
+    normalized_source = normalize_source(source, video_id=video_id or "", source_id=source_id or "")
+    normalized_source_id = (source_id or "").strip()
+    if not normalized_source_id and normalized_source == SOURCE_YOUTUBE and video_id:
+        normalized_source_id = video_id
+    return normalized_source, normalized_source_id
+
+
+def stable_track_key(
+    stored_key: Optional[str],
+    source: Optional[str],
+    source_id: Optional[str],
+    video_id: Optional[str],
+    title: str = "",
+    artist: str = "",
+) -> str:
+    resolved_source, resolved_source_id = legacy_source_fields(source, source_id, video_id)
+    if resolved_source and resolved_source_id:
+        return make_track_key(resolved_source, resolved_source_id, title, artist, video_id)
+    return (stored_key or make_track_key(resolved_source, resolved_source_id, title, artist, video_id)).strip()
+
+
+def parse_stable_track_key(track_key: str) -> tuple[str, str]:
+    key = (track_key or "").strip()
+    if ":" not in key:
+        return "", ""
+    source, source_id = key.split(":", 1)
+    source = normalize_source(source)
+    source_id = source_id.strip()
+    if not source or not source_id:
+        return "", ""
+    return source, source_id
+
+
+def delete_duplicate_source_rows(
+    connection: sqlite3.Connection,
+    table_name: str,
+    track_key: str,
+    source: str,
+    source_id: str,
+    video_id: Optional[str],
+) -> None:
+    if table_name not in {"favorites", "play_history", "lyrics_offsets"}:
+        return
+
+    clauses: list[str] = []
+    params: list[Any] = [track_key]
+    if source and source_id:
+        clauses.append("(source = ? AND source_id = ?)")
+        params.extend([source, source_id])
+    if video_id:
+        clauses.append("video_id = ?")
+        params.append(video_id)
+    elif source == SOURCE_YOUTUBE and source_id:
+        clauses.append("video_id = ?")
+        params.append(source_id)
+
+    if not clauses:
+        return
+
+    connection.execute(
+        f"DELETE FROM {table_name} WHERE track_key <> ? AND ({' OR '.join(clauses)})",
+        tuple(params),
+    )
 
 
 def build_search_cache_key(query: str, limit: int, provider: str = "auto", region: str = "", language: str = "") -> str:
@@ -1629,8 +1878,15 @@ def build_playback_cache_key(video_id: str) -> str:
     return f"playback::{(video_id or '').strip()}"
 
 
-def build_visualize_cache_key(query: str = "", video_id: str = "") -> str:
-    return f"visualize::{normalize_cache_text(video_id)}::{normalize_cache_text(query)}"
+def build_visualize_cache_key(query: str = "", video_id: str = "", source: str = "", source_id: str = "") -> str:
+    return "::".join(
+        [
+            "visualize",
+            normalize_source(source, video_id=video_id, source_id=source_id) or "auto",
+            normalize_cache_text(source_id or video_id),
+            normalize_cache_text(query),
+        ]
+    )
 
 
 def build_lyrics_cache_key(
@@ -1638,6 +1894,8 @@ def build_lyrics_cache_key(
     artist_name: str = "",
     audio_duration: Optional[float] = None,
     video_id: str = "",
+    source: str = "",
+    source_id: str = "",
 ) -> str:
     rounded_duration = normalize_duration_seconds(audio_duration) or 0
     return "::".join(
@@ -1645,15 +1903,15 @@ def build_lyrics_cache_key(
             normalize_cache_text(track_name),
             normalize_cache_text(artist_name),
             str(rounded_duration),
+            normalize_source(source, video_id=video_id, source_id=source_id) or "",
+            normalize_cache_text(source_id),
             normalize_cache_text(video_id),
         ]
     )
 
 
-def make_track_identity(video_id: Optional[str], title: str, artist: str) -> str:
-    if video_id:
-        return f"vid:{video_id}"
-    return f"{normalize_cache_text(title)}::{normalize_cache_text(artist)}"
+def make_track_identity(video_id: Optional[str], title: str, artist: str, source: Optional[str] = None, source_id: Optional[str] = None) -> str:
+    return make_track_key(source, source_id, title, artist, video_id)
 
 
 def recommendation_cache_key() -> str:
@@ -1753,9 +2011,11 @@ def search_item_from_entry(entry: dict, fallback_query: str = "") -> SearchItem 
         return None
 
     video_id = entry.get("id")
+    source = normalize_source(entry.get("source"), video_id=video_id or "", source_id=entry.get("sourceId") or "")
+    source_id = entry.get("sourceId") or (video_id if source == SOURCE_YOUTUBE else "")
     title = entry.get("title") or "Unknown Title"
     artist = entry.get("uploader") or entry.get("channel") or "Unknown Artist"
-    if not video_id:
+    if not source_id and not video_id:
         return None
 
     duration = normalize_duration_seconds(entry.get("duration"))
@@ -1763,11 +2023,14 @@ def search_item_from_entry(entry: dict, fallback_query: str = "") -> SearchItem 
         title=title,
         artist=artist,
         cover=entry.get("thumbnail") or "",
-        videoId=video_id,
+        videoId=video_id or "",
         query=fallback_query or f"{title} {artist}".strip(),
         duration=duration,
         durationText=format_duration(duration),
         provider=entry.get("provider"),
+        source=source or None,
+        sourceId=source_id or None,
+        trackKey=entry.get("trackKey") or make_track_key(source, source_id, title, artist, video_id),
     )
 
 
@@ -1787,6 +2050,9 @@ def search_item_from_library_track(item: dict) -> SearchItem | None:
         duration=None,
         durationText=None,
         provider="library",
+        source=item.get("source") or None,
+        sourceId=item.get("sourceId") or None,
+        trackKey=stable_track_key(item.get("key"), item.get("source"), item.get("sourceId"), item.get("videoId"), title, artist),
     )
 
 
@@ -2181,9 +2447,9 @@ def looks_like_metric_label(value: str) -> bool:
     return bool(re.search(r"(播放次数|次观看|views?\b|watching\b)", text, re.IGNORECASE))
 
 
-def search_provider_order() -> list[str]:
+def youtube_search_provider_order() -> list[str]:
     mode = NAS_SEARCH_PROVIDER
-    if mode == "auto":
+    if mode in {"auto", SOURCE_QQMUSIC, SOURCE_YOUTUBE}:
         providers: list[str] = []
         if YOUTUBE_DATA_API_KEY:
             providers.append("youtube_data_api")
@@ -2194,11 +2460,504 @@ def search_provider_order() -> list[str]:
     return [mode]
 
 
+def search_provider_order() -> list[str]:
+    mode = NAS_SEARCH_PROVIDER
+    if mode == "auto":
+        providers = [SOURCE_QQMUSIC]
+        if NAS_ENABLE_YOUTUBE_FALLBACK:
+            providers.append(SOURCE_YOUTUBE)
+        return providers
+    if mode in YOUTUBE_SEARCH_PROVIDERS:
+        return [SOURCE_YOUTUBE]
+    if mode == SOURCE_YOUTUBE:
+        return [SOURCE_YOUTUBE]
+    if mode == SOURCE_QQMUSIC:
+        providers = [SOURCE_QQMUSIC]
+        if NAS_ENABLE_YOUTUBE_FALLBACK:
+            providers.append(SOURCE_YOUTUBE)
+        return providers
+    return [SOURCE_QQMUSIC]
+
+
 def normalize_catalog_entry(entry: dict, provider: str) -> dict:
     normalized = dict(entry)
     normalized["provider"] = provider
+    if provider in YOUTUBE_SEARCH_PROVIDERS:
+        normalized["source"] = SOURCE_YOUTUBE
+        normalized["sourceId"] = normalized.get("sourceId") or normalized.get("id") or ""
+    else:
+        normalized["source"] = normalize_source(normalized.get("source") or provider, source_id=normalized.get("sourceId") or "")
     normalized["duration"] = normalize_duration_seconds(entry.get("duration"))
+    normalized["trackKey"] = normalized.get("trackKey") or make_track_key(
+        normalized.get("source"),
+        normalized.get("sourceId"),
+        normalized.get("title") or "",
+        normalized.get("uploader") or normalized.get("channel") or "",
+        normalized.get("id"),
+    )
     return normalized
+
+
+def qqmusic_search_id() -> str:
+    base = 18014398509481984
+    jitter = int(time.time() * 1000) % (24 * 60 * 60 * 1000)
+    return str(base + (uuid.uuid4().int % 4194304) * 4294967296 + jitter)
+
+
+def qqmusic_request_item(module: str, method: str, param: dict[str, Any]) -> dict[str, Any]:
+    return {"module": module, "method": method, "param": param}
+
+
+def qqmusic_artist_names(item: dict[str, Any]) -> str:
+    names = []
+    for singer in item.get("singer") or []:
+        if isinstance(singer, dict):
+            name = str(singer.get("name") or singer.get("title") or "").strip()
+            if name:
+                names.append(name)
+    return ", ".join(names) or "Unknown Artist"
+
+
+def qqmusic_album_cover(item: dict[str, Any]) -> str:
+    album = item.get("album") or {}
+    album_mid = str(album.get("mid") or album.get("pmid") or "").split("_", 1)[0]
+    if not album_mid:
+        return ""
+    return QQMUSIC_COVER_URL.format(album_mid=album_mid)
+
+
+def qqmusic_track_from_raw(item: dict[str, Any]) -> dict[str, Any] | None:
+    song_mid = str(item.get("mid") or "").strip()
+    if not song_mid:
+        return None
+    title = html.unescape(str(item.get("title") or item.get("name") or "Unknown Title"))
+    title = re.sub(r"<[^>]+>", "", title).strip() or "Unknown Title"
+    artist = qqmusic_artist_names(item)
+    duration = normalize_duration_seconds(item.get("interval"))
+    return {
+        "id": "",
+        "source": SOURCE_QQMUSIC,
+        "sourceId": song_mid,
+        "trackKey": make_track_key(SOURCE_QQMUSIC, song_mid, title, artist),
+        "title": title,
+        "uploader": artist,
+        "channel": artist,
+        "description": "QQ Music",
+        "thumbnail": qqmusic_album_cover(item),
+        "duration": duration,
+        "provider": SOURCE_QQMUSIC,
+        "qqMusicId": item.get("id"),
+        "qqMediaMid": (item.get("file") or {}).get("media_mid") or song_mid,
+        "qqFile": item.get("file") or {},
+    }
+
+
+def search_qqmusic_entries(query: str, limit: int) -> list[dict]:
+    normalized_query = " ".join((query or "").split())
+    if not normalized_query:
+        return []
+
+    search_size = min(max(limit * 2, limit + 4), 20)
+    started_ms = perf_counter_ms()
+    payload = request_qqmusic_api(
+        qqmusic_request_item(
+            "music.adaptor.SearchAdaptor",
+            "do_search_v2",
+            {
+                "searchid": qqmusic_search_id(),
+                "search_type": 100,
+                "page_num": 15,
+                "query": normalized_query,
+                "page_id": 1,
+                "highlight": 0,
+                "grp": 1,
+            },
+        ),
+        timeout=10,
+    )
+    raw_items = (((payload.get("body") or {}).get("item_song") or {}).get("items") or [])[:search_size]
+    entries: list[dict] = []
+    seen_source_ids: set[str] = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        entry = qqmusic_track_from_raw(raw_item)
+        if not entry:
+            continue
+        source_id = entry.get("sourceId") or ""
+        if source_id in seen_source_ids:
+            continue
+        seen_source_ids.add(source_id)
+        entries.append(normalize_catalog_entry(entry, SOURCE_QQMUSIC))
+        if len(entries) >= limit:
+            break
+
+    log_timing("search_provider", provider=SOURCE_QQMUSIC, search_ms=int(perf_counter_ms() - started_ms), count=len(entries))
+    return entries
+
+
+def fetch_qqmusic_track_detail(song_mid: str) -> dict[str, Any] | None:
+    source_id = (song_mid or "").strip()
+    if not source_id:
+        return None
+    payload = request_qqmusic_api(
+        qqmusic_request_item(
+            "music.trackInfo.UniformRuleCtrl",
+            "CgiGetTrackInfo",
+            {
+                "types": [0],
+                "modify_stamp": [0],
+                "ctx": 0,
+                "client": 1,
+                "mids": [source_id],
+            },
+        ),
+        timeout=10,
+    )
+    tracks = payload.get("tracks") or []
+    if not tracks or not isinstance(tracks[0], dict):
+        return None
+    return qqmusic_track_from_raw(tracks[0])
+
+
+def qqmusic_file_candidates(entry: dict[str, Any]) -> list[tuple[str, str, str]]:
+    file_info = entry.get("qqFile") or {}
+    candidates = [
+        ("C400", ".m4a", "size_96aac"),
+        ("M500", ".mp3", "size_128mp3"),
+        ("C600", ".m4a", "size_192aac"),
+        ("M800", ".mp3", "size_320mp3"),
+    ]
+    available = []
+    for prefix, extension, size_key in candidates:
+        try:
+            size = int(file_info.get(size_key) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size > 0:
+            available.append((prefix, extension, size_key))
+    return available or candidates[:2]
+
+
+def fetch_qqmusic_vkey_info(song_mid: str, media_mid: str, prefix: str, extension: str) -> dict[str, Any]:
+    guid = uuid.uuid4().hex
+    filename = f"{prefix}{media_mid}{extension}"
+    payload = request_qqmusic_api(
+        qqmusic_request_item(
+            "music.vkey.GetVkey",
+            "UrlGetVkey",
+            {
+                "uin": "0",
+                "filename": [filename],
+                "guid": guid,
+                "songmid": [song_mid],
+                "songtype": [0],
+                "ctx": 0,
+            },
+        ),
+        timeout=10,
+    )
+    info_items = payload.get("midurlinfo") or []
+    if not info_items or not isinstance(info_items[0], dict):
+        return {
+            "url": "",
+            "purl": "",
+            "filename": filename,
+            "prefix": prefix,
+            "extension": extension,
+            "reason": QQMUSIC_FAILURE_EMPTY_PURL,
+            "message": "missing midurlinfo",
+        }
+    info = info_items[0]
+    purl = str(info_items[0].get("purl") or "").strip()
+    if not purl:
+        return {
+            "url": "",
+            "purl": "",
+            "filename": filename,
+            "prefix": prefix,
+            "extension": extension,
+            "reason": classify_qqmusic_vkey_failure(info),
+            "message": str(info.get("msg") or info.get("errmsg") or info.get("message") or ""),
+            "result": info.get("result"),
+        }
+    if purl.startswith("http"):
+        audio_url = purl
+        domain = ""
+    else:
+        domains = [domain for domain in payload.get("sip") or [] if domain]
+        domain = domains[0] if domains else QQMUSIC_AUDIO_FALLBACK_DOMAIN
+        audio_url = f"{domain.rstrip('/')}/{purl.lstrip('/')}"
+    return {
+        "url": audio_url,
+        "purl": purl,
+        "filename": filename,
+        "prefix": prefix,
+        "extension": extension,
+        "domain": domain,
+        "reason": "",
+        "message": str(info.get("msg") or info.get("errmsg") or info.get("message") or ""),
+        "result": info.get("result"),
+    }
+
+
+def fetch_qqmusic_vkey(song_mid: str, media_mid: str, prefix: str, extension: str) -> str:
+    return str(fetch_qqmusic_vkey_info(song_mid, media_mid, prefix, extension).get("url") or "")
+
+
+def classify_qqmusic_vkey_failure(info: dict[str, Any]) -> str:
+    text = " ".join(str(info.get(key) or "") for key in ("msg", "errmsg", "message", "tips", "result"))
+    lowered = text.lower()
+    if any(token in lowered for token in ("vip", "pay", "green", "premium")) or any(token in text for token in ("会员", "付费", "绿钻")):
+        return QQMUSIC_FAILURE_VIP_REQUIRED
+    if any(token in lowered for token in ("copyright", "right")) or any(token in text for token in ("版权", "无版权", "暂无版权")):
+        return QQMUSIC_FAILURE_COPYRIGHT_RESTRICTED
+    return QQMUSIC_FAILURE_EMPTY_PURL
+
+
+def qqmusic_failure_label(reason: str) -> str:
+    mapping = {
+        QQMUSIC_FAILURE_EMPTY_PURL: "QQ 音乐未返回完整播放地址",
+        QQMUSIC_FAILURE_PREVIEW_ONLY: "QQ 音乐仅返回试听片段",
+        QQMUSIC_FAILURE_VIP_REQUIRED: "QQ 音乐可能需要会员权益",
+        QQMUSIC_FAILURE_COPYRIGHT_RESTRICTED: "QQ 音乐版权受限",
+        QQMUSIC_FAILURE_HTTP_403: "QQ 音乐播放地址拒绝访问",
+        QQMUSIC_FAILURE_STALE_VKEY: "QQ 音乐播放地址已过期，已重试",
+        QQMUSIC_FAILURE_NETWORK: "QQ 音乐播放地址网络探测失败",
+        QQMUSIC_FAILURE_TRACK_DETAIL: "QQ 音乐曲目信息缺失",
+    }
+    return mapping.get(reason or "", "QQ 音乐解析失败")
+
+
+def is_qqmusic_preview_url(url: str, purl: str = "") -> bool:
+    value = f"{url or ''} {purl or ''}".lower()
+    return bool(re.search(r"(^|[/_-])rs0[12]", value)) or "preview" in value or "试听" in value
+
+
+def probe_playable_media_url_info(url: str) -> dict[str, Any]:
+    if not url:
+        return {"ok": False, "reason": QQMUSIC_FAILURE_EMPTY_PURL, "statusCode": None, "error": ""}
+    upstream = None
+    headers = media_request_headers(url)
+    headers["Range"] = "bytes=0-1"
+    try:
+        upstream, _transport_mode = request_media_response(
+            url,
+            headers=headers,
+            timeout=8,
+            stream=True,
+        )
+        return {
+            "ok": upstream.ok,
+            "reason": "" if upstream.ok else QQMUSIC_FAILURE_UNKNOWN,
+            "statusCode": upstream.status_code,
+            "error": "",
+        }
+    except requests.HTTPError as exc:
+        response = exc.response
+        status_code = response.status_code if response is not None else None
+        reason = QQMUSIC_FAILURE_HTTP_403 if status_code == 403 else QQMUSIC_FAILURE_NETWORK
+        log_timing("media_probe_failed", provider=SOURCE_QQMUSIC, status=status_code or "", error=exc.__class__.__name__)
+        return {"ok": False, "reason": reason, "statusCode": status_code, "error": exc.__class__.__name__}
+    except Exception as exc:
+        log_timing("media_probe_failed", provider=SOURCE_QQMUSIC, error=exc.__class__.__name__)
+        return {"ok": False, "reason": QQMUSIC_FAILURE_NETWORK, "statusCode": None, "error": exc.__class__.__name__}
+    finally:
+        if upstream is not None:
+            upstream.close()
+
+
+def qqmusic_attempt_payload(
+    *,
+    source_id: str,
+    title: str,
+    artist: str,
+    prefix: str = "",
+    extension: str = "",
+    reason: str = "",
+    status_code: Optional[int] = None,
+    message: str = "",
+) -> dict[str, Any]:
+    return {
+        "source": SOURCE_QQMUSIC,
+        "sourceId": source_id,
+        "title": title,
+        "artist": artist,
+        "format": f"{prefix}{extension}".strip(),
+        "reason": reason or QQMUSIC_FAILURE_UNKNOWN,
+        "message": message or qqmusic_failure_label(reason),
+        "statusCode": status_code,
+    }
+
+
+def dominant_qqmusic_failure(attempts: list[dict[str, Any]]) -> str:
+    reasons = [str(item.get("reason") or "") for item in attempts if item.get("reason")]
+    for preferred in (
+        QQMUSIC_FAILURE_VIP_REQUIRED,
+        QQMUSIC_FAILURE_COPYRIGHT_RESTRICTED,
+        QQMUSIC_FAILURE_PREVIEW_ONLY,
+        QQMUSIC_FAILURE_HTTP_403,
+        QQMUSIC_FAILURE_EMPTY_PURL,
+        QQMUSIC_FAILURE_NETWORK,
+    ):
+        if preferred in reasons:
+            return preferred
+    return reasons[-1] if reasons else QQMUSIC_FAILURE_UNKNOWN
+
+
+def media_request_headers(url: str) -> dict[str, str]:
+    headers = {"User-Agent": DEFAULT_HTTP_USER_AGENT}
+    lowered_url = (url or "").lower()
+    if "qqmusic.qq.com" in lowered_url or "music.tc.qq.com" in lowered_url:
+        headers["Referer"] = "https://y.qq.com/"
+        headers["Origin"] = "https://y.qq.com"
+    return headers
+
+
+def probe_playable_media_url(url: str) -> bool:
+    return bool(probe_playable_media_url_info(url).get("ok"))
+
+
+def resolve_qqmusic_entry(source_id: str, candidate: dict | None = None) -> dict:
+    source_id = (source_id or "").strip()
+    if not source_id:
+        raise HTTPException(status_code=422, detail="sourceId is required")
+
+    cache_key = f"playback::{SOURCE_QQMUSIC}::{source_id}"
+    cached = PLAYBACK_INFO_CACHE.get(cache_key)
+    if cached is not CACHE_MISS:
+        if isinstance(cached, dict) and cached.get("__error__"):
+            raise QQMusicResolveError(
+                str(cached.get("reason") or QQMUSIC_FAILURE_UNKNOWN),
+                str(cached.get("detail") or ""),
+                list(cached.get("attempts") or []),
+            )
+        if cached:
+            return dict(cached)
+        raise QQMusicResolveError(QQMUSIC_FAILURE_EMPTY_PURL, "missing playable QQ Music stream URL")
+
+    entry = candidate if candidate and candidate.get("sourceId") == source_id else None
+    if not entry:
+        entry = fetch_qqmusic_track_detail(source_id)
+    if not entry:
+        attempts = [
+            qqmusic_attempt_payload(
+                source_id=source_id,
+                title="",
+                artist="",
+                reason=QQMUSIC_FAILURE_TRACK_DETAIL,
+                message=qqmusic_failure_label(QQMUSIC_FAILURE_TRACK_DETAIL),
+            )
+        ]
+        PLAYBACK_INFO_CACHE.set(
+            cache_key,
+            {"__error__": True, "reason": QQMUSIC_FAILURE_TRACK_DETAIL, "detail": "missing QQ Music track detail", "attempts": attempts},
+            PLAYBACK_INFO_NEGATIVE_CACHE_TTL_SECONDS,
+        )
+        raise QQMusicResolveError(QQMUSIC_FAILURE_TRACK_DETAIL, "missing QQ Music track detail", attempts)
+
+    media_mid = str(entry.get("qqMediaMid") or source_id).strip()
+    title = str(entry.get("title") or "").strip()
+    artist = str(entry.get("uploader") or entry.get("channel") or "").strip()
+    attempts: list[dict[str, Any]] = []
+    for prefix, extension, _size_key in qqmusic_file_candidates(entry):
+        for refresh_attempt in range(2):
+            try:
+                vkey_info = fetch_qqmusic_vkey_info(source_id, media_mid, prefix, extension)
+            except Exception as exc:
+                attempts.append(
+                    qqmusic_attempt_payload(
+                        source_id=source_id,
+                        title=title,
+                        artist=artist,
+                        prefix=prefix,
+                        extension=extension,
+                        reason=QQMUSIC_FAILURE_NETWORK,
+                        message=exc.__class__.__name__,
+                    )
+                )
+                break
+
+            audio_url = str(vkey_info.get("url") or "")
+            purl = str(vkey_info.get("purl") or "")
+            if not audio_url:
+                reason = str(vkey_info.get("reason") or QQMUSIC_FAILURE_EMPTY_PURL)
+                attempts.append(
+                    qqmusic_attempt_payload(
+                        source_id=source_id,
+                        title=title,
+                        artist=artist,
+                        prefix=prefix,
+                        extension=extension,
+                        reason=reason,
+                        message=str(vkey_info.get("message") or qqmusic_failure_label(reason)),
+                    )
+                )
+                break
+
+            if is_qqmusic_preview_url(audio_url, purl):
+                attempts.append(
+                    qqmusic_attempt_payload(
+                        source_id=source_id,
+                        title=title,
+                        artist=artist,
+                        prefix=prefix,
+                        extension=extension,
+                        reason=QQMUSIC_FAILURE_PREVIEW_ONLY,
+                        message=qqmusic_failure_label(QQMUSIC_FAILURE_PREVIEW_ONLY),
+                    )
+                )
+                break
+
+            probe_info = probe_playable_media_url_info(audio_url)
+            if probe_info.get("ok"):
+                payload = {
+                    **entry,
+                    "audioUrl": audio_url,
+                    "audioExt": extension.lstrip("."),
+                    "resolveAttempts": attempts,
+                }
+                PLAYBACK_INFO_CACHE.set(cache_key, payload, PLAYBACK_INFO_CACHE_TTL_SECONDS)
+                return payload
+
+            reason = str(probe_info.get("reason") or QQMUSIC_FAILURE_UNKNOWN)
+            if reason == QQMUSIC_FAILURE_HTTP_403 and refresh_attempt == 0:
+                attempts.append(
+                    qqmusic_attempt_payload(
+                        source_id=source_id,
+                        title=title,
+                        artist=artist,
+                        prefix=prefix,
+                        extension=extension,
+                        reason=QQMUSIC_FAILURE_STALE_VKEY,
+                        status_code=403,
+                        message=qqmusic_failure_label(QQMUSIC_FAILURE_STALE_VKEY),
+                    )
+                )
+                continue
+
+            attempts.append(
+                qqmusic_attempt_payload(
+                    source_id=source_id,
+                    title=title,
+                    artist=artist,
+                    prefix=prefix,
+                    extension=extension,
+                    reason=reason,
+                    status_code=probe_info.get("statusCode"),
+                    message=str(probe_info.get("error") or qqmusic_failure_label(reason)),
+                )
+            )
+            break
+
+    reason = dominant_qqmusic_failure(attempts)
+    detail = qqmusic_failure_label(reason)
+    PLAYBACK_INFO_CACHE.set(
+        cache_key,
+        {"__error__": True, "reason": reason, "detail": detail, "attempts": attempts},
+        PLAYBACK_INFO_NEGATIVE_CACHE_TTL_SECONDS,
+    )
+    raise QQMusicResolveError(reason, detail, attempts)
 
 
 def ytmusic_client() -> Any:
@@ -2425,18 +3184,57 @@ def search_youtube_entries(query: str, limit: int, *, allow_network: bool = True
     if not normalized_query:
         return []
 
-    for provider in search_provider_order():
+    for provider in youtube_search_provider_order():
         results = search_entries_with_provider(normalized_query, limit, provider, allow_network=allow_network)
         if results:
             return results[:limit]
     return []
 
 
-def build_search_response_payload(query: str, limit: int) -> dict:
+def search_entries_with_source(query: str, limit: int, source: str, *, allow_network: bool = True) -> list[dict]:
+    normalized_source = normalize_source(source) or SOURCE_QQMUSIC
+    cache_key = build_search_cache_key(query, limit, normalized_source)
+    cached = SEARCH_RESULTS_CACHE.get(cache_key)
+    if cached is not CACHE_MISS:
+        return list(cached)
+    if not allow_network:
+        return []
+
+    try:
+        if normalized_source == SOURCE_YOUTUBE:
+            results = search_youtube_entries(query, limit, allow_network=allow_network)
+        else:
+            results = search_qqmusic_entries(query, limit)
+    except Exception as exc:
+        log_timing("search_provider_failed", provider=normalized_source, error=exc.__class__.__name__)
+        results = []
+
+    ttl = SEARCH_CACHE_TTL_SECONDS if results else SEARCH_NEGATIVE_CACHE_TTL_SECONDS
+    SEARCH_RESULTS_CACHE.set(cache_key, results, ttl)
+    return results
+
+
+def search_catalog_entries(query: str, limit: int, *, allow_network: bool = True) -> list[dict]:
+    normalized_query = " ".join((query or "").split())
+    if not normalized_query:
+        return []
+    for source in search_provider_order():
+        results = search_entries_with_source(normalized_query, limit, source, allow_network=allow_network)
+        if results:
+            return results[:limit]
+    return []
+
+
+def build_search_response_payload(query: str, limit: int, source: str = "") -> dict:
     provider = None
     results: list[SearchItem] = []
-    for entry in search_youtube_entries(query, limit):
-        provider = provider or entry.get("provider")
+    normalized_source = normalize_source(source)
+    if normalized_source in {SOURCE_QQMUSIC, SOURCE_YOUTUBE}:
+        entries = search_entries_with_source(query, limit, normalized_source)
+    else:
+        entries = search_catalog_entries(query, limit)
+    for entry in entries:
+        provider = provider or entry.get("source") or entry.get("provider")
         item = search_item_from_entry(entry)
         if item:
             results.append(item)
@@ -2447,52 +3245,127 @@ def build_visualize_error_payload(detail: str, status_code: int) -> dict:
     return {"__error__": True, "detail": detail, "statusCode": status_code}
 
 
-def cache_visualize_payload(query: str, video_id: str, payload: dict, ttl_seconds: int) -> None:
-    VISUALIZE_CACHE.set(build_visualize_cache_key(query=query, video_id=video_id), payload, ttl_seconds)
+def resolve_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, QQMusicResolveError):
+        return exc.reason
+    text = str(exc).lower()
+    if "403" in text or "forbidden" in text:
+        return QQMUSIC_FAILURE_HTTP_403
+    if "network" in text or "timeout" in text:
+        return QQMUSIC_FAILURE_NETWORK
+    return QQMUSIC_FAILURE_UNKNOWN
+
+
+def candidate_failure_payload(candidate: dict, exc: Exception) -> list[dict[str, Any]]:
+    if isinstance(exc, QQMusicResolveError) and exc.attempts:
+        return [dict(item) for item in exc.attempts]
+
+    candidate_video_id = candidate.get("id") or ""
+    candidate_source = normalize_source(candidate.get("source"), video_id=candidate_video_id, source_id=candidate.get("sourceId") or "")
+    candidate_source_id = candidate.get("sourceId") or (candidate_video_id if candidate_source == SOURCE_YOUTUBE else "")
+    reason = resolve_failure_reason(exc)
+    return [
+        {
+            "source": candidate_source or "",
+            "sourceId": candidate_source_id or "",
+            "title": candidate.get("title") or "",
+            "artist": candidate.get("uploader") or candidate.get("channel") or "",
+            "reason": reason,
+            "message": str(exc) or qqmusic_failure_label(reason),
+            "statusCode": None,
+        }
+    ]
+
+
+def cache_visualize_payload(query: str, video_id: str, payload: dict, ttl_seconds: int, *, source: str = "", source_id: str = "") -> None:
+    resolved_source = source or payload.get("source") or ""
+    resolved_source_id = source_id or payload.get("sourceId") or ""
+    VISUALIZE_CACHE.set(
+        build_visualize_cache_key(query=query, video_id=video_id, source=resolved_source, source_id=resolved_source_id),
+        payload,
+        ttl_seconds,
+    )
+    if resolved_source_id:
+        VISUALIZE_CACHE.set(
+            build_visualize_cache_key(source=resolved_source, source_id=resolved_source_id),
+            payload,
+            ttl_seconds,
+        )
     if video_id:
-        VISUALIZE_CACHE.set(build_visualize_cache_key(video_id=video_id), payload, ttl_seconds)
+        VISUALIZE_CACHE.set(build_visualize_cache_key(video_id=video_id, source=SOURCE_YOUTUBE), payload, ttl_seconds)
 
 
-def build_visualize_response_payload(query: str = "", video_id: str = "") -> dict:
-    cache_key = build_visualize_cache_key(query=query, video_id=video_id)
+def build_visualize_response_payload(
+    query: str = "",
+    video_id: str = "",
+    source: str = "",
+    source_id: str = "",
+    track_key: str = "",
+    source_mode: str = "",
+) -> dict:
+    requested_source = normalize_source(source, video_id=video_id, source_id=source_id)
+    forced_source = normalize_source(source_mode)
+    requested_source_id = (source_id or "").strip()
+    if not requested_source_id and requested_source == SOURCE_YOUTUBE and video_id:
+        requested_source_id = video_id
+    cache_key = build_visualize_cache_key(query=query, video_id=video_id, source=requested_source, source_id=requested_source_id)
     cached = VISUALIZE_CACHE.get(cache_key)
     if cached is not CACHE_MISS:
         if isinstance(cached, dict) and cached.get("__error__"):
             raise HTTPException(status_code=int(cached.get("statusCode") or 502), detail=cached.get("detail") or "Visualize failed")
         return dict(cached)
 
-    request_label = video_id or query or ""
+    request_label = requested_source_id or video_id or query or ""
     started_ms = perf_counter_ms()
     print(f"Visualizing: {request_label}")
+    fallback_trace: list[dict[str, Any]] = []
 
     def resolve_candidate(candidate: dict) -> dict:
         candidate_video_id = candidate.get("id")
-        if not candidate_video_id:
-            raise RuntimeError("missing video id")
+        candidate_source = normalize_source(candidate.get("source"), video_id=candidate_video_id or "", source_id=candidate.get("sourceId") or "")
+        candidate_source_id = candidate.get("sourceId") or (candidate_video_id if candidate_source == SOURCE_YOUTUBE else "")
+        if not candidate_source_id and not candidate_video_id:
+            raise RuntimeError("missing source id")
 
-        video_data = extract_playback_info(candidate_video_id)
-        audio_format = select_preferred_audio_format(video_data)
-        audio_url = audio_format.get("url") if audio_format else video_data.get("url")
+        if candidate_source == SOURCE_QQMUSIC:
+            media_data = resolve_qqmusic_entry(candidate_source_id, candidate)
+            audio_url = media_data.get("audioUrl")
+            title = media_data.get("title") or candidate.get("title") or "Unknown Title"
+            artist = media_data.get("uploader") or media_data.get("channel") or candidate.get("uploader") or "Unknown Artist"
+            cover_url = media_data.get("thumbnail") or candidate.get("thumbnail") or ""
+            audio_ext = media_data.get("audioExt") or "m4a"
+            provider = SOURCE_QQMUSIC
+            resolved_video_id = ""
+        else:
+            resolved_video_id = candidate_video_id or candidate_source_id
+            if not resolved_video_id:
+                raise RuntimeError("missing video id")
+            media_data = extract_playback_info(resolved_video_id)
+            audio_format = select_preferred_audio_format(media_data)
+            audio_url = audio_format.get("url") if audio_format else media_data.get("url")
+            title = media_data.get("title") or candidate.get("title") or "Unknown Title"
+            artist = media_data.get("uploader") or media_data.get("channel") or candidate.get("uploader") or "Unknown Artist"
+            cover_url = media_data.get("thumbnail") or candidate.get("thumbnail") or ""
+            audio_ext = (
+                (audio_format or {}).get("audio_ext")
+                or (audio_format or {}).get("ext")
+                or "m4a"
+            )
+            if audio_ext == "none":
+                audio_ext = (audio_format or {}).get("ext") or "m4a"
+            provider = candidate.get("provider") or SOURCE_YOUTUBE
+            candidate_source = SOURCE_YOUTUBE
+            candidate_source_id = resolved_video_id
+
         if not audio_url:
             raise RuntimeError("missing playable stream URL")
-
-        title = video_data.get("title") or candidate.get("title") or "Unknown Title"
-        artist = video_data.get("uploader") or video_data.get("channel") or candidate.get("uploader") or "Unknown Artist"
-        cover_url = video_data.get("thumbnail") or candidate.get("thumbnail") or ""
         query_text = query or f"{title} {artist}".strip()
-        audio_ext = (
-            (audio_format or {}).get("audio_ext")
-            or (audio_format or {}).get("ext")
-            or "m4a"
-        )
-        if audio_ext == "none":
-            audio_ext = (audio_format or {}).get("ext") or "m4a"
-
         extracted_colors = get_cached_cover_colors(cover_url) or warm_cover_colors(cover_url)
         theme = analyze_theme(title, extracted_colors)
         proxy_endpoint = f"/proxy-stream?url={quote(audio_url, safe='')}"
         stream_mode = "proxy" if NAS_MEDIA_TRANSPORT == "proxy" else "direct"
         primary_audio_src = proxy_endpoint if stream_mode == "proxy" else audio_url
+        resolved_track_key = candidate.get("trackKey") or track_key or make_track_key(candidate_source, candidate_source_id, title, artist, resolved_video_id)
 
         return {
             "title": title,
@@ -2503,18 +3376,29 @@ def build_visualize_response_payload(query: str = "", video_id: str = "") -> dic
             "audioExt": audio_ext,
             "colors": extracted_colors,
             "theme": theme,
-            "videoId": candidate_video_id,
+            "videoId": resolved_video_id if candidate_source == SOURCE_YOUTUBE else None,
             "query": query_text,
-            "provider": candidate.get("provider"),
+            "provider": provider,
             "streamMode": stream_mode,
+            "source": candidate_source,
+            "sourceId": candidate_source_id,
+            "trackKey": resolved_track_key,
+            "fallbackReason": "auto_fallback" if fallback_trace else "none",
+            "fallbackTrace": list(fallback_trace),
         }
 
     last_error: Exception | None = None
 
-    if video_id:
+    if requested_source_id or video_id:
         try:
-            payload = resolve_candidate({"id": video_id})
-            cache_visualize_payload(query, video_id, payload, VISUALIZE_CACHE_TTL_SECONDS)
+            direct_candidate = {
+                    "id": video_id,
+                    "source": requested_source or (SOURCE_YOUTUBE if video_id else ""),
+                    "sourceId": requested_source_id,
+                    "trackKey": track_key,
+            }
+            payload = resolve_candidate(direct_candidate)
+            cache_visualize_payload(query, payload.get("videoId") or "", payload, VISUALIZE_CACHE_TTL_SECONDS)
             log_timing(
                 "visualize_resolved",
                 resolve_ms=int(perf_counter_ms() - started_ms),
@@ -2525,28 +3409,36 @@ def build_visualize_response_payload(query: str = "", video_id: str = "") -> dic
             return payload
         except Exception as exc:
             last_error = exc
+            fallback_trace.extend(candidate_failure_payload(direct_candidate, exc))
 
-    seen_video_ids: set[str] = {video_id} if video_id else set()
+    seen_identities: set[str] = set()
+    if requested_source_id or video_id:
+        seen_identities.add(make_track_key(requested_source, requested_source_id, video_id=video_id))
     if query:
-        for match in search_youtube_entries(query, 6):
-            match_video_id = match.get("id")
-            if not match_video_id or match_video_id in seen_video_ids:
-                continue
-            seen_video_ids.add(match_video_id)
-            try:
-                payload = resolve_candidate(match)
-                cache_visualize_payload(query, payload.get("videoId") or "", payload, VISUALIZE_CACHE_TTL_SECONDS)
-                log_timing(
-                    "visualize_resolved",
-                    resolve_ms=int(perf_counter_ms() - started_ms),
-                    stream_mode=payload.get("streamMode"),
-                    provider=payload.get("provider"),
-                    fallback_reason="search_fallback",
-                )
-                return payload
-            except Exception as exc:
-                last_error = exc
-                continue
+        provider_sources = [forced_source] if forced_source in {SOURCE_QQMUSIC, SOURCE_YOUTUBE} else search_provider_order()
+        for provider_source in provider_sources:
+            for match in search_entries_with_source(query, 6, provider_source):
+                match_source = normalize_source(match.get("source"), video_id=match.get("id") or "", source_id=match.get("sourceId") or "")
+                match_source_id = match.get("sourceId") or (match.get("id") if match_source == SOURCE_YOUTUBE else "")
+                identity = make_track_key(match_source, match_source_id, match.get("title") or "", match.get("uploader") or "", match.get("id"))
+                if identity in seen_identities:
+                    continue
+                seen_identities.add(identity)
+                try:
+                    payload = resolve_candidate(match)
+                    cache_visualize_payload(query, payload.get("videoId") or "", payload, VISUALIZE_CACHE_TTL_SECONDS)
+                    log_timing(
+                        "visualize_resolved",
+                        resolve_ms=int(perf_counter_ms() - started_ms),
+                        stream_mode=payload.get("streamMode"),
+                        provider=payload.get("provider"),
+                        fallback_reason="search_fallback",
+                    )
+                    return payload
+                except Exception as exc:
+                    last_error = exc
+                    fallback_trace.extend(candidate_failure_payload(match, exc))
+                    continue
 
     if last_error:
         error_payload = build_visualize_error_payload("Unable to resolve a playable stream", 502)
@@ -2563,8 +3455,14 @@ def fetch_lyrics_payload(
     artist_name: str = "",
     audio_duration: Optional[float] = None,
     video_id: str = "",
+    source: str = "",
+    source_id: str = "",
 ) -> dict:
-    cache_key = build_lyrics_cache_key(track_name, artist_name, audio_duration, video_id)
+    resolved_source = normalize_source(source, video_id=video_id, source_id=source_id)
+    resolved_source_id = (source_id or "").strip()
+    if not resolved_source_id and resolved_source == SOURCE_YOUTUBE and video_id:
+        resolved_source_id = video_id
+    cache_key = build_lyrics_cache_key(track_name, artist_name, audio_duration, video_id, resolved_source, resolved_source_id)
     cached = LYRICS_CACHE.get(cache_key)
     if cached is not CACHE_MISS:
         return dict(cached)
@@ -2594,7 +3492,15 @@ def fetch_lyrics_payload(
         if next_score > current_score:
             best_plain_payload = payload
 
-    if video_id:
+    if resolved_source == SOURCE_QQMUSIC and resolved_source_id:
+        qqmusic_payload = fetch_qqmusic_lyrics(resolved_source_id)
+        if qqmusic_payload:
+            if qqmusic_payload.get("syncedLyrics"):
+                LYRICS_CACHE.set(cache_key, qqmusic_payload, LYRICS_CACHE_TTL_SECONDS)
+                return qqmusic_payload
+            remember_plain_candidate(qqmusic_payload)
+
+    if resolved_source == SOURCE_YOUTUBE and video_id:
         ytmusic_payload = fetch_ytmusic_lyrics(video_id)
         if ytmusic_payload:
             remember_plain_candidate(ytmusic_payload)
@@ -2700,10 +3606,11 @@ def fetch_lyrics_payload(
                 return result
             remember_plain_candidate(result)
 
-    youtube_caption_payload = fetch_youtube_captions(video_id, target_lang)
-    if youtube_caption_payload:
-        LYRICS_CACHE.set(cache_key, youtube_caption_payload, LYRICS_CACHE_TTL_SECONDS)
-        return youtube_caption_payload
+    if resolved_source == SOURCE_YOUTUBE:
+        youtube_caption_payload = fetch_youtube_captions(video_id, target_lang)
+        if youtube_caption_payload:
+            LYRICS_CACHE.set(cache_key, youtube_caption_payload, LYRICS_CACHE_TTL_SECONDS)
+            return youtube_caption_payload
 
     if best_plain_payload:
         LYRICS_CACHE.set(cache_key, best_plain_payload, LYRICS_CACHE_TTL_SECONDS)
@@ -2719,7 +3626,7 @@ def fetch_lyrics_payload(
 
 
 def recommendation_item_identity(item: SearchItem) -> str:
-    return make_track_identity(item.videoId or None, item.title, item.artist)
+    return item.trackKey or make_track_identity(item.videoId or None, item.title, item.artist, item.source, item.sourceId)
 
 
 def personalized_recommendation_seeds(
@@ -2793,7 +3700,7 @@ def resolve_recommendation_seed_items(
 
     def search_seed(query: str) -> list[dict]:
         try:
-            return search_youtube_entries(
+            return search_catalog_entries(
                 query,
                 RECOMMENDATION_SEARCH_RESULTS_PER_SEED,
                 allow_network=True,
@@ -2858,7 +3765,7 @@ def build_recommendations_payload() -> dict:
 
     sections: list[RecommendationSection] = []
     excluded_identities = {
-        make_track_identity(item.get("videoId"), item.get("title") or "", item.get("artist") or "")
+        make_track_identity(item.get("videoId"), item.get("title") or "", item.get("artist") or "", item.get("source"), item.get("sourceId"))
         for item in [*favorites, *history]
     }
 
@@ -3079,40 +3986,61 @@ async def get_recommendations():
 async def upsert_favorite(item: LibraryTrack):
     payload = item.model_dump()
     saved_at = payload.get("savedAt") or utc_now_iso()
+    source, source_id = legacy_source_fields(payload.get("source"), payload.get("sourceId"), payload.get("videoId"))
+    track_key = stable_track_key(payload.get("key"), source, source_id, payload.get("videoId"), payload["title"], payload["artist"])
 
     with get_db_connection() as connection:
+        delete_duplicate_source_rows(connection, "favorites", track_key, source, source_id, payload.get("videoId"))
         connection.execute(
             """
-            INSERT INTO favorites (track_key, title, artist, cover, query, video_id, saved_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO favorites (track_key, title, artist, cover, query, video_id, source, source_id, saved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(track_key) DO UPDATE SET
                 title = excluded.title,
                 artist = excluded.artist,
                 cover = excluded.cover,
                 query = excluded.query,
                 video_id = excluded.video_id,
+                source = excluded.source,
+                source_id = excluded.source_id,
                 saved_at = excluded.saved_at
             """,
             (
-                payload["key"],
+                track_key,
                 payload["title"],
                 payload["artist"],
                 payload.get("cover") or "",
                 payload.get("query") or "",
                 payload.get("videoId"),
+                source,
+                source_id,
                 saved_at,
             ),
         )
 
+    payload["key"] = track_key
     payload["savedAt"] = saved_at
     payload["playedAt"] = None
+    payload["source"] = source or None
+    payload["sourceId"] = source_id or None
     return payload
 
 
 @app.delete("/library/favorites")
 async def delete_favorite(key: str):
     with get_db_connection() as connection:
-        connection.execute("DELETE FROM favorites WHERE track_key = ?", (key,))
+        source, source_id = parse_stable_track_key(key)
+        clauses = ["track_key = ?"]
+        params: list[Any] = [key]
+        if source and source_id:
+            clauses.append("(source = ? AND source_id = ?)")
+            params.extend([source, source_id])
+            if source == SOURCE_YOUTUBE:
+                clauses.append("video_id = ?")
+                params.append(source_id)
+                clauses.append("track_key = ?")
+                params.append(f"vid:{source_id}")
+        connection.execute(f"DELETE FROM favorites WHERE {' OR '.join(clauses)}", tuple(params))
     return {"ok": True, "key": key}
 
 
@@ -3120,33 +4048,43 @@ async def delete_favorite(key: str):
 async def upsert_history(item: LibraryTrack):
     payload = item.model_dump()
     played_at = payload.get("playedAt") or utc_now_iso()
+    source, source_id = legacy_source_fields(payload.get("source"), payload.get("sourceId"), payload.get("videoId"))
+    track_key = stable_track_key(payload.get("key"), source, source_id, payload.get("videoId"), payload["title"], payload["artist"])
 
     with get_db_connection() as connection:
+        delete_duplicate_source_rows(connection, "play_history", track_key, source, source_id, payload.get("videoId"))
         connection.execute(
             """
-            INSERT INTO play_history (track_key, title, artist, cover, query, video_id, played_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO play_history (track_key, title, artist, cover, query, video_id, source, source_id, played_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(track_key) DO UPDATE SET
                 title = excluded.title,
                 artist = excluded.artist,
                 cover = excluded.cover,
                 query = excluded.query,
                 video_id = excluded.video_id,
+                source = excluded.source,
+                source_id = excluded.source_id,
                 played_at = excluded.played_at
             """,
             (
-                payload["key"],
+                track_key,
                 payload["title"],
                 payload["artist"],
                 payload.get("cover") or "",
                 payload.get("query") or "",
                 payload.get("videoId"),
+                source,
+                source_id,
                 played_at,
             ),
         )
 
+    payload["key"] = track_key
     payload["savedAt"] = None
     payload["playedAt"] = played_at
+    payload["source"] = source or None
+    payload["sourceId"] = source_id or None
     return payload
 
 
@@ -3175,15 +4113,17 @@ async def upsert_search_history(item: SearchHistoryEntry):
 @app.post("/library/downloads", response_model=DownloadHistoryEntry)
 async def create_download_history(item: DownloadHistoryEntry):
     downloaded_at = item.downloadedAt or utc_now_iso()
+    source, source_id = legacy_source_fields(item.source, item.sourceId, item.videoId)
+    track_key = stable_track_key(item.key, source, source_id, item.videoId, item.title, item.artist)
 
     with get_db_connection() as connection:
         connection.execute(
             """
-            INSERT INTO download_history (track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO download_history (track_key, title, artist, filename, source_url, saved_path, cover, query, video_id, source, source_id, downloaded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                item.key,
+                track_key,
                 item.title,
                 item.artist,
                 item.filename,
@@ -3192,12 +4132,14 @@ async def create_download_history(item: DownloadHistoryEntry):
                 item.cover,
                 item.query,
                 item.videoId,
+                source,
+                source_id,
                 downloaded_at,
             ),
         )
 
     return {
-        "key": item.key,
+        "key": track_key,
         "title": item.title,
         "artist": item.artist,
         "filename": item.filename,
@@ -3206,6 +4148,8 @@ async def create_download_history(item: DownloadHistoryEntry):
         "cover": item.cover,
         "query": item.query,
         "videoId": item.videoId,
+        "source": source or None,
+        "sourceId": source_id or None,
         "downloadedAt": downloaded_at,
     }
 
@@ -3231,11 +4175,14 @@ async def open_download_job_folder(job_id: str):
 
 
 @app.get("/lyrics-offset")
-async def get_lyrics_offset(track_key: str = "", video_id: str = ""):
+async def get_lyrics_offset(track_key: str = "", video_id: str = "", source: str = "", source_id: str = ""):
+    resolved_source, resolved_source_id = legacy_source_fields(source, source_id, video_id)
     return {
-        "trackKey": track_key or None,
+        "trackKey": stable_track_key(track_key, resolved_source, resolved_source_id, video_id) or None,
         "videoId": video_id or None,
-        "offsetSeconds": fetch_saved_lyrics_offset(track_key=track_key, video_id=video_id),
+        "source": resolved_source or None,
+        "sourceId": resolved_source_id or None,
+        "offsetSeconds": fetch_saved_lyrics_offset(track_key=track_key, video_id=video_id, source=resolved_source, source_id=resolved_source_id),
     }
 
 
@@ -3254,7 +4201,7 @@ async def search_tracks(req: SearchRequest):
     started_ms = perf_counter_ms()
 
     try:
-        payload = await run_in_threadpool(build_search_response_payload, query, limit)
+        payload = await run_in_threadpool(build_search_response_payload, query, limit, req.source or "")
         log_timing(
             "search_completed",
             search_ms=int(perf_counter_ms() - started_ms),
@@ -3476,6 +4423,66 @@ def extract_ytmusic_browse_id(payload: Any) -> str | None:
     return None
 
 
+def decode_qqmusic_lyric(value: str) -> str:
+    raw_value = (value or "").strip()
+    if not raw_value:
+        return ""
+    try:
+        return base64.b64decode(raw_value).decode("utf-8", errors="ignore")
+    except Exception:
+        return raw_value
+
+
+def plain_text_from_lrc(value: str) -> str:
+    lines = []
+    for raw_line in (value or "").splitlines():
+        cleaned = re.sub(r"\[[^\]]+\]", "", raw_line).strip()
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines)
+
+
+def fetch_qqmusic_lyrics(source_id: str) -> dict | None:
+    song_mid = (source_id or "").strip()
+    if not song_mid:
+        return None
+    try:
+        payload = request_qqmusic_api(
+            qqmusic_request_item(
+                "music.musichallSong.PlayLyricInfo",
+                "GetPlayLyricInfo",
+                {
+                    "crypt": 0,
+                    "lrc_t": 0,
+                    "qrc": 0,
+                    "qrc_t": 0,
+                    "roma": 0,
+                    "roma_t": 0,
+                    "trans": 0,
+                    "trans_t": 0,
+                    "type": 1,
+                    "songMid": song_mid,
+                    "cv": 0,
+                    "ct": 24,
+                },
+            ),
+            timeout=10,
+        )
+    except Exception as exc:
+        log_timing("qqmusic_lyrics_failed", error=exc.__class__.__name__)
+        return None
+
+    lyric_text = decode_qqmusic_lyric(str(payload.get("lyric") or ""))
+    if not lyric_text.strip():
+        return None
+    has_timestamps = bool(re.search(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]", lyric_text))
+    return {
+        "syncedLyrics": lyric_text if has_timestamps else None,
+        "plainLyrics": plain_text_from_lrc(lyric_text) if has_timestamps else lyric_text,
+        "source": SOURCE_QQMUSIC,
+    }
+
+
 def fetch_ytmusic_lyrics(video_id: str) -> dict | None:
     client = ytmusic_client()
     if client is None or not video_id:
@@ -3561,15 +4568,17 @@ async def get_lyrics(
     artist_name: str = "",
     audio_duration: Optional[float] = None,
     video_id: str = "",
+    source: str = "",
+    source_id: str = "",
     track_key: str = "",
 ):
     if not track_name:
         raise HTTPException(status_code=422, detail="track_name is required")
 
-    saved_offset = fetch_saved_lyrics_offset(track_key=track_key, video_id=video_id)
+    saved_offset = fetch_saved_lyrics_offset(track_key=track_key, video_id=video_id, source=source, source_id=source_id)
 
     try:
-        payload = await run_in_threadpool(fetch_lyrics_payload, track_name, artist_name, audio_duration, video_id)
+        payload = await run_in_threadpool(fetch_lyrics_payload, track_name, artist_name, audio_duration, video_id, source, source_id)
     except Exception as exc:
         print(f"Lyrics error: {exc}")
         payload = {
@@ -3586,11 +4595,19 @@ async def get_lyrics(
 
 @app.post("/visualize", response_model=VisualizeResponse)
 async def visualize(req: VisualizeRequest):
-    if not req.videoId and not req.query:
-        raise HTTPException(status_code=422, detail="query or videoId is required")
+    if not req.videoId and not req.sourceId and not req.query:
+        raise HTTPException(status_code=422, detail="query, sourceId, or videoId is required")
 
     try:
-        return await run_in_threadpool(build_visualize_response_payload, req.query or "", req.videoId or "")
+        return await run_in_threadpool(
+            build_visualize_response_payload,
+            req.query or "",
+            req.videoId or "",
+            req.source or "",
+            req.sourceId or "",
+            req.trackKey or "",
+            req.sourceMode or "",
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -3604,7 +4621,7 @@ async def proxy_stream(url: str, request: Request):
         started_ms = perf_counter_ms()
         print(f"Proxying stream: {url[:120]}")
 
-        upstream_headers = {"User-Agent": DEFAULT_HTTP_USER_AGENT}
+        upstream_headers = media_request_headers(url)
 
         range_header = request.headers.get("range")
         if range_header:
