@@ -3059,10 +3059,6 @@ function App() {
         </div>
 
         <div className="right-controls">
-          <div className="hidden 2xl:flex flex-col items-end gap-1">
-            <span className="text-[10px] uppercase tracking-[0.16em] text-white/30">音源 · {sourceModeLabel}</span>
-            {renderSourceModeSelector('justify-end')}
-          </div>
           <div className="flex items-center gap-3 w-32">
             <Volume2 size={18} className="text-slate-500" />
             <div className="progress-bar flex-1">
