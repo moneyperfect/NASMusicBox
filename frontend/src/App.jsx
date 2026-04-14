@@ -43,6 +43,13 @@ const FAVORITES_STORAGE_KEY = 'nsrl_local_favorites_v2';
 const LIBRARY_MIGRATION_KEY = 'nas_library_db_migrated_v1';
 const DOWNLOAD_HISTORY_STORAGE_KEY = 'nas_recent_downloads_v1';
 const DOWNLOAD_CENTER_STORAGE_KEY = 'nas_download_center_v1';
+const SOURCE_MODE_STORAGE_KEY = 'nas_source_mode_v1';
+
+const SOURCE_MODE_OPTIONS = [
+  { id: 'auto', label: '自动' },
+  { id: 'qqmusic', label: 'QQ 音乐' },
+  { id: 'youtube', label: 'YouTube' },
+];
 
 const NAV_ITEMS = [
   { id: 'search', label: '搜索', icon: Search },
@@ -262,7 +269,92 @@ const handleCoverError = (event, song, artist) => {
   event.currentTarget.src = nextCover;
 };
 
-const recommendationIdentity = (item) => item?.videoId ? `vid:${item.videoId}` : `${(item?.title || '').trim().toLowerCase()}::${(item?.artist || '').trim().toLowerCase()}`;
+const normalizeSource = (value, videoId = '', sourceId = '') => {
+  const source = (value || '').trim().toLowerCase();
+  if (source === 'qqmusic' || source === 'youtube' || source === 'local') return source;
+  if (videoId) return 'youtube';
+  if (sourceId) return 'qqmusic';
+  return '';
+};
+
+const normalizeSourceMode = (value) => {
+  const mode = (value || '').trim().toLowerCase();
+  return SOURCE_MODE_OPTIONS.some((option) => option.id === mode) ? mode : 'auto';
+};
+
+const readSourceModeStorage = () => {
+  try {
+    return normalizeSourceMode(localStorage.getItem(SOURCE_MODE_STORAGE_KEY));
+  } catch {
+    return 'auto';
+  }
+};
+
+const trackKey = (videoId, title, artist, source = '', sourceId = '') => {
+  const normalizedSource = normalizeSource(source, videoId, sourceId);
+  const normalizedSourceId = (sourceId || (normalizedSource === 'youtube' ? videoId : '') || '').trim();
+  if (normalizedSource && normalizedSourceId) return `${normalizedSource}:${normalizedSourceId}`;
+  return `${(title || '').trim().toLowerCase()}::${(artist || '').trim().toLowerCase()}`;
+};
+
+const getItemTrackKey = (item) => {
+  if (item?.key && !item?.trackKey && !item?.videoId && !item?.sourceId && !item?.source) return item.key;
+  const computedKey = item?.trackKey || trackKey(
+    item?.videoId,
+    item?.title,
+    item?.artist,
+    item?.source,
+    item?.sourceId || (item?.source === 'local' ? item?.savedPath : ''),
+  );
+  return computedKey || item?.key || '';
+};
+
+const buildSourceRequest = (item, sourceMode = 'auto') => {
+  const mode = normalizeSourceMode(sourceMode);
+  const itemSource = normalizeSource(item?.source, item?.videoId, item?.sourceId || '');
+  const itemTrackKey = item?.trackKey || item?.key || null;
+
+  if (itemSource === 'local') {
+    return {
+      source: 'local',
+      sourceId: item?.sourceId || item?.savedPath || null,
+      videoId: item?.videoId || null,
+      trackKey: itemTrackKey,
+      sourceMode: null,
+    };
+  }
+
+  if (mode === 'qqmusic') {
+    return {
+      source: 'qqmusic',
+      sourceId: itemSource === 'qqmusic' ? item?.sourceId || null : null,
+      videoId: null,
+      trackKey: itemSource === 'qqmusic' ? itemTrackKey : null,
+      sourceMode: 'qqmusic',
+    };
+  }
+
+  if (mode === 'youtube') {
+    const youtubeId = itemSource === 'youtube' ? item?.sourceId || item?.videoId || null : null;
+    return {
+      source: 'youtube',
+      sourceId: youtubeId,
+      videoId: youtubeId,
+      trackKey: itemSource === 'youtube' ? itemTrackKey : null,
+      sourceMode: 'youtube',
+    };
+  }
+
+  return {
+    source: itemSource || null,
+    sourceId: item?.sourceId || null,
+    videoId: item?.videoId || null,
+    trackKey: itemTrackKey,
+    sourceMode: null,
+  };
+};
+
+const recommendationIdentity = (item) => getItemTrackKey(item);
 
 const buildFallbackRecommendations = () => ({
   mode: 'fallback',
@@ -284,6 +376,9 @@ const normalizeRecommendationItem = (item) => ({
   cover: item?.cover || '',
   query: item?.query || makeQuery(item?.title, item?.artist),
   videoId: item?.videoId || '',
+  source: item?.source || null,
+  sourceId: item?.sourceId || null,
+  trackKey: item?.trackKey || item?.key || trackKey(item?.videoId, item?.title, item?.artist, item?.source, item?.sourceId),
   duration: item?.duration ?? null,
   durationText: item?.durationText || null,
 });
@@ -313,7 +408,6 @@ const formatTime = (seconds) => {
 };
 
 const makeQuery = (song, artist) => [song?.trim(), artist?.trim()].filter(Boolean).join(' ').trim();
-const trackKey = (videoId, title, artist) => videoId ? `vid:${videoId}` : `${(title || '').trim().toLowerCase()}::${(artist || '').trim().toLowerCase()}`;
 const downloadTaskId = () => `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 const formatBytes = (bytes) => {
@@ -359,6 +453,8 @@ const formatProxyMode = (value) => {
 const formatSearchProviderLabel = (value) => {
   const mapping = {
     auto: '自动',
+    qqmusic: 'QQ 音乐',
+    youtube: 'YouTube',
     ytmusicapi: 'YT Music',
     legacy_ytdlp: 'yt-dlp',
     youtube_data_api: 'YouTube Data API',
@@ -366,8 +462,19 @@ const formatSearchProviderLabel = (value) => {
   return mapping[value] || value || '未知';
 };
 
+const formatFallbackNotice = (trace = [], resolvedSource = '') => {
+  if (!Array.isArray(trace) || trace.length === 0) return '';
+  const lastReason = trace[trace.length - 1]?.reason || '';
+  if (resolvedSource === 'youtube') return 'QQ 音乐当前版本不可播，已自动切换 YouTube 兜底';
+  if (lastReason === 'http_403' || lastReason === 'stale_vkey') return '播放地址失效，已自动刷新并切换可用版本';
+  if (lastReason === 'preview_only') return 'QQ 音乐仅返回试听片段，已自动尝试其他版本';
+  if (lastReason === 'vip_required') return '该曲可能需要会员权益，已自动尝试其他版本';
+  if (lastReason === 'copyright_restricted') return '该曲版权受限，已自动尝试其他版本';
+  return '已自动切换到可播放音源';
+};
+
 const normalizeDownloadHistoryItem = (item) => ({
-  key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+  key: getItemTrackKey(item),
   title: item?.title || '',
   artist: item?.artist || '',
   filename: item?.filename || '',
@@ -376,6 +483,8 @@ const normalizeDownloadHistoryItem = (item) => ({
   cover: item?.cover || '',
   query: item?.query || makeQuery(item?.title, item?.artist),
   videoId: item?.videoId || null,
+  source: item?.source || null,
+  sourceId: item?.sourceId || null,
   downloadedAt: item?.downloadedAt || new Date().toISOString(),
 });
 
@@ -395,12 +504,14 @@ const mergeDownloadHistory = (primary, secondary, limit = 30) => {
 
 const normalizeDownloadTask = (item) => ({
   id: item?.id || downloadTaskId(),
-  key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+  key: getItemTrackKey(item),
   title: item?.title || '',
   artist: item?.artist || '',
   cover: item?.cover || '',
   query: item?.query || makeQuery(item?.title, item?.artist),
   videoId: item?.videoId || null,
+  source: item?.source || null,
+  sourceId: item?.sourceId || null,
   audioSrc: item?.audioSrc || '',
   audioExt: item?.audioExt || 'm4a',
   filename: item?.filename || '',
@@ -424,7 +535,7 @@ const normalizeLocalLibraryPayload = (payload) => ({
   duplicateTracks: Number(payload?.duplicateTracks || 0),
   totalSize: Number(payload?.totalSize || 0),
   items: Array.isArray(payload?.items) ? payload.items.map((item) => ({
-    key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+    key: getItemTrackKey(item),
     title: item?.title || '',
     artist: item?.artist || '',
     cover: item?.cover || '',
@@ -433,6 +544,8 @@ const normalizeLocalLibraryPayload = (payload) => ({
     sourceUrl: item?.sourceUrl || '',
     query: item?.query || makeQuery(item?.title, item?.artist),
     videoId: item?.videoId || null,
+    source: item?.source || null,
+    sourceId: item?.sourceId || null,
     downloadedAt: item?.downloadedAt || '',
     fileSize: Number(item?.fileSize || 0),
     offlineUrl: item?.offlineUrl || '',
@@ -456,7 +569,7 @@ const waitWithAbort = (ms, signal) => new Promise((resolve, reject) => {
 });
 
 const buildLibraryRecord = (item, timestampField) => {
-  const key = item?.key || trackKey(item?.videoId, item?.title, item?.artist);
+  const key = getItemTrackKey(item);
   const timestamp = item?.[timestampField] || item?.savedAt || item?.playedAt || new Date().toISOString();
 
   return {
@@ -466,6 +579,8 @@ const buildLibraryRecord = (item, timestampField) => {
     cover: item?.cover || '',
     query: item?.query || makeQuery(item?.title, item?.artist),
     videoId: item?.videoId || null,
+    source: item?.source || null,
+    sourceId: item?.sourceId || null,
     savedAt: timestampField === 'savedAt' ? timestamp : (item?.savedAt || null),
     playedAt: timestampField === 'playedAt' ? timestamp : (item?.playedAt || null),
   };
@@ -515,6 +630,7 @@ function App() {
   const [favorites, setFavorites] = useState(() => readStorage(FAVORITES_STORAGE_KEY, []).map(toFavoriteRecord));
   const [recentSearches, setRecentSearches] = useState([]);
   const [downloadHistory, setDownloadHistory] = useState(() => readStorage(DOWNLOAD_HISTORY_STORAGE_KEY, []).map(normalizeDownloadHistoryItem));
+  const [sourceMode, setSourceMode] = useState(readSourceModeStorage);
   const [downloadTasks, setDownloadTasks] = useState(() => readStorage(DOWNLOAD_CENTER_STORAGE_KEY, []).map((item) => {
     const task = normalizeDownloadTask(item);
     if (task.status === 'downloading' || task.status === 'resolving') {
@@ -635,7 +751,11 @@ function App() {
 
     const data = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(data?.detail || `request_failed_${response.status}`);
+      const detail = data?.detail;
+      const message = typeof detail === 'string'
+        ? detail
+        : detail?.message || detail?.detail || `request_failed_${response.status}`;
+      throw new Error(message);
     }
     return data;
   };
@@ -819,6 +939,19 @@ function App() {
   }, [downloadTasks]);
 
   useEffect(() => {
+    localStorage.setItem(SOURCE_MODE_STORAGE_KEY, sourceMode);
+  }, [sourceMode]);
+
+  useEffect(() => {
+    const handleRuntimeError = (event) => {
+      console.warn('[NAS] runtime error captured by boot diagnostics', event?.detail || {});
+      setNoticeText('运行异常已写入诊断日志');
+    };
+    window.addEventListener('nas:runtime-error', handleRuntimeError);
+    return () => window.removeEventListener('nas:runtime-error', handleRuntimeError);
+  }, []);
+
+  useEffect(() => {
     void refreshLibraryState({ bootstrapLocal: true });
   }, []);
 
@@ -893,7 +1026,7 @@ function App() {
 
   // --- Helpers (Defined before use in hooks/renders) ---
   const isFavoriteItem = (item) => {
-    const key = trackKey(item.videoId, item.title, item.artist);
+    const key = getItemTrackKey(item);
     return favorites.some((fav) => fav.key === key);
   };
 
@@ -954,14 +1087,34 @@ function App() {
   const resolveDownloadPlan = async (item) => {
     let downloadUrl = item.audioSrc;
     let audioExt = item.audioExt || 'm4a';
+    const sourceRequest = buildSourceRequest(item, sourceMode);
+    let resolvedIdentity = {
+      videoId: sourceRequest.videoId || item.videoId || null,
+      source: sourceRequest.source || item.source || null,
+      sourceId: sourceRequest.sourceId || item.sourceId || null,
+      key: sourceRequest.trackKey || item.key || item.trackKey || '',
+    };
     if (!downloadUrl) {
       const query = item.query || makeQuery(item.title, item.artist);
       const data = await apiRequest('/visualize', {
         method: 'POST',
-        body: JSON.stringify({ query, videoId: item.videoId || null }),
+        body: JSON.stringify({
+          query,
+          videoId: sourceRequest.videoId || null,
+          source: sourceRequest.source || null,
+          sourceId: sourceRequest.sourceId || null,
+          trackKey: sourceRequest.trackKey || null,
+          sourceMode: sourceRequest.sourceMode || null,
+        }),
       });
       downloadUrl = data.audioSrc;
       audioExt = data.audioExt || audioExt;
+      resolvedIdentity = {
+        videoId: data.videoId || item.videoId || null,
+        source: data.source || item.source || null,
+        sourceId: data.sourceId || item.sourceId || null,
+        key: data.trackKey || item.key || item.trackKey || '',
+      };
     }
 
     if (!downloadUrl) throw new Error('未能解析到可下载音源');
@@ -982,6 +1135,7 @@ function App() {
       filename,
       rawUrl,
       audioExt: normalizedExt,
+      ...resolvedIdentity,
     };
   };
 
@@ -1005,6 +1159,10 @@ function App() {
         filename: plan.filename,
         sourceUrl: plan.rawUrl,
         audioExt: plan.audioExt,
+        videoId: plan.videoId,
+        source: plan.source,
+        sourceId: plan.sourceId,
+        key: plan.key || task.key,
       });
       let downloadedAt = new Date().toISOString();
       let savedPath = '';
@@ -1017,7 +1175,7 @@ function App() {
         const createdJob = await apiRequest('/download-jobs', {
           method: 'POST',
           body: JSON.stringify({
-            key: task.key || trackKey(task.videoId, task.title, task.artist),
+            key: task.key || getItemTrackKey(task),
             title: task.title || '',
             artist: task.artist || '',
             filename: plan.filename,
@@ -1117,12 +1275,14 @@ function App() {
       });
 
       const historyEntry = {
-        key: task.key || trackKey(task.videoId, task.title, task.artist),
+        key: plan.key || task.key || getItemTrackKey(task),
         title: task.title || '',
         artist: task.artist || '',
         cover: task.cover || '',
         query: task.query || makeQuery(task.title, task.artist),
-        videoId: task.videoId || null,
+        videoId: plan.videoId || task.videoId || null,
+        source: plan.source || task.source || null,
+        sourceId: plan.sourceId || task.sourceId || null,
         filename: resolvedFilename,
         sourceUrl: plan.rawUrl,
         savedPath,
@@ -1357,6 +1517,8 @@ function App() {
   const runSearch = async (overrideQuery) => {
     const q = normalizeSearchQuery(typeof overrideQuery === 'string' ? overrideQuery : queryText);
     if (!q) return;
+    const activeSourceMode = normalizeSourceMode(sourceMode);
+    const searchCacheKey = `${activeSourceMode}:${q}`;
     if (typeof overrideQuery === 'string') {
       setQuerySong(q);
       setQueryArtist('');
@@ -1364,9 +1526,9 @@ function App() {
     setSearchRan(true);
     setActivePage('search');
 
-    if (searchCache.has(q)) {
+    if (searchCache.has(searchCacheKey)) {
       setSearching(false);
-      setSearchResults(searchCache.get(q));
+      setSearchResults(searchCache.get(searchCacheKey));
       rememberRecentSearch(q);
       void apiRequest('/library/searches', {
         method: 'POST',
@@ -1382,11 +1544,15 @@ function App() {
     try {
       const data = await apiRequest('/search', {
         method: 'POST',
-        body: JSON.stringify({ query: q, limit: 12 }),
+        body: JSON.stringify({
+          query: q,
+          limit: 12,
+          source: activeSourceMode === 'auto' ? null : activeSourceMode,
+        }),
       });
       const results = Array.isArray(data.results) ? data.results : [];
       setSearchResults(results);
-      searchCache.set(q, results);
+      searchCache.set(searchCacheKey, results);
       rememberRecentSearch(q);
       void apiRequest('/library/searches', {
         method: 'POST',
@@ -1413,7 +1579,10 @@ function App() {
   const resolveAndPlay = async (candidate, options = {}) => {
     const { queue = null, index = -1 } = options;
     const query = candidate.query || makeQuery(candidate.title, candidate.artist);
-    const cacheKey = candidate.videoId ? `vid:${candidate.videoId}` : `query:${normalizeSearchQuery(query)}`;
+    const candidateKey = getItemTrackKey(candidate);
+    const activeSourceMode = normalizeSourceMode(sourceMode);
+    const sourceRequest = buildSourceRequest(candidate, activeSourceMode);
+    const cacheKey = candidateKey ? `track:${activeSourceMode}:${candidateKey}` : `query:${activeSourceMode}:${normalizeSearchQuery(query)}`;
     const cached = visualizeCache.get(cacheKey);
     const cachedData = cached && (Date.now() - cached.cachedAt) < VISUALIZE_CACHE_TTL_MS ? cached.payload : null;
 
@@ -1423,16 +1592,23 @@ function App() {
     try {
       const data = cachedData || await apiRequest('/visualize', {
         method: 'POST',
-        body: JSON.stringify({ query, videoId: candidate.videoId || null }),
+        body: JSON.stringify({
+          query,
+          videoId: sourceRequest.videoId || null,
+          source: sourceRequest.source || null,
+          sourceId: sourceRequest.sourceId || null,
+          trackKey: sourceRequest.trackKey || null,
+          sourceMode: sourceRequest.sourceMode || null,
+        }),
       });
       if (!cachedData) {
         visualizeCache.set(cacheKey, { payload: data, cachedAt: Date.now() });
-        if (data?.videoId) {
-          visualizeCache.set(`vid:${data.videoId}`, { payload: data, cachedAt: Date.now() });
+        if (data?.trackKey) {
+          visualizeCache.set(`track:${activeSourceMode}:${data.trackKey}`, { payload: data, cachedAt: Date.now() });
         }
       }
       const resolved = {
-        key: trackKey(data.videoId || candidate.videoId, data.title || candidate.title, data.artist || candidate.artist),
+        key: data.trackKey || candidate.trackKey || candidate.key || trackKey(data.videoId || candidate.videoId, data.title || candidate.title, data.artist || candidate.artist, data.source || candidate.source, data.sourceId || candidate.sourceId),
         title: data.title || candidate.title,
         artist: data.artist || candidate.artist,
         cover: data.cover || candidate.cover,
@@ -1442,8 +1618,12 @@ function App() {
         proxyAudioSrc: resolveAudioUrl(data.proxyAudioSrc || ''),
         audioExt: data.audioExt || candidate.audioExt || null,
         videoId: data.videoId || candidate.videoId || null,
+        source: data.source || candidate.source || null,
+        sourceId: data.sourceId || candidate.sourceId || null,
         query: data.query || query,
         streamMode: data.streamMode || 'direct',
+        fallbackReason: data.fallbackReason || 'none',
+        fallbackTrace: Array.isArray(data.fallbackTrace) ? data.fallbackTrace : [],
       };
 
       playbackMetricsRef.current = {
@@ -1454,6 +1634,10 @@ function App() {
       setCurrentTime(0);
       setDuration(0);
       setIsPlaying(false);
+      const fallbackNotice = formatFallbackNotice(resolved.fallbackTrace, resolved.source);
+      if (fallbackNotice && !cachedData) {
+        setNoticeText(fallbackNotice);
+      }
 
       if (queue) {
         setPlayQueue(queue);
@@ -1467,6 +1651,8 @@ function App() {
         cover: resolved.cover,
         query: resolved.query,
         videoId: resolved.videoId,
+        source: resolved.source,
+        sourceId: resolved.sourceId,
         playedAt: new Date().toISOString(),
       });
       setHistoryItems((prev) => mergeLibraryRecords([historyEntry], prev, 50, 'playedAt'));
@@ -1478,8 +1664,12 @@ function App() {
       // Auto play
       window.setTimeout(() => {
         if (audioRef.current) {
-          audioRef.current.play();
-          setIsPlaying(true);
+          audioRef.current.play().then(() => {
+            setIsPlaying(true);
+          }).catch(() => {
+            setIsPlaying(false);
+            setNoticeText('请点击播放按钮');
+          });
         }
       }, cachedData ? 24 : 80);
 
@@ -1500,7 +1690,7 @@ function App() {
 
     const { queue = null, index = -1 } = options;
     const resolved = {
-      key: item.key || trackKey(item.videoId, item.title, item.artist),
+      key: item.key || getItemTrackKey(item),
       title: item.title || item.filename || '本地音频',
       artist: item.artist || '本地文件',
       cover: item.cover || '',
@@ -1510,6 +1700,8 @@ function App() {
       proxyAudioSrc: '',
       audioExt: item.filename?.split('.').pop() || 'm4a',
       videoId: item.videoId || null,
+      source: item.source || 'local',
+      sourceId: item.sourceId || item.savedPath || null,
       query: item.query || makeQuery(item.title, item.artist),
       streamMode: 'local',
     };
@@ -1535,6 +1727,8 @@ function App() {
       cover: resolved.cover,
       query: resolved.query,
       videoId: resolved.videoId,
+      source: resolved.source,
+      sourceId: resolved.sourceId,
       playedAt: new Date().toISOString(),
     });
     setHistoryItems((prev) => mergeLibraryRecords([historyEntry], prev, 50, 'playedAt'));
@@ -1794,6 +1988,27 @@ function App() {
   const completedDownloadCount = downloadTasks.filter((taskItem) => taskItem.status === 'completed').length;
   const duplicateLibraryItems = localLibrary.items.filter((item) => item.duplicateCount > 1);
   const recentLocalItems = localLibrary.items.slice(0, 8);
+  const activeSourceMode = normalizeSourceMode(sourceMode);
+  const sourceModeLabel = formatSearchProviderLabel(activeSourceMode);
+
+  const renderSourceModeSelector = (extraClassName = '') => (
+    <div className={`flex items-center gap-1 ${extraClassName}`}>
+      {SOURCE_MODE_OPTIONS.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          onClick={() => setSourceMode(option.id)}
+          className={`h-7 px-2.5 rounded-md border text-[11px] font-semibold transition-colors ${
+            activeSourceMode === option.id
+              ? 'bg-white text-slate-950 border-white'
+              : 'bg-white/5 text-white/55 border-white/10 hover:text-white hover:bg-white/10'
+          }`}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
 
   if (isMiniMode) {
     return (
@@ -1915,6 +2130,11 @@ function App() {
               if (e.key === 'Enter') runSearch();
             }}
           />
+        </div>
+
+        <div className="px-2 mb-4">
+          <div className="text-[10px] uppercase tracking-[0.18em] text-white/35 mb-2">音源</div>
+          {renderSourceModeSelector('flex-wrap')}
         </div>
 
         <nav className="nav-group mb-4">
@@ -2061,9 +2281,15 @@ function App() {
 
           {activePage === 'search' && (
             <div>
-              <h2 className="section-title">
-                {searching ? '正在搜寻宇宙中的频率...' : (searchResults.length > 0 ? `找到 ${searchResults.length} 个匹配项` : '准备好开始你的搜索')}
-              </h2>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between mb-6">
+                <div>
+                  <h2 className="section-title !mb-1">
+                    {searching ? '正在搜寻宇宙中的频率...' : (searchResults.length > 0 ? `找到 ${searchResults.length} 个匹配项` : '准备好开始你的搜索')}
+                  </h2>
+                  <p className="text-xs text-white/45">当前音源：{sourceModeLabel}</p>
+                </div>
+                {renderSourceModeSelector('justify-start sm:justify-end')}
+              </div>
               {searchResults.length > 0 ? (
                 <div className="card-grid">
                   {searchResults.map((item, idx) => renderCard(
@@ -2516,7 +2742,7 @@ function App() {
                   <div>
                     <h4 className="flex items-center gap-2 text-slate-100"><ShieldCheck size={18} /> 搜索 / 网络诊断</h4>
                     <p className="text-sm text-slate-400 mt-2">
-                      用来判断“搜不到歌”到底是版本问题、网络问题，还是代理没有生效。
+                      用来判断“搜不到歌”到底是国内音源、兜底源、网络，还是代理设置出了问题。
                     </p>
                   </div>
                   <div className="text-xs text-white/35">
@@ -2609,7 +2835,7 @@ function App() {
                   </>
                 ) : (
                   <div className="mt-5 rounded-2xl border border-white/8 bg-black/20 p-5 text-sm text-white/45">
-                    点击“刷新诊断”后，会立刻测试 YouTube / YT Music 是否可达，并跑一次真实搜索探针。
+                    点击“刷新诊断”后，会立刻测试 QQ 音乐、YouTube / YT Music 与歌词源是否可达，并跑一次真实搜索探针。
                   </div>
                 )}
               </div>
@@ -2631,7 +2857,7 @@ function App() {
                     <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">托盘菜单：`显示 NAS` / `隐藏 NAS` / `沉浸式全屏`</div>
                     <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">启动即全屏：`start-desktop.bat --fullscreen`</div>
                     <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`Ctrl + Alt + M`：切换迷你播放器</div>
-                    <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">如果朋友反馈无法搜索，先进入这里看网络诊断，再决定是否需要代理。</div>
+                    <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">如果朋友反馈无法搜索，先进入这里看音源诊断，再决定是否需要代理。</div>
                   </div>
                 </div>
               </div>
@@ -2833,6 +3059,10 @@ function App() {
         </div>
 
         <div className="right-controls">
+          <div className="hidden 2xl:flex flex-col items-end gap-1">
+            <span className="text-[10px] uppercase tracking-[0.16em] text-white/30">音源 · {sourceModeLabel}</span>
+            {renderSourceModeSelector('justify-end')}
+          </div>
           <div className="flex items-center gap-3 w-32">
             <Volume2 size={18} className="text-slate-500" />
             <div className="progress-bar flex-1">
