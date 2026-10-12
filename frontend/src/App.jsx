@@ -34,15 +34,30 @@ import {
   FolderDown,
   FolderOpen,
   HardDrive,
+  SlidersHorizontal,
+  Shuffle,
+  Repeat,
 } from 'lucide-react';
 
 import VibeOverlay from './components/VibeOverlay';
+import QueuePanel from './components/QueuePanel';
+import AudioEffectsPanel from './components/AudioEffectsPanel';
+import { AudioEffectsEngine, AUDIO_EFFECTS } from './audio/effects';
+import { emptyQueue, queueReducer, queueIndexOf, currentQueueItem, peekNext, queueSession } from './player/queue';
+import { readSearchStream } from './player/stream';
 
 const HISTORY_STORAGE_KEY = 'nsrl_local_history_v2';
 const FAVORITES_STORAGE_KEY = 'nsrl_local_favorites_v2';
 const LIBRARY_MIGRATION_KEY = 'nas_library_db_migrated_v1';
 const DOWNLOAD_HISTORY_STORAGE_KEY = 'nas_recent_downloads_v1';
 const DOWNLOAD_CENTER_STORAGE_KEY = 'nas_download_center_v1';
+const SOURCE_MODE_STORAGE_KEY = 'nas_source_mode_v1';
+
+const SOURCE_MODE_OPTIONS = [
+  { id: 'auto', label: '综合' },
+  { id: 'qqmusic', label: 'QQ 音乐' },
+  { id: 'youtube', label: 'YouTube' },
+];
 
 const NAV_ITEMS = [
   { id: 'search', label: '搜索', icon: Search },
@@ -262,7 +277,92 @@ const handleCoverError = (event, song, artist) => {
   event.currentTarget.src = nextCover;
 };
 
-const recommendationIdentity = (item) => item?.videoId ? `vid:${item.videoId}` : `${(item?.title || '').trim().toLowerCase()}::${(item?.artist || '').trim().toLowerCase()}`;
+const normalizeSource = (value, videoId = '', sourceId = '') => {
+  const source = (value || '').trim().toLowerCase();
+  if (source === 'qqmusic' || source === 'youtube' || source === 'local') return source;
+  if (videoId) return 'youtube';
+  if (sourceId) return 'qqmusic';
+  return '';
+};
+
+const normalizeSourceMode = (value) => {
+  const mode = (value || '').trim().toLowerCase();
+  return SOURCE_MODE_OPTIONS.some((option) => option.id === mode) ? mode : 'auto';
+};
+
+const readSourceModeStorage = () => {
+  try {
+    return normalizeSourceMode(localStorage.getItem(SOURCE_MODE_STORAGE_KEY));
+  } catch {
+    return 'auto';
+  }
+};
+
+const trackKey = (videoId, title, artist, source = '', sourceId = '') => {
+  const normalizedSource = normalizeSource(source, videoId, sourceId);
+  const normalizedSourceId = (sourceId || (normalizedSource === 'youtube' ? videoId : '') || '').trim();
+  if (normalizedSource && normalizedSourceId) return `${normalizedSource}:${normalizedSourceId}`;
+  return `${(title || '').trim().toLowerCase()}::${(artist || '').trim().toLowerCase()}`;
+};
+
+const getItemTrackKey = (item) => {
+  if (item?.key && !item?.trackKey && !item?.videoId && !item?.sourceId && !item?.source) return item.key;
+  const computedKey = item?.trackKey || trackKey(
+    item?.videoId,
+    item?.title,
+    item?.artist,
+    item?.source,
+    item?.sourceId || (item?.source === 'local' ? item?.savedPath : ''),
+  );
+  return computedKey || item?.key || '';
+};
+
+const buildSourceRequest = (item, sourceMode = 'auto') => {
+  const mode = normalizeSourceMode(sourceMode);
+  const itemSource = normalizeSource(item?.source, item?.videoId, item?.sourceId || '');
+  const itemTrackKey = item?.trackKey || item?.key || null;
+
+  if (itemSource === 'local') {
+    return {
+      source: 'local',
+      sourceId: item?.sourceId || item?.savedPath || null,
+      videoId: item?.videoId || null,
+      trackKey: itemTrackKey,
+      sourceMode: null,
+    };
+  }
+
+  if (mode === 'qqmusic') {
+    return {
+      source: 'qqmusic',
+      sourceId: itemSource === 'qqmusic' ? item?.sourceId || null : null,
+      videoId: null,
+      trackKey: itemSource === 'qqmusic' ? itemTrackKey : null,
+      sourceMode: 'qqmusic',
+    };
+  }
+
+  if (mode === 'youtube') {
+    const youtubeId = itemSource === 'youtube' ? item?.sourceId || item?.videoId || null : null;
+    return {
+      source: 'youtube',
+      sourceId: youtubeId,
+      videoId: youtubeId,
+      trackKey: itemSource === 'youtube' ? itemTrackKey : null,
+      sourceMode: 'youtube',
+    };
+  }
+
+  return {
+    source: itemSource || null,
+    sourceId: item?.sourceId || null,
+    videoId: item?.videoId || null,
+    trackKey: itemTrackKey,
+    sourceMode: null,
+  };
+};
+
+const recommendationIdentity = (item) => getItemTrackKey(item);
 
 const buildFallbackRecommendations = () => ({
   mode: 'fallback',
@@ -284,6 +384,9 @@ const normalizeRecommendationItem = (item) => ({
   cover: item?.cover || '',
   query: item?.query || makeQuery(item?.title, item?.artist),
   videoId: item?.videoId || '',
+  source: item?.source || null,
+  sourceId: item?.sourceId || null,
+  trackKey: item?.trackKey || item?.key || trackKey(item?.videoId, item?.title, item?.artist, item?.source, item?.sourceId),
   duration: item?.duration ?? null,
   durationText: item?.durationText || null,
 });
@@ -313,7 +416,6 @@ const formatTime = (seconds) => {
 };
 
 const makeQuery = (song, artist) => [song?.trim(), artist?.trim()].filter(Boolean).join(' ').trim();
-const trackKey = (videoId, title, artist) => videoId ? `vid:${videoId}` : `${(title || '').trim().toLowerCase()}::${(artist || '').trim().toLowerCase()}`;
 const downloadTaskId = () => `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 const formatBytes = (bytes) => {
@@ -359,6 +461,8 @@ const formatProxyMode = (value) => {
 const formatSearchProviderLabel = (value) => {
   const mapping = {
     auto: '自动',
+    qqmusic: 'QQ 音乐',
+    youtube: 'YouTube',
     ytmusicapi: 'YT Music',
     legacy_ytdlp: 'yt-dlp',
     youtube_data_api: 'YouTube Data API',
@@ -366,8 +470,19 @@ const formatSearchProviderLabel = (value) => {
   return mapping[value] || value || '未知';
 };
 
+const formatFallbackNotice = (trace = [], resolvedSource = '') => {
+  if (!Array.isArray(trace) || trace.length === 0) return '';
+  const lastReason = trace[trace.length - 1]?.reason || '';
+  if (resolvedSource === 'youtube') return 'QQ 音乐当前版本不可播，已自动切换 YouTube 兜底';
+  if (lastReason === 'http_403' || lastReason === 'stale_vkey') return '播放地址失效，已自动刷新并切换可用版本';
+  if (lastReason === 'preview_only') return 'QQ 音乐仅返回试听片段，已自动尝试其他版本';
+  if (lastReason === 'vip_required') return '该曲可能需要会员权益，已自动尝试其他版本';
+  if (lastReason === 'copyright_restricted') return '该曲版权受限，已自动尝试其他版本';
+  return '已自动切换到可播放音源';
+};
+
 const normalizeDownloadHistoryItem = (item) => ({
-  key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+  key: getItemTrackKey(item),
   title: item?.title || '',
   artist: item?.artist || '',
   filename: item?.filename || '',
@@ -376,6 +491,8 @@ const normalizeDownloadHistoryItem = (item) => ({
   cover: item?.cover || '',
   query: item?.query || makeQuery(item?.title, item?.artist),
   videoId: item?.videoId || null,
+  source: item?.source || null,
+  sourceId: item?.sourceId || null,
   downloadedAt: item?.downloadedAt || new Date().toISOString(),
 });
 
@@ -395,12 +512,14 @@ const mergeDownloadHistory = (primary, secondary, limit = 30) => {
 
 const normalizeDownloadTask = (item) => ({
   id: item?.id || downloadTaskId(),
-  key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+  key: getItemTrackKey(item),
   title: item?.title || '',
   artist: item?.artist || '',
   cover: item?.cover || '',
   query: item?.query || makeQuery(item?.title, item?.artist),
   videoId: item?.videoId || null,
+  source: item?.source || null,
+  sourceId: item?.sourceId || null,
   audioSrc: item?.audioSrc || '',
   audioExt: item?.audioExt || 'm4a',
   filename: item?.filename || '',
@@ -424,7 +543,7 @@ const normalizeLocalLibraryPayload = (payload) => ({
   duplicateTracks: Number(payload?.duplicateTracks || 0),
   totalSize: Number(payload?.totalSize || 0),
   items: Array.isArray(payload?.items) ? payload.items.map((item) => ({
-    key: item?.key || trackKey(item?.videoId, item?.title, item?.artist),
+    key: getItemTrackKey(item),
     title: item?.title || '',
     artist: item?.artist || '',
     cover: item?.cover || '',
@@ -433,6 +552,8 @@ const normalizeLocalLibraryPayload = (payload) => ({
     sourceUrl: item?.sourceUrl || '',
     query: item?.query || makeQuery(item?.title, item?.artist),
     videoId: item?.videoId || null,
+    source: item?.source || null,
+    sourceId: item?.sourceId || null,
     downloadedAt: item?.downloadedAt || '',
     fileSize: Number(item?.fileSize || 0),
     offlineUrl: item?.offlineUrl || '',
@@ -456,7 +577,7 @@ const waitWithAbort = (ms, signal) => new Promise((resolve, reject) => {
 });
 
 const buildLibraryRecord = (item, timestampField) => {
-  const key = item?.key || trackKey(item?.videoId, item?.title, item?.artist);
+  const key = getItemTrackKey(item);
   const timestamp = item?.[timestampField] || item?.savedAt || item?.playedAt || new Date().toISOString();
 
   return {
@@ -466,6 +587,8 @@ const buildLibraryRecord = (item, timestampField) => {
     cover: item?.cover || '',
     query: item?.query || makeQuery(item?.title, item?.artist),
     videoId: item?.videoId || null,
+    source: item?.source || null,
+    sourceId: item?.sourceId || null,
     savedAt: timestampField === 'savedAt' ? timestamp : (item?.savedAt || null),
     playedAt: timestampField === 'playedAt' ? timestamp : (item?.playedAt || null),
   };
@@ -508,13 +631,36 @@ function App() {
 
   const [resolvingTrack, setResolvingTrack] = useState(false);
   const [track, setTrack] = useState(null);
-  const [playQueue, setPlayQueue] = useState([]);
-  const [queueIndex, setQueueIndex] = useState(-1);
+  const [queueState, setQueueState] = useState(emptyQueue);
+  const queueRef = useRef(queueState);
+  const playQueue = queueState.items;
+  const queueIndex = queueIndexOf(queueState);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [effectsOpen, setEffectsOpen] = useState(false);
+  const [effectPreset, setEffectPreset] = useState('off');
+  const effectRef = useRef('off');
+  const [effectStatus, setEffectStatus] = useState('原声');
+  const [sourcePicker, setSourcePicker] = useState(null);
+  const [searchProviders, setSearchProviders] = useState([]);
+  const intentRef = useRef(0);
+  const resolveAbortRef = useRef(null);
+  const searchAbortRef = useRef(null);
+  const audioEngineRef = useRef(null);
+  const pendingResumeRef = useRef(0);
+  const sessionReadyRef = useRef(false);
+  const sessionSnapshotRef = useRef(null);
+  const sessionSaveRef = useRef(Promise.resolve());
+  const sessionWriteRevisionRef = useRef(0);
+  const prepareRef = useRef(new Map());
+  const prepareAbortRef = useRef(null);
+  const recoveryRef = useRef(new Set());
+  const recoveryPositionRef = useRef(0);
 
   const [historyItems, setHistoryItems] = useState(() => readStorage(HISTORY_STORAGE_KEY, []).map(toHistoryRecord));
   const [favorites, setFavorites] = useState(() => readStorage(FAVORITES_STORAGE_KEY, []).map(toFavoriteRecord));
   const [recentSearches, setRecentSearches] = useState([]);
   const [downloadHistory, setDownloadHistory] = useState(() => readStorage(DOWNLOAD_HISTORY_STORAGE_KEY, []).map(normalizeDownloadHistoryItem));
+  const [sourceMode, setSourceMode] = useState(readSourceModeStorage);
   const [downloadTasks, setDownloadTasks] = useState(() => readStorage(DOWNLOAD_CENTER_STORAGE_KEY, []).map((item) => {
     const task = normalizeDownloadTask(item);
     if (task.status === 'downloading' || task.status === 'resolving') {
@@ -635,7 +781,11 @@ function App() {
 
     const data = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(data?.detail || `request_failed_${response.status}`);
+      const detail = data?.detail;
+      const message = typeof detail === 'string'
+        ? detail
+        : detail?.message || detail?.detail || `request_failed_${response.status}`;
+      throw new Error(message);
     }
     return data;
   };
@@ -819,6 +969,19 @@ function App() {
   }, [downloadTasks]);
 
   useEffect(() => {
+    localStorage.setItem(SOURCE_MODE_STORAGE_KEY, sourceMode);
+  }, [sourceMode]);
+
+  useEffect(() => {
+    const handleRuntimeError = (event) => {
+      console.warn('[NAS] runtime error captured by boot diagnostics', event?.detail || {});
+      setNoticeText('运行异常已写入诊断日志');
+    };
+    window.addEventListener('nas:runtime-error', handleRuntimeError);
+    return () => window.removeEventListener('nas:runtime-error', handleRuntimeError);
+  }, []);
+
+  useEffect(() => {
     void refreshLibraryState({ bootstrapLocal: true });
   }, []);
 
@@ -893,7 +1056,7 @@ function App() {
 
   // --- Helpers (Defined before use in hooks/renders) ---
   const isFavoriteItem = (item) => {
-    const key = trackKey(item.videoId, item.title, item.artist);
+    const key = getItemTrackKey(item);
     return favorites.some((fav) => fav.key === key);
   };
 
@@ -954,14 +1117,34 @@ function App() {
   const resolveDownloadPlan = async (item) => {
     let downloadUrl = item.audioSrc;
     let audioExt = item.audioExt || 'm4a';
+    const sourceRequest = buildSourceRequest(item, sourceMode);
+    let resolvedIdentity = {
+      videoId: sourceRequest.videoId || item.videoId || null,
+      source: sourceRequest.source || item.source || null,
+      sourceId: sourceRequest.sourceId || item.sourceId || null,
+      key: sourceRequest.trackKey || item.key || item.trackKey || '',
+    };
     if (!downloadUrl) {
       const query = item.query || makeQuery(item.title, item.artist);
       const data = await apiRequest('/visualize', {
         method: 'POST',
-        body: JSON.stringify({ query, videoId: item.videoId || null }),
+        body: JSON.stringify({
+          query,
+          videoId: sourceRequest.videoId || null,
+          source: sourceRequest.source || null,
+          sourceId: sourceRequest.sourceId || null,
+          trackKey: sourceRequest.trackKey || null,
+          sourceMode: sourceRequest.sourceMode || null,
+        }),
       });
       downloadUrl = data.audioSrc;
       audioExt = data.audioExt || audioExt;
+      resolvedIdentity = {
+        videoId: data.videoId || item.videoId || null,
+        source: data.source || item.source || null,
+        sourceId: data.sourceId || item.sourceId || null,
+        key: data.trackKey || item.key || item.trackKey || '',
+      };
     }
 
     if (!downloadUrl) throw new Error('未能解析到可下载音源');
@@ -982,6 +1165,7 @@ function App() {
       filename,
       rawUrl,
       audioExt: normalizedExt,
+      ...resolvedIdentity,
     };
   };
 
@@ -1005,6 +1189,10 @@ function App() {
         filename: plan.filename,
         sourceUrl: plan.rawUrl,
         audioExt: plan.audioExt,
+        videoId: plan.videoId,
+        source: plan.source,
+        sourceId: plan.sourceId,
+        key: plan.key || task.key,
       });
       let downloadedAt = new Date().toISOString();
       let savedPath = '';
@@ -1017,7 +1205,7 @@ function App() {
         const createdJob = await apiRequest('/download-jobs', {
           method: 'POST',
           body: JSON.stringify({
-            key: task.key || trackKey(task.videoId, task.title, task.artist),
+            key: task.key || getItemTrackKey(task),
             title: task.title || '',
             artist: task.artist || '',
             filename: plan.filename,
@@ -1117,12 +1305,14 @@ function App() {
       });
 
       const historyEntry = {
-        key: task.key || trackKey(task.videoId, task.title, task.artist),
+        key: plan.key || task.key || getItemTrackKey(task),
         title: task.title || '',
         artist: task.artist || '',
         cover: task.cover || '',
         query: task.query || makeQuery(task.title, task.artist),
-        videoId: task.videoId || null,
+        videoId: plan.videoId || task.videoId || null,
+        source: plan.source || task.source || null,
+        sourceId: plan.sourceId || task.sourceId || null,
         filename: resolvedFilename,
         sourceUrl: plan.rawUrl,
         savedPath,
@@ -1215,7 +1405,8 @@ function App() {
 
   useEffect(() => {
     if (!audioRef.current) return;
-    audioRef.current.volume = volume;
+    if (audioEngineRef.current) { audioRef.current.volume = 1; audioEngineRef.current.setVolume(volume); }
+    else audioRef.current.volume = volume;
   }, [volume]);
 
   const currentIsFavorite = useMemo(() => {
@@ -1357,199 +1548,129 @@ function App() {
   const runSearch = async (overrideQuery) => {
     const q = normalizeSearchQuery(typeof overrideQuery === 'string' ? overrideQuery : queryText);
     if (!q) return;
-    if (typeof overrideQuery === 'string') {
-      setQuerySong(q);
-      setQueryArtist('');
-    }
-    setSearchRan(true);
-    setActivePage('search');
-
-    if (searchCache.has(q)) {
-      setSearching(false);
-      setSearchResults(searchCache.get(q));
-      rememberRecentSearch(q);
-      void apiRequest('/library/searches', {
-        method: 'POST',
-        body: JSON.stringify({ query: q, searchedAt: new Date().toISOString() }),
-      }).then(() => {
-        void refreshLibraryState();
-      }).catch(() => {});
-      return;
-    }
-
-    setSearchResults([]);
-    setSearching(true);
+    searchAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
+    const mode = normalizeSourceMode(sourceMode);
+    const key = `${mode}:${q}`;
+    if (typeof overrideQuery === 'string') { setQuerySong(q); setQueryArtist(''); }
+    setSearchRan(true); setActivePage('search'); setSearchProviders([]);
+    setSearchResults([]); setSearching(true);
     try {
-      const data = await apiRequest('/search', {
-        method: 'POST',
-        body: JSON.stringify({ query: q, limit: 12 }),
-      });
-      const results = Array.isArray(data.results) ? data.results : [];
-      setSearchResults(results);
-      searchCache.set(q, results);
-      rememberRecentSearch(q);
-      void apiRequest('/library/searches', {
-        method: 'POST',
-        body: JSON.stringify({ query: q, searchedAt: new Date().toISOString() }),
-      }).then(() => {
-        void refreshLibraryState();
-      }).catch(() => {});
-      if (results.length === 0) {
-        setNoticeText('没有找到可用音源，试试加上歌手名');
-      }
-    } catch (err) {
-      setSearchResults([]);
-      const message = err instanceof Error ? err.message : '';
-      if (message.includes('Failed to fetch')) {
-        setNoticeText('搜索服务不可用，请检查网络或后端状态');
+      const cached = searchCache.get(key);
+      if (cached && Date.now() - cached.at < 180000) {
+        setSearchResults(cached.results);
+        setSearchProviders(cached.providers || []);
+      } else if (mode === 'auto') {
+        const response = await fetch(apiUrl('/search/stream'), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: q, limit: 12 }), signal: controller.signal,
+        });
+        await readSearchStream(response, (data) => {
+          if (controller.signal.aborted) return;
+          const results = Array.isArray(data.results) ? data.results : [];
+          setSearchResults(results); setSearchProviders(data.providers || []);
+          searchCache.set(key, { results, providers: data.providers || [], at: Date.now() });
+          if (data.errors && Object.keys(data.errors).length) setNoticeText('部分音源暂不可用，已显示可用结果');
+        }, controller.signal);
       } else {
-        setNoticeText('搜索暂时失败，请稍后再试');
+        const data = await apiRequest('/search', { method: 'POST', body: JSON.stringify({ query: q, limit: 12, source: mode }), signal: controller.signal });
+        if (controller.signal.aborted) return;
+        const results = Array.isArray(data.results) ? data.results : [];
+        setSearchResults(results); setSearchProviders([mode]);
+        searchCache.set(key, { results, providers: [mode], at: Date.now() });
       }
-    } finally {
-      setSearching(false);
-    }
+      if (controller.signal.aborted) return;
+      rememberRecentSearch(q);
+      void apiRequest('/library/searches', { method: 'POST', body: JSON.stringify({ query: q, searchedAt: new Date().toISOString() }) }).catch(() => {});
+    } catch (err) {
+      if (err.name !== 'AbortError') setNoticeText('搜索暂时失败，请检查网络后重试');
+    } finally { if (searchAbortRef.current === controller) setSearching(false); }
   };
+
+  const applyQueue = (action) => {
+    const next = queueReducer(queueRef.current, action);
+    queueRef.current = next; setQueueState(next);
+    return next;
+  };
+
+  const ensureAudioEngine = async () => {
+    if (!audioRef.current) return;
+    if (!audioEngineRef.current) audioEngineRef.current = new AudioEffectsEngine({ onError: () => {
+      effectRef.current = 'off'; setEffectPreset('off');
+      setEffectStatus(audioEngineRef.current?.status); setNoticeText('音效处理暂不可用，已切回原声');
+    } });
+    try {
+      await audioEngineRef.current.attach(audioRef.current);
+      audioRef.current.volume = 1;
+      audioEngineRef.current.setVolume(volume);
+      await audioEngineRef.current.resume();
+      await audioEngineRef.current.setPreset(effectRef.current);
+      setEffectStatus(audioEngineRef.current.status);
+    } catch { audioRef.current.volume = volume; }
+  };
+
+  const resolveBody = (candidate) => ({
+    query: candidate.query || makeQuery(candidate.title, candidate.artist),
+    ...buildSourceRequest(candidate, normalizeSourceMode(sourceMode)),
+    title: candidate.title, artist: candidate.artist, duration: candidate.duration || null,
+    fast: true, candidates: candidate.variants?.length ? candidate.variants : [candidate],
+  });
+  const preparedKey = (candidate) => `${normalizeSourceMode(sourceMode)}:${getItemTrackKey(candidate) || candidate.query || makeQuery(candidate.title, candidate.artist)}`;
 
   const resolveAndPlay = async (candidate, options = {}) => {
-    const { queue = null, index = -1 } = options;
-    const query = candidate.query || makeQuery(candidate.title, candidate.artist);
-    const cacheKey = candidate.videoId ? `vid:${candidate.videoId}` : `query:${normalizeSearchQuery(query)}`;
-    const cached = visualizeCache.get(cacheKey);
-    const cachedData = cached && (Date.now() - cached.cachedAt) < VISUALIZE_CACHE_TTL_MS ? cached.payload : null;
-
-    if (!cachedData) {
-      setResolvingTrack(true);
-    }
+    if (!candidate) return;
+    if (!options.recoveryAttempt) recoveryPositionRef.current = 0;
+    const requestId = ++intentRef.current;
+    resolveAbortRef.current?.abort();
+    const controller = new AbortController(); resolveAbortRef.current = controller;
+    let nextState = queueRef.current;
+    if (!options.preserveQueue) nextState = applyQueue({ type: 'replace', items: options.queue || [candidate], index: Math.max(0, options.index || 0) });
+    else if (candidate.entryId) nextState = applyQueue({ type: 'select', id: candidate.entryId });
+    const entryId = nextState.currentId;
+    const startedAt = performance.now();
+    playbackMetricsRef.current = { startedAt, requestId, firstPlayed: false };
+    setResolvingTrack(true);
+    audioRef.current?.pause(); setIsPlaying(false);
+    void ensureAudioEngine();
     try {
-      const data = cachedData || await apiRequest('/visualize', {
-        method: 'POST',
-        body: JSON.stringify({ query, videoId: candidate.videoId || null }),
-      });
-      if (!cachedData) {
-        visualizeCache.set(cacheKey, { payload: data, cachedAt: Date.now() });
-        if (data?.videoId) {
-          visualizeCache.set(`vid:${data.videoId}`, { payload: data, cachedAt: Date.now() });
-        }
+      let data;
+      if (candidate.offlineUrl) data = { ...candidate, audioSrc: candidate.offlineUrl, streamMode: 'local', colors: ['#49dcb1', '#08111d', '#02060c'], theme: 'Offline Session' };
+      else {
+        const key = preparedKey(candidate);
+        const cached = prepareRef.current.get(key);
+        const fresh = cached && Date.now() - cached.at < 45000 && (!cached.data.expiresAt || cached.data.expiresAt * 1000 > Date.now() + 5000);
+        data = fresh && !options.refresh ? cached.data : await apiRequest('/visualize', { method: 'POST', body: JSON.stringify({ ...resolveBody(candidate), refresh: !!options.refresh }), signal: controller.signal });
+        if (requestId !== intentRef.current) return;
+        prepareRef.current.set(key, { data, at: Date.now() });
+        while (prepareRef.current.size > 12) prepareRef.current.delete(prepareRef.current.keys().next().value);
       }
+      if (requestId !== intentRef.current) return;
       const resolved = {
-        key: trackKey(data.videoId || candidate.videoId, data.title || candidate.title, data.artist || candidate.artist),
-        title: data.title || candidate.title,
-        artist: data.artist || candidate.artist,
-        cover: data.cover || candidate.cover,
-        theme: data.theme || 'Vibe Resonating',
-        colors: data.colors || ['#22d3ee', '#000000'],
-        audioSrc: resolveAudioUrl(data.audioSrc),
+        ...candidate, ...data, entryId,
+        key: data.trackKey || candidate.trackKey || candidate.key || getItemTrackKey(data),
+        title: data.title || candidate.title, artist: data.artist || candidate.artist,
+        cover: data.cover || candidate.cover, query: data.query || candidate.query || makeQuery(candidate.title, candidate.artist),
+        sourceId: data.sourceId || candidate.sourceId, videoId: data.videoId || candidate.videoId,
+        audioSrc: resolveAudioUrl(data.proxyAudioSrc || data.audioSrc),
         proxyAudioSrc: resolveAudioUrl(data.proxyAudioSrc || ''),
-        audioExt: data.audioExt || candidate.audioExt || null,
-        videoId: data.videoId || candidate.videoId || null,
-        query: data.query || query,
-        streamMode: data.streamMode || 'direct',
+        variants: candidate.variants || [], requestId, recoveryAttempt: options.recoveryAttempt || 0, resumeAt: Number(options.resumeAt || 0), playIntent: options.autoplay !== false,
       };
-
-      playbackMetricsRef.current = {
-        startedAt: performance.now(),
-        trackKey: resolved.key,
-      };
-      setTrack(resolved);
-      setCurrentTime(0);
-      setDuration(0);
-      setIsPlaying(false);
-
-      if (queue) {
-        setPlayQueue(queue);
-        setQueueIndex(index);
-      }
-
-      const historyEntry = toHistoryRecord({
-        key: resolved.key,
-        title: resolved.title,
-        artist: resolved.artist,
-        cover: resolved.cover,
-        query: resolved.query,
-        videoId: resolved.videoId,
-        playedAt: new Date().toISOString(),
-      });
-      setHistoryItems((prev) => mergeLibraryRecords([historyEntry], prev, 50, 'playedAt'));
-      void apiRequest('/library/history', {
-        method: 'POST',
-        body: JSON.stringify(historyEntry),
+      pendingResumeRef.current = resolved.resumeAt;
+      applyQueue({ type: 'update', id: entryId, item: { source: resolved.source, sourceId: resolved.sourceId, videoId: resolved.videoId, trackKey: resolved.key, key: resolved.key } });
+      playbackMetricsRef.current = { ...playbackMetricsRef.current, trackKey: resolved.key, resolveMs: performance.now() - startedAt };
+      setTrack(resolved); setCurrentTime(resolved.resumeAt); setDuration(0);
+      if (data.fallbackTrace?.length) setNoticeText('原音源不可用，已切换同版本音源');
+      if (!candidate.offlineUrl) void apiRequest('/visualize/appearance', { method: 'POST', body: JSON.stringify({ title: resolved.title, cover: resolved.cover }), signal: controller.signal }).then((appearance) => {
+        if (requestId === intentRef.current) setTrack((prev) => prev?.requestId === requestId ? { ...prev, ...appearance } : prev);
       }).catch(() => {});
-
-      // Auto play
-      window.setTimeout(() => {
-        if (audioRef.current) {
-          audioRef.current.play();
-          setIsPlaying(true);
-        }
-      }, cachedData ? 24 : 80);
-
-    } catch {
-      setNoticeText('加载音频失败，请重试');
-    } finally {
-      if (!cachedData) {
-        setResolvingTrack(false);
-      }
-    }
+    } catch (error) {
+      if (requestId !== intentRef.current || error.name === 'AbortError') return;
+      setTrack(null); setIsPlaying(false); setNoticeText(candidate.offlineUrl ? '本地文件不可用，请重新选择' : '没有找到可播放的同版本音源，请选择其他来源');
+    } finally { if (requestId === intentRef.current) setResolvingTrack(false); }
   };
 
-  const playLocalTrack = (item, options = {}) => {
-    if (!item?.offlineUrl) {
-      setNoticeText('本地文件路径不可用');
-      return;
-    }
-
-    const { queue = null, index = -1 } = options;
-    const resolved = {
-      key: item.key || trackKey(item.videoId, item.title, item.artist),
-      title: item.title || item.filename || '本地音频',
-      artist: item.artist || '本地文件',
-      cover: item.cover || '',
-      theme: 'Offline Session',
-      colors: ['#49dcb1', '#08111d', '#02060c'],
-      audioSrc: resolveAudioUrl(item.offlineUrl),
-      proxyAudioSrc: '',
-      audioExt: item.filename?.split('.').pop() || 'm4a',
-      videoId: item.videoId || null,
-      query: item.query || makeQuery(item.title, item.artist),
-      streamMode: 'local',
-    };
-
-    playbackMetricsRef.current = {
-      startedAt: performance.now(),
-      trackKey: resolved.key,
-    };
-    setTrack(resolved);
-    setCurrentTime(0);
-    setDuration(0);
-    setIsPlaying(false);
-
-    if (queue) {
-      setPlayQueue(queue);
-      setQueueIndex(index);
-    }
-
-    const historyEntry = toHistoryRecord({
-      key: resolved.key,
-      title: resolved.title,
-      artist: resolved.artist,
-      cover: resolved.cover,
-      query: resolved.query,
-      videoId: resolved.videoId,
-      playedAt: new Date().toISOString(),
-    });
-    setHistoryItems((prev) => mergeLibraryRecords([historyEntry], prev, 50, 'playedAt'));
-    void apiRequest('/library/history', {
-      method: 'POST',
-      body: JSON.stringify(historyEntry),
-    }).catch(() => {});
-
-    window.setTimeout(() => {
-      if (audioRef.current) {
-        audioRef.current.load();
-        audioRef.current.play().then(() => setIsPlaying(true)).catch(() => setNoticeText('请点击播放按钮'));
-      }
-    }, 24);
-  };
+  const playLocalTrack = (item, options = {}) => resolveAndPlay(item, options);
 
   const playSceneStation = (station) => {
     const queue = Array.isArray(station?.queue)
@@ -1568,68 +1689,152 @@ function App() {
   };
 
   const handleAudioError = () => {
-    if (!track || !audioRef.current) {
-      setIsPlaying(false);
-      return;
-    }
-
-    const directSource = resolveAudioUrl(track.audioSrc);
-    const proxySource = resolveAudioUrl(track.proxyAudioSrc || '');
-    if (proxySource && directSource !== proxySource) {
-      setNoticeText('直连播放失败，正在切换兼容通道');
-      setTrack((prev) => prev ? {
-        ...prev,
-        audioSrc: proxySource,
-        streamMode: 'proxy',
-      } : prev);
-      window.setTimeout(() => {
-        if (audioRef.current) {
-          audioRef.current.load();
-          audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
-        }
-      }, 60);
-      return;
-    }
-
-    setIsPlaying(false);
-    setNoticeText('音频播放失败，请重试');
+    if (!track || track.requestId !== intentRef.current) return;
+    const recoveryKey = `${track.requestId}:${track.source}:${track.sourceId}`;
+    if (track.offlineUrl || track.recoveryAttempt >= 2 || recoveryRef.current.has(recoveryKey)) { setIsPlaying(false); setNoticeText('音频播放失败，请选择其他音源'); return; }
+    recoveryRef.current.add(recoveryKey);
+    recoveryPositionRef.current = Math.max(recoveryPositionRef.current, audioRef.current?.currentTime || 0, currentTime);
+    const origin = currentQueueItem(queueRef.current) || track;
+    const remaining = (origin.variants || []).filter((v) => getItemTrackKey(v) !== getItemTrackKey(track));
+    // One fresh resolution of the failed URL, followed only by verified alternatives.
+    const retry = track.recoveryAttempt ? remaining[0] : track;
+    if (!retry) { setIsPlaying(false); setNoticeText('没有其他可播放的同版本音源'); return; }
+    const candidate = { ...origin, source: retry.source, sourceId: retry.sourceId, videoId: retry.videoId, variants: remaining };
+    void resolveAndPlay(candidate, { preserveQueue: true, resumeAt: recoveryPositionRef.current, refresh: true, recoveryAttempt: (track.recoveryAttempt || 0) + 1 });
   };
 
   const handleTogglePlay = () => {
-    if (!audioRef.current || !track) return;
-    if (isPlaying) {
-      audioRef.current.pause();
-      setIsPlaying(false);
-    } else {
-      audioRef.current.play().then(() => setIsPlaying(true)).catch(() => setNoticeText('请点击播放按钮'));
+    if (!track?.audioSrc) {
+      const item = currentQueueItem(queueRef.current);
+      if (item) void resolveAndPlay(item, { preserveQueue: true, resumeAt: currentTime });
+      return;
     }
+    if (audioRef.current?.paused) { void ensureAudioEngine().then(() => audioRef.current?.play()).catch(() => setNoticeText('请点击播放按钮')); }
+    else audioRef.current?.pause();
   };
 
   const jumpQueue = (nextIndex) => {
-    if (nextIndex < 0 || nextIndex >= playQueue.length) return;
-    const nextItem = playQueue[nextIndex];
-    if (nextItem?.offlineUrl) {
-      playLocalTrack(nextItem, { queue: playQueue, index: nextIndex });
-      return;
-    }
-    resolveAndPlay(nextItem, { queue: playQueue, index: nextIndex });
+    const item = queueRef.current.items[nextIndex];
+    if (item) void resolveAndPlay(item, { preserveQueue: true });
   };
+  const navigateQueue = (direction, natural = false) => {
+    const before = queueRef.current;
+    const id = direction === 'previous' ? before.history.at(-1) : peekNext(before, natural);
+    if (!id && !(direction === 'next' && before.shuffle && before.repeat === 'all' && before.items.length === 1)) { if (natural) setIsPlaying(false); return; }
+    const next = applyQueue({ type: direction, natural });
+    const item = currentQueueItem(next);
+    if (item) void resolveAndPlay(item, { preserveQueue: true });
+  };
+  const queueAction = (action) => {
+    const previous = queueRef.current.currentId;
+    const next = applyQueue(action);
+    if (action.type === 'clear' || (action.type === 'remove' && previous === action.id)) {
+      const item = currentQueueItem(next);
+      if (item) void resolveAndPlay(item, { preserveQueue: true });
+      else { ++intentRef.current; resolveAbortRef.current?.abort(); audioRef.current?.pause(); setTrack(null); setIsPlaying(false); setCurrentTime(0); setDuration(0); setResolvingTrack(false); }
+    }
+  };
+  const addToQueue = (item, next = false) => { applyQueue({ type: 'insert', item, next }); setNoticeText(next ? '已设为下一首' : '已添加到播放队列'); };
 
   const onLoadedMetadata = () => {
-    setDuration(audioRef.current?.duration || 0);
-    if (track?.key && playbackMetricsRef.current.trackKey === track.key && playbackMetricsRef.current.startedAt > 0) {
-      const elapsed = Math.round(performance.now() - playbackMetricsRef.current.startedAt);
-      console.info('[NAS] audio_loaded_metadata', {
-        loadMs: elapsed,
-        streamMode: track.streamMode || 'unknown',
-        title: track.title,
-      });
-    }
+    const audio = audioRef.current;
+    if (!audio) return;
+    setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+    if (pendingResumeRef.current > 0 && Number.isFinite(audio.duration)) audio.currentTime = Math.min(pendingResumeRef.current, Math.max(0, audio.duration - 0.1));
+    pendingResumeRef.current = 0;
   };
   const onTimeUpdate = () => setCurrentTime(audioRef.current?.currentTime || 0);
-  const seekTo = (nextTime) => {
-    if (audioRef.current) audioRef.current.currentTime = nextTime;
+  const seekTo = (nextTime) => { if (audioRef.current && Number.isFinite(nextTime)) { audioRef.current.currentTime = Math.max(0, nextTime); setCurrentTime(audioRef.current.currentTime); } };
+  const onAudioPlaying = () => {
+    if (!track || track.requestId !== intentRef.current) return;
+    setIsPlaying(true);
+    const metric = playbackMetricsRef.current;
+    if (!metric.firstPlayed) {
+      metric.firstPlayed = true;
+      const detail = { clickToPlayingMs: Math.round(performance.now() - metric.startedAt), resolveMs: Math.round(metric.resolveMs || 0), firstDataMs: metric.firstDataMs == null ? null : Math.round(metric.firstDataMs), firstSegmentMs: metric.firstDataMs == null ? null : Math.round(Math.max(0, metric.firstDataMs - (metric.resolveMs || 0))), source: track.source, trackKey: track.key, requestId: track.requestId };
+      console.info('[NAS] audio_playing', detail); window.dispatchEvent(new CustomEvent('nas-playback-metric', { detail }));
+      const historyEntry = toHistoryRecord({ ...track, playedAt: new Date().toISOString() });
+      setHistoryItems((prev) => mergeLibraryRecords([historyEntry], prev, 50, 'playedAt'));
+      void apiRequest('/library/history', { method: 'POST', body: JSON.stringify(historyEntry) }).catch(() => {});
+    }
   };
+  const chooseEffect = async (id) => {
+    if (!AUDIO_EFFECTS.some((effect) => effect.id === id)) return;
+    effectRef.current = id; setEffectPreset(id);
+    await ensureAudioEngine();
+    setEffectStatus(audioEngineRef.current?.status || '原声');
+  };
+
+  useEffect(() => {
+    if (isMiniMode || !track?.audioSrc) return;
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.load();
+    if (track.playIntent) void ensureAudioEngine().then(() => { if (track.requestId === intentRef.current) return audio.play(); }).catch(() => setNoticeText('请点击播放按钮继续'));
+  }, [isMiniMode, track?.requestId, track?.audioSrc]);
+
+  useEffect(() => {
+    if (isMiniMode || backendStatus !== 'online') return;
+    let active = true;
+    const initialIntent = intentRef.current;
+    void apiRequest('/playback-session').then((session) => {
+      if (!active || intentRef.current !== initialIntent) return;
+      const restored = applyQueue({ type: 'restore', session });
+      setCurrentTime(Number(session.position) || 0);
+      const id = AUDIO_EFFECTS.some((e) => e.id === session.effect) ? session.effect : 'off';
+      effectRef.current = id; setEffectPreset(id);
+      const item = currentQueueItem(restored);
+      if (item) { setTrack({ ...item, audioSrc: '', requestId: 0, playIntent: false, restored: true }); setDuration(Number(item.duration) || 0); }
+    }).catch(() => {}).finally(() => { if (active) sessionReadyRef.current = true; });
+    return () => { active = false; };
+  }, [isMiniMode, backendStatus]);
+
+  const saveSession = () => {
+    if (!sessionReadyRef.current || isMiniMode || !sessionSnapshotRef.current) return;
+    const payload = JSON.stringify(sessionSnapshotRef.current);
+    const revision = ++sessionWriteRevisionRef.current;
+    sessionSaveRef.current = sessionSaveRef.current.catch(() => {}).then(() => {
+      if (revision !== sessionWriteRevisionRef.current) return;
+      return apiRequest('/playback-session', { method: 'POST', body: payload });
+    }).catch(() => {});
+  };
+  useEffect(() => { sessionSnapshotRef.current = queueSession(queueState, currentTime, effectPreset); }, [queueState, currentTime, effectPreset]);
+  useEffect(() => {
+    if (isMiniMode) return;
+    const timer = setTimeout(saveSession, 250);
+    return () => clearTimeout(timer);
+  }, [queueState, effectPreset, isPlaying, isMiniMode]);
+  useEffect(() => {
+    if (isMiniMode) return;
+    const interval = setInterval(saveSession, 5000);
+    const saveOnExit = () => {
+      if (sessionReadyRef.current && sessionSnapshotRef.current) navigator.sendBeacon(apiUrl('/playback-session'), new Blob([JSON.stringify(sessionSnapshotRef.current)], { type: 'application/json' }));
+    };
+    window.addEventListener('pagehide', saveOnExit);
+    return () => { clearInterval(interval); window.removeEventListener('pagehide', saveOnExit); };
+  }, [isMiniMode]);
+
+  const nextPreparedItem = playQueue.find((i) => i.entryId === peekNext(queueState));
+  useEffect(() => {
+    // A song may already be playing when the slower search provider finishes.
+    for (const entry of queueRef.current.items) {
+      const identities = new Set([entry, ...(entry.variants || [])].map(getItemTrackKey));
+      const group = searchResults.find((item) => (item.variants || [item]).some((variant) => identities.has(getItemTrackKey(variant))));
+      if (group?.variants?.length > (entry.variants?.length || 0)) applyQueue({ type: 'update', id: entry.entryId, item: { variants: group.variants } });
+    }
+  }, [searchResults]);
+  useEffect(() => {
+    if (isMiniMode || !track?.audioSrc || !nextPreparedItem || nextPreparedItem.offlineUrl || nextPreparedItem.entryId === queueState.currentId) return;
+    const controller = new AbortController();
+    prepareAbortRef.current?.abort(); prepareAbortRef.current = controller;
+    const timer = setTimeout(() => {
+      const key = preparedKey(nextPreparedItem);
+      void apiRequest('/playback/prepare', { method: 'POST', body: JSON.stringify(resolveBody(nextPreparedItem)), signal: controller.signal }).then((data) => {
+        if (!controller.signal.aborted) prepareRef.current.set(key, { data, at: Date.now() });
+      }).catch(() => {});
+    }, 300);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [isMiniMode, nextPreparedItem?.entryId, queueState.currentId, sourceMode, track?.audioSrc]);
 
   const performDesktopAction = (action) => {
     const type = action?.type;
@@ -1640,11 +1845,11 @@ function App() {
       return;
     }
     if (type === 'next') {
-      jumpQueue(queueIndex + 1);
+      navigateQueue('next');
       return;
     }
     if (type === 'previous') {
-      jumpQueue(queueIndex - 1);
+      navigateQueue('previous');
       return;
     }
     if (type === 'toggle-vibe') {
@@ -1659,6 +1864,9 @@ function App() {
       setVolume((prev) => Math.max(0, Number((prev - 0.05).toFixed(2))));
       return;
     }
+    if (type === 'set-effect') { void chooseEffect(action.payload.id); return; }
+    if (type === 'shuffle') { queueAction({ type: 'shuffle' }); return; }
+    if (type === 'repeat') { queueAction({ type: 'repeat' }); return; }
     if (type === 'seek' && Number.isFinite(action?.payload?.seconds)) {
       seekTo(action.payload.seconds);
     }
@@ -1690,7 +1898,7 @@ function App() {
       channel.close();
       if (syncChannelRef.current === channel) syncChannelRef.current = null;
     };
-  }, [isMiniMode, queueIndex, playQueue.length, track, isPlaying]);
+  }, [isMiniMode, queueState, track, isPlaying]);
 
   useEffect(() => {
     const handleStorage = (event) => {
@@ -1721,7 +1929,7 @@ function App() {
       window.removeEventListener('storage', handleStorage);
       window.removeEventListener('nas-desktop-shell-action', handleShellAction);
     };
-  }, [isMiniMode, remotePlayerState, queueIndex, playQueue.length, track, isPlaying]);
+  }, [isMiniMode, remotePlayerState, queueState, track, isPlaying]);
 
   useEffect(() => {
     if (isMiniMode) return undefined;
@@ -1734,8 +1942,9 @@ function App() {
       volume,
       queueIndex,
       queueLength: playQueue.length,
-      canGoPrevious: queueIndex > 0,
-      canGoNext: queueIndex >= 0 && queueIndex < playQueue.length - 1,
+      canGoPrevious: queueState.history.length > 0,
+      canGoNext: !!peekNext(queueState),
+      shuffle: queueState.shuffle, repeat: queueState.repeat, effect: effectPreset,
       vibeModeEnabled,
       updatedAt: Date.now(),
     };
@@ -1743,9 +1952,9 @@ function App() {
     localStorage.setItem(PLAYER_STATE_STORAGE_KEY, JSON.stringify(payload));
     postDesktopMessage({ type: 'player-state', payload });
     return undefined;
-  }, [isMiniMode, track, isPlaying, currentTime, duration, volume, queueIndex, playQueue.length, vibeModeEnabled]);
+  }, [isMiniMode, track, isPlaying, currentTime, duration, volume, queueState, effectPreset, vibeModeEnabled]);
 
-  const renderCard = (song, artist, cover, onClick, isPlayable = true) => {
+  const renderCard = (song, artist, cover, onClick, isPlayable = true, item = null) => {
     const displayCover = resolveCoverArt(song, artist, cover);
 
     return (
@@ -1767,14 +1976,16 @@ function App() {
         <div className="card-title">{song}</div>
         <div className="card-subtitle">{artist}</div>
         <div className="absolute bottom-12 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+          <button title="下一首播放" aria-label={`下一首播放 ${song}`} className="p-1.5 rounded-full bg-black/40" onClick={(event) => { event.stopPropagation(); addToQueue(item || { title: song, artist, cover: displayCover }, true); }}><SkipForward size={14} /></button>
+          <button title="添加到队列" aria-label={`添加到队列 ${song}`} className="p-1.5 rounded-full bg-black/40" onClick={(event) => { event.stopPropagation(); addToQueue(item || { title: song, artist, cover: displayCover }); }}><Plus size={14} /></button>
           <button
-            onClick={(e) => { e.stopPropagation(); toggleFavoriteItem({ title: song, artist, cover: displayCover }); }}
+            onClick={(e) => { e.stopPropagation(); toggleFavoriteItem(item || { title: song, artist, cover: displayCover }); }}
             className={`p-1.5 rounded-full bg-black/40 backdrop-blur-md hover:bg-black/60 transition-colors ${isFavoriteItem({ title: song, artist }) ? 'text-[var(--accent)]' : 'text-white/70'}`}
           >
             <Heart size={14} fill={isFavoriteItem({ title: song, artist }) ? 'currentColor' : 'none'} />
           </button>
           <button
-            onClick={(e) => { e.stopPropagation(); handleDownload({ title: song, artist }); }}
+            onClick={(e) => { e.stopPropagation(); handleDownload(item || { title: song, artist }); }}
             className="p-1.5 rounded-full bg-black/40 backdrop-blur-md text-white/70 hover:text-white hover:bg-black/60 transition-colors"
           >
             <Download size={14} />
@@ -1794,6 +2005,27 @@ function App() {
   const completedDownloadCount = downloadTasks.filter((taskItem) => taskItem.status === 'completed').length;
   const duplicateLibraryItems = localLibrary.items.filter((item) => item.duplicateCount > 1);
   const recentLocalItems = localLibrary.items.slice(0, 8);
+  const activeSourceMode = normalizeSourceMode(sourceMode);
+  const sourceModeLabel = formatSearchProviderLabel(activeSourceMode);
+
+  const renderSourceModeSelector = (extraClassName = '') => (
+    <div className={`flex items-center gap-1 ${extraClassName}`}>
+      {SOURCE_MODE_OPTIONS.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          onClick={() => setSourceMode(option.id)}
+          className={`h-7 px-2.5 rounded-md border text-[11px] font-semibold transition-colors ${
+            activeSourceMode === option.id
+              ? 'bg-white text-slate-950 border-white'
+              : 'bg-white/5 text-white/55 border-white/10 hover:text-white hover:bg-white/10'
+          }`}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
 
   if (isMiniMode) {
     return (
@@ -1885,10 +2117,10 @@ function App() {
         </div>
       )}
 
-      {/* Loading Overlay */}
+      {/* Nonblocking playback preparation keeps rapid song selection available. */}
       {resolvingTrack && (
-        <div className="fixed inset-0 z-[90] bg-black/80 backdrop-blur-xl flex flex-col items-center justify-center gap-4">
-          <LoaderCircle size={48} className="text-slate-300 animate-spin" />
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[90] bg-slate-900/95 border border-white/10 rounded-xl px-5 py-3 flex items-center gap-3 pointer-events-none">
+          <LoaderCircle size={18} className="text-slate-300 animate-spin" />
           <p className="font-bold text-lg tracking-widest text-slate-300 animate-pulse">{BRAND.name} 正在解析音频...</p>
         </div>
       )}
@@ -1915,6 +2147,11 @@ function App() {
               if (e.key === 'Enter') runSearch();
             }}
           />
+        </div>
+
+        <div className="px-2 mb-4">
+          <div className="text-[10px] uppercase tracking-[0.18em] text-white/35 mb-2">音源</div>
+          {renderSourceModeSelector('flex-wrap')}
         </div>
 
         <nav className="nav-group mb-4">
@@ -2032,6 +2269,7 @@ function App() {
                   item.artist,
                   item.cover,
                   () => resolveAndPlay(item, { queue: discoverSpotlightItems, index: idx }),
+                  true, item,
                 ))}
               </div>
 
@@ -2052,6 +2290,7 @@ function App() {
                       item.artist,
                       item.cover,
                       () => resolveAndPlay(item, { queue: continueSection.items, index: idx }),
+                      true, item,
                     ))}
                   </div>
                 </>
@@ -2061,17 +2300,25 @@ function App() {
 
           {activePage === 'search' && (
             <div>
-              <h2 className="section-title">
-                {searching ? '正在搜寻宇宙中的频率...' : (searchResults.length > 0 ? `找到 ${searchResults.length} 个匹配项` : '准备好开始你的搜索')}
-              </h2>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between mb-6">
+                <div>
+                  <h2 className="section-title !mb-1">
+                    {searching ? '正在搜寻宇宙中的频率...' : (searchResults.length > 0 ? `找到 ${searchResults.length} 个匹配项` : '准备好开始你的搜索')}
+                  </h2>
+                  <p className="text-xs text-white/45">当前音源：{sourceModeLabel}{searchProviders.length > 0 ? ` · 已返回 ${searchProviders.map(formatSearchProviderLabel).join('、')}` : ''}</p>
+                </div>
+                {renderSourceModeSelector('justify-start sm:justify-end')}
+              </div>
               {searchResults.length > 0 ? (
                 <div className="card-grid">
-                  {searchResults.map((item, idx) => renderCard(
-                    item.title,
-                    item.artist,
-                    item.cover,
-                    () => resolveAndPlay(item, { queue: searchResults, index: idx })
-                  ))}
+                  {searchResults.map((item, idx) => <div key={item.groupKey || getItemTrackKey(item) || idx}>
+                    {renderCard(item.title, item.artist, item.cover, () => resolveAndPlay(item, { queue: searchResults, index: idx }), true, item)}
+                    <div className="flex items-center gap-3 mt-2 text-[11px] text-white/55">
+                      <button onClick={() => setSourcePicker({ item, options: { queue: searchResults, index: idx } })}>{item.variants?.length > 1 ? `${item.variants.length} 个音源` : formatSearchProviderLabel(item.source)} <ChevronRight size={11} className="inline" /></button>
+                      <button aria-label={`下一首播放 ${item.title}`} onClick={() => addToQueue(item, true)}>下一首播放</button>
+                      <button aria-label={`添加到队列 ${item.title}`} className="ml-auto" onClick={() => addToQueue(item)}><Plus size={15} /></button>
+                    </div>
+                  </div>)}
                 </div>
               ) : (
                 !searching && (
@@ -2089,11 +2336,12 @@ function App() {
               <h2 className="section-title">我的收藏</h2>
               {favorites.length > 0 ? (
                 <div className="card-grid">
-                  {favorites.map(item => renderCard(
+                  {favorites.map((item, idx) => renderCard(
                     item.title,
                     item.artist,
                     item.cover,
-                    () => resolveAndPlay(item)
+                    () => resolveAndPlay(item, { queue: favorites, index: idx }),
+                    true, item,
                   ))}
                 </div>
               ) : (
@@ -2114,8 +2362,8 @@ function App() {
                     item.title,
                     item.artist,
                     item.cover,
-                    () => resolveAndPlay(item),
-                    true
+                    () => resolveAndPlay(item, { queue: historyItems, index: idx }),
+                    true, item,
                   ))}
                 </div>
               ) : (
@@ -2516,7 +2764,7 @@ function App() {
                   <div>
                     <h4 className="flex items-center gap-2 text-slate-100"><ShieldCheck size={18} /> 搜索 / 网络诊断</h4>
                     <p className="text-sm text-slate-400 mt-2">
-                      用来判断“搜不到歌”到底是版本问题、网络问题，还是代理没有生效。
+                      用来判断“搜不到歌”到底是国内音源、兜底源、网络，还是代理设置出了问题。
                     </p>
                   </div>
                   <div className="text-xs text-white/35">
@@ -2609,7 +2857,7 @@ function App() {
                   </>
                 ) : (
                   <div className="mt-5 rounded-2xl border border-white/8 bg-black/20 p-5 text-sm text-white/45">
-                    点击“刷新诊断”后，会立刻测试 YouTube / YT Music 是否可达，并跑一次真实搜索探针。
+                    点击“刷新诊断”后，会立刻测试 QQ 音乐、YouTube / YT Music 与歌词源是否可达，并跑一次真实搜索探针。
                   </div>
                 )}
               </div>
@@ -2618,7 +2866,7 @@ function App() {
                 <div className="p-6 bg-white/5 border border-white/10 rounded-3xl">
                   <h4 className="flex items-center gap-2 mb-3 text-slate-200"><Info size={18} /> 更新与日志</h4>
                   <div className="flex flex-col gap-3 text-sm text-slate-400 leading-relaxed">
-                    <p>当前对外版本号显示为 `v{systemCheck?.appVersionLabel || '1.60'}`，内部构建版本仍保持 `{systemCheck?.appVersion || '1.6.0'}` 以兼容现有更新链路。</p>
+                    <p>当前版本 v{systemCheck?.appVersion || '1.7.0'}。</p>
                     <p>桌面端从这一版开始，托盘点击“检查更新”后，若发现新版本会自动下载并拉起安装包。</p>
                     <p>前端错误日志：{systemCheck?.frontendErrorLogExists ? '已启用' : '暂未生成'}。</p>
                     <p className="break-all text-white/35">{systemCheck?.frontendErrorLog || '日志路径暂不可用'}</p>
@@ -2631,7 +2879,7 @@ function App() {
                     <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">托盘菜单：`显示 NAS` / `隐藏 NAS` / `沉浸式全屏`</div>
                     <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">启动即全屏：`start-desktop.bat --fullscreen`</div>
                     <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">`Ctrl + Alt + M`：切换迷你播放器</div>
-                    <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">如果朋友反馈无法搜索，先进入这里看网络诊断，再决定是否需要代理。</div>
+                    <div className="rounded-xl border border-white/8 bg-black/20 px-4 py-3">如果朋友反馈无法搜索，先进入这里看音源诊断，再决定是否需要代理。</div>
                   </div>
                 </div>
               </div>
@@ -2726,7 +2974,7 @@ function App() {
                       <span className="w-16 text-right">时长</span>
                     </div>
                     {allSongs.map((song, idx) => (
-                      <div key={song.key} className="grid grid-cols-[auto_1fr_1fr_auto] gap-4 px-4 py-3 items-center hover:bg-white/5 rounded-lg cursor-pointer group transition-colors" onClick={() => resolveAndPlay(song)}>
+                      <div key={song.key} className="grid grid-cols-[auto_1fr_1fr_auto] gap-4 px-4 py-3 items-center hover:bg-white/5 rounded-lg cursor-pointer group transition-colors" onClick={() => resolveAndPlay(song, { queue: allSongs, index: idx })}>
                         <div className="w-8 relative flex justify-center items-center">
                           <img
                             src={resolveCoverArt(song.title, song.artist, song.cover)}
@@ -2760,7 +3008,7 @@ function App() {
                 />
               <div className="track-details">
                 <div className="track-name">{track.title}</div>
-                <div className="track-artist">{track.artist}</div>
+                <button className="track-artist text-left" title="选择音源" onClick={() => setSourcePicker({ item: { ...track, variants: currentQueueItem(queueRef.current)?.variants || track.variants }, options: { preserveQueue: true, resumeAt: audioRef.current?.currentTime || currentTime } })}>{track.artist} · {formatSearchProviderLabel(track.source)} <ChevronRight size={11} className="inline" /></button>
               </div>
               <button
                 onClick={() => toggleFavoriteItem(track)}
@@ -2782,13 +3030,15 @@ function App() {
 
         <div className="main-controls">
           <div className="control-buttons">
-            <button className="control-btn" onClick={() => jumpQueue(queueIndex - 1)} disabled={queueIndex <= 0}>
+            <button aria-label="随机播放" aria-pressed={queueState.shuffle} className={`control-btn ${queueState.shuffle ? '!text-emerald-300' : ''}`} onClick={() => queueAction({ type: 'shuffle' })}><Shuffle size={16} /></button>
+            <button aria-label={{ off: '顺序播放', all: '列表循环', one: '单曲循环' }[queueState.repeat]} className={`control-btn ${queueState.repeat !== 'off' ? '!text-emerald-300' : ''}`} onClick={() => queueAction({ type: 'repeat' })}><Repeat size={16} />{queueState.repeat === 'one' && <span className="text-[9px]">1</span>}</button>
+            <button className="control-btn" aria-label="上一首" onClick={() => navigateQueue('previous')} disabled={!queueState.history.length}>
               <SkipBack size={20} fill="currentColor" />
             </button>
-            <button className="play-pause-btn" onClick={handleTogglePlay}>
+            <button className="play-pause-btn" aria-label={isPlaying ? "暂停" : "播放"} onClick={handleTogglePlay}>
               {isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} className="ml-1" fill="currentColor" />}
             </button>
-            <button className="control-btn" onClick={() => jumpQueue(queueIndex + 1)} disabled={queueIndex < 0 || queueIndex >= playQueue.length - 1}>
+            <button className="control-btn" aria-label="下一首" onClick={() => navigateQueue('next')} disabled={!peekNext(queueState)}>
               <SkipForward size={20} fill="currentColor" />
             </button>
 
@@ -2854,24 +3104,30 @@ function App() {
           >
             <Download size={20} />
           </button>
-          <button className="text-slate-500 hover:text-white transition-colors" title="播放队列">
+          <button className="text-slate-500 hover:text-white transition-colors" title="音效" aria-label="音效" onClick={() => setEffectsOpen(true)}><SlidersHorizontal size={20} /></button>
+          <button className="text-slate-500 hover:text-white transition-colors" title="播放队列" aria-label="播放队列" onClick={() => setQueueOpen(true)}>
             <ListMusic size={20} />
           </button>
         </div>
       </footer>
 
-      {/* Invisible Audio Element */}
+      {queueOpen && <QueuePanel state={queueState} onAction={queueAction} onPlay={jumpQueue} onClose={() => setQueueOpen(false)} />}
+      {effectsOpen && <AudioEffectsPanel value={effectPreset} onChange={chooseEffect} onClose={() => setEffectsOpen(false)} status={effectStatus} />}
+      {sourcePicker && <div className="fixed inset-0 z-[120] bg-black/60 flex items-center justify-center" onClick={() => setSourcePicker(null)}><section role="dialog" aria-modal="true" aria-label="选择音源" className="bg-[#111d2b] rounded-2xl border border-white/10 p-6 w-[420px]" onClick={(e) => e.stopPropagation()}><header className="flex justify-between mb-4"><h2 className="font-bold">{sourcePicker.item.title} · 音源</h2><button aria-label="关闭音源选择" onClick={() => setSourcePicker(null)}><X size={18} /></button></header>{(sourcePicker.item.variants?.length ? sourcePicker.item.variants : [sourcePicker.item]).map((variant) => <button key={getItemTrackKey(variant)} className="flex justify-between w-full p-3 hover:bg-white/10 rounded-lg text-sm" onClick={() => { void resolveAndPlay({ ...variant, variants: sourcePicker.item.variants }, sourcePicker.options); setSourcePicker(null); }}><span>{formatSearchProviderLabel(variant.source)} · {variant.artist}</span><span className="text-white/40">{variant.duration ? formatTime(variant.duration) : '播放'}</span></button>)}</section></div>}
+
+      {/* One media element owns playback; Web Audio only processes its output. */}
       <audio
         ref={audioRef}
-        src={track?.audioSrc}
+        src={track?.audioSrc || undefined}
         preload="auto"
         onLoadedMetadata={onLoadedMetadata}
+        onLoadedData={() => { const metric = playbackMetricsRef.current; if (metric?.requestId === intentRef.current && metric.firstDataMs == null) metric.firstDataMs = performance.now() - metric.startedAt; }}
         onTimeUpdate={onTimeUpdate}
         onError={handleAudioError}
-        onEnded={() => {
-          if (queueIndex < playQueue.length - 1) jumpQueue(queueIndex + 1);
-          else setIsPlaying(false);
-        }}
+        onPlaying={onAudioPlaying}
+        onPause={() => setIsPlaying(false)}
+        onWaiting={() => setIsPlaying(false)}
+        onEnded={() => navigateQueue('next', true)}
       />
 
       {vibeModeEnabled && track && (
@@ -2882,6 +3138,16 @@ function App() {
           playQueue={playQueue}
           queueIndex={queueIndex}
           jumpQueue={jumpQueue}
+          onNext={() => navigateQueue('next')}
+          onPrevious={() => navigateQueue('previous')}
+          canNext={!!peekNext(queueState)}
+          canPrevious={queueState.history.length > 0}
+          isShuffle={queueState.shuffle}
+          repeatMode={{ off: 0, all: 1, one: 2 }[queueState.repeat]}
+          onToggleShuffle={() => queueAction({ type: 'shuffle' })}
+          onCycleRepeat={() => queueAction({ type: 'repeat' })}
+          onOpenEffects={() => setEffectsOpen(true)}
+          effectName={AUDIO_EFFECTS.find((effect) => effect.id === effectPreset)?.name || '原声'}
           isPlaying={isPlaying}
           handleTogglePlay={handleTogglePlay}
           currentTime={currentTime}

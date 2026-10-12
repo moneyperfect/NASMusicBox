@@ -1,0 +1,40 @@
+汽水音乐项目文件清理说明
+
+清理原则
+只清理可以重新生成的开发缓存。
+不要删除可能包含用户数据、下载歌曲、收藏、历史、歌词偏移或运行配置的目录。
+
+不要删除
+data/
+data/nas_local.db
+data/downloads/
+data/webview-storage/
+assets/
+frontend/dist/
+dist/
+build/
+start-local.bat
+start-desktop.bat
+启动最新版本.txt
+
+这些内容分别包含数据库、下载记录、本地音乐、桌面运行资源、前端构建结果、发布包或启动入口。
+
+可以清理
+.pytest_cache/
+__pycache__/
+tests/__pycache__/
+任意 Python 生成的 .pyc 文件
+
+推荐清理命令
+在项目根目录 D:\抖音汽水\nsrl-local 打开 PowerShell 后运行：
+
+powershell -ExecutionPolicy Bypass -Command "Get-ChildItem -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force; Get-ChildItem -Recurse -Directory -Filter .pytest_cache | Remove-Item -Recurse -Force; Get-ChildItem -Recurse -File -Filter *.pyc | Remove-Item -Force"
+
+当前版本说明
+当前版本默认音源为自动模式：QQ 音乐优先，QQ 不可播时尝试 YouTube 兜底。
+可以在左侧音源按钮切换为自动、QQ 音乐或 YouTube。
+旧的 YouTube 收藏会保留 YouTube 身份，不会被强制改成 QQ 音乐。
+
+图标说明
+桌面和前端图标来自 D:\Nasmusicbox.png。
+生成文件包括 assets/app-icon.png、assets/app-icon.ico、frontend/public/apple-touch-icon.png、frontend/public/pwa-192x192.png、frontend/public/pwa-512x512.png。

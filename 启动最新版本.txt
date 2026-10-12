@@ -1,0 +1,26 @@
+汽水音乐最新版本启动说明
+
+项目路径：
+D:\抖音汽水\nsrl-local
+
+推荐启动方式：
+双击这个文件：
+D:\抖音汽水\nsrl-local\start-local.bat
+
+启动后访问地址：
+http://localhost:8010
+
+桌面窗口启动方式：
+双击这个文件：
+D:\抖音汽水\nsrl-local\start-desktop.bat
+
+如果 8010 端口被占用：
+打开 PowerShell，运行：
+D:\抖音汽水\nsrl-local\start-desktop.bat --kill-port --browser
+
+如果以后改过前端页面，想重新构建后启动：
+打开 PowerShell，运行：
+D:\抖音汽水\nsrl-local\start-desktop.bat --rebuild --browser
+
+日常自己使用时，通常只需要双击 start-local.bat。
+它会使用当前项目里的最新代码和已经构建好的前端页面。

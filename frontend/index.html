@@ -76,6 +76,37 @@
       margin: 0 0 16px;
     }
 
+    .boot-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin: 18px 0 0;
+    }
+
+    .boot-actions button,
+    .boot-actions a {
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.86);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 0 14px;
+      text-decoration: none;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .boot-actions span {
+      color: rgba(255,255,255,0.52);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
     .boot-detail {
       border-radius: 18px;
       background: rgba(0,0,0,0.35);
@@ -99,6 +130,26 @@
         return bootStatus;
       }
 
+      function dismissBootStatus() {
+        var node = ensureBootStatus();
+        if (node) {
+          node.dataset.hidden = 'true';
+        }
+      }
+
+      function escapeHtml(value) {
+        var entityMap = {
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#39;',
+        };
+        return String(value == null ? '' : value).replace(/[&<>"']/g, function (char) {
+          return entityMap[char];
+        });
+      }
+
       function renderError(title, detail) {
         var node = ensureBootStatus();
         if (!node) return;
@@ -106,9 +157,14 @@
         node.innerHTML =
           '<div class="boot-card">' +
             '<div class="boot-kicker">NAS Diagnostics</div>' +
-            '<h1 class="boot-title">' + title + '</h1>' +
+            '<h1 class="boot-title">' + escapeHtml(title) + '</h1>' +
             '<p class="boot-copy">应用启动阶段捕获到了前端错误，详细信息已经写入本地诊断日志。</p>' +
-            '<div class="boot-detail">' + (detail || '未知错误') + '</div>' +
+            '<div class="boot-detail">' + escapeHtml(detail || '未知错误') + '</div>' +
+            '<div class="boot-actions">' +
+              '<button type="button" onclick="window.__NAS_BOOT__ && window.__NAS_BOOT__.dismiss()">关闭诊断层</button>' +
+              '<a href="http://localhost:8010" target="_blank" rel="noreferrer">打开浏览器版</a>' +
+              '<span>启动说明：D:\\抖音汽水\\nsrl-local\\启动最新版本.txt</span>' +
+            '</div>' +
           '</div>';
       }
 
@@ -144,9 +200,18 @@
             node.dataset.hidden = 'true';
           }
         },
+        dismiss: dismissBootStatus,
         reportError: function (eventType, payload) {
           var detail = (payload && (payload.stack || payload.message)) || '未知错误';
-          renderError('前端启动失败', detail);
+          if (!mounted) {
+            renderError('前端启动失败', detail);
+          } else {
+            try {
+              window.dispatchEvent(new CustomEvent('nas:runtime-error', {
+                detail: { eventType: eventType, message: payload && payload.message || '' },
+              }));
+            } catch (error) {}
+          }
           sendReport(eventType, payload || {});
         }
       };

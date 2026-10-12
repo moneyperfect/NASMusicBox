@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,8 @@ from pystray import Icon, Menu, MenuItem
 from app_meta import APP_BRAND_NAME, APP_ID, APP_VERSION, APP_VERSION_LABEL, BACKEND_URL, GITHUB_RELEASES_URL
 from app_paths import (
     DESKTOP_ENTRYPOINT,
+    APP_ROOT,
+    DATA_DIR,
     FRONTEND_INDEX,
     ICON_CACHE_DIR,
     IS_FROZEN,
@@ -30,6 +33,7 @@ from app_paths import (
 )
 from desktop_assets import create_app_icon_image, write_icon_assets
 from desktop_updater import ReleaseInfo, download_release_asset, fetch_latest_release, is_newer_version
+from desktop_runtime import DesktopInstance, configure_windowed_logs
 
 try:
     import keyboard
@@ -65,6 +69,7 @@ class DesktopApp:
         self.update_check_in_progress = False
         self.update_download_in_progress = False
         self.start_fullscreen = start_fullscreen
+        self.instance: DesktopInstance | None = None
 
     @property
     def storage_path(self) -> str:
@@ -513,6 +518,8 @@ class DesktopApp:
         self.quit()
 
     def on_webview_ready(self) -> None:
+        if self.instance:
+            self.instance.listen(self.show_main_window)
         self.start_tray()
         self.register_hotkeys()
         self.trigger_update_check(background=True)
@@ -550,20 +557,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    log_path = configure_windowed_logs(DATA_DIR, backend=args.backend)
     if args.backend:
         from main import run_backend_server
 
         run_backend_server()
         return 0
 
-    app = DesktopApp(start_fullscreen=args.fullscreen)
+    instance = DesktopInstance(APP_ROOT)
+    app = None
     try:
+        if not instance.acquire():
+            return 0
+        app = DesktopApp(start_fullscreen=args.fullscreen)
+        app.instance = instance
         app.run()
         return 0
     except Exception as exc:
-        print(f"[ERROR] {exc}")
-        app.quit()
+        traceback.print_exc()
+        if os.name == "nt":
+            ctypes.windll.user32.MessageBoxW(None, f"NAS音乐器无法启动：{exc}\n\n请确认已安装 Microsoft Edge WebView2，并退出旧版播放器后重试。\n日志：{log_path}", APP_BRAND_NAME, 0x10)
+        if app:
+            app.quit()
         return 1
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f2efe7">
+  <meta name="description" content="NAS音乐器，让音乐自然留在桌面。Windows 桌面播放器，综合音源搜索、九种实时音效、完整播放队列与迷你播放器。">
+  <meta property="og:title" content="NAS音乐器 · 把喜欢的歌，留在桌面上。">
+  <meta property="og:description" content="一个为桌面而生的音乐播放器。Windows 安装版与便携版。">
+  <meta property="og:type" content="website">
+  <link rel="canonical" href="https://music.nasbuild.dev/">
+  <link rel="icon" href="assets/app-icon.png">
+  <link rel="stylesheet" href="style.css">
+  <title>NAS音乐器 · 把喜欢的歌，留在桌面上。</title>
+  <script src="app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">跳转到内容</a>
+<svg class="svg-defs" xmlns="http://www.w3.org/2000/svg"><defs>
+  <symbol id="arrow" viewBox="0 0 24 24"><path d="M7 17 17 7M7 7h10v10"/></symbol>
+  <symbol id="download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></symbol>
+  <symbol id="windows" viewBox="0 0 24 24"><path d="m3 5 7-1v7H3zm9-1 9-1v8h-9zM3 13h7v7l-7-1zm9 0h9v8l-9-1z"/></symbol>
+  <symbol id="sliders" viewBox="0 0 24 24"><path d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3M1 14h6m2-6h6m2 8h6"/></symbol>
+  <symbol id="list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h9M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="7.5"/><path d="m16 16 5 5"/></symbol>
+  <symbol id="monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></symbol>
+  <symbol id="check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+</defs></svg>
+<header class="header wrap">
+  <a href="#" class="brand" aria-label="NAS音乐器首页"><img src="assets/app-icon.png" width="38" height="38" alt=""><span>NAS<span class="brand-name">音乐器</span></span></a>
+  <nav aria-label="主导航"><a href="#experience">体验</a><a href="#features">功能</a><a href="#faq">使用帮助</a></nav>
+  <a class="nav-download" href="#download">下载 Windows 版 <svg><use href="#arrow"/></svg></a>
+</header>
+<main id="main">
+  <section class="hero wrap">
+    <div class="hero-copy">
+      <p class="eyebrow"><span class="status-dot"></span> NEXT AUDIO STATION <span class="edition">DESKTOP / 01</span></p>
+      <h1>把喜欢的歌，<br><span>留在桌面上。</span></h1>
+      <p class="hero-description">写东西、发会儿呆，或者什么都不做。<br>让音乐陪着你，不必来回切换窗口。</p>
+      <div class="hero-actions"><a class="button primary" href="#download"><svg><use href="#windows"/></svg> 下载 Windows 版 <svg><use href="#arrow"/></svg></a><a class="text-link" href="#experience">先看看它 <span>↓</span></a></div>
+      <p class="hero-meta">Windows 10 / 11 · x64 <span>安装版与便携版</span></p>
+    </div>
+    <div class="record-scene" aria-hidden="true">
+      <div class="record-sleeve"><span class="sleeve-top">NAS ORIGINAL<br>LISTENING ROOM</span><span class="sleeve-title">好好<br>听歌。</span><div class="sleeve-bottom"><span>VOL. 01</span><span>33⅓ RPM</span></div></div>
+      <div class="vinyl"><div class="vinyl-label"><span>NAS</span><small>MAKE ROOM<br>FOR MUSIC</small><i></i></div></div>
+      <span class="record-note">声音有自己的位置，<br>你也是。</span>
+    </div>
+  </section>
+  <div class="feature-strip"><div class="wrap"><span><svg><use href="#search"/></svg> 多个音源，一起找歌</span><span><svg><use href="#sliders"/></svg> 九种音效，换种心情</span><span><svg><use href="#list"/></svg> 播放队列，下次接着听</span><span><svg><use href="#monitor"/></svg> 独立窗口，自然驻留</span></div></div>
+  <section class="experience wrap section" id="experience">
+    <div class="section-heading"><div><p class="eyebrow">01 / LISTENING ROOM</p><h2>音乐在这里，<br>其他的，慢慢来。</h2></div><p>从找歌到排好下一首，<br>留一个顺手、安静的桌面空间。</p></div>
+    <div class="preview-tabs" role="tablist" aria-label="软件界面预览"><button role="tab" aria-selected="true" aria-controls="preview-panel" id="tab-queue" data-image="queue" tabindex="0">完整队列</button><button role="tab" aria-selected="false" aria-controls="preview-panel" id="tab-effects" data-image="effects" tabindex="-1">九种音效</button><button role="tab" aria-selected="false" aria-controls="preview-panel" id="tab-search" data-image="search" tabindex="-1">综合搜索</button><span>真实软件界面 / 演示曲目</span></div>
+    <figure class="app-window" id="preview-panel" role="tabpanel" aria-labelledby="tab-queue" tabindex="0"><div class="window-bar"><span class="window-logo">NAS <i>音乐器</i></span><span class="window-controls" aria-hidden="true">— &nbsp; □ &nbsp; ×</span></div><img id="app-preview" src="assets/queue-panel.png" width="1440" height="960" alt="NAS音乐器完整播放队列，支持拖动排序、随机和循环" loading="lazy"></figure>
+    <div class="preview-caption"><span id="preview-caption">下一首听什么，由你决定。拖动调整顺序，退出后还能接着听。</span><span>NAS MUSIC BOX <b data-version>1.7.0</b></span></div>
+  </section>
+  <section class="features section wrap" id="features">
+    <p class="eyebrow">02 / MADE FOR EVERYDAY</p>
+    <div class="feature-row"><span class="feature-no">01</span><div class="feature-title"><svg><use href="#search"/></svg><h3>歌在不同地方，<br>一起搜就好。</h3></div><div class="feature-detail"><p>综合搜索 QQ、YouTube，先找到的先出现。同一版本的歌曲整合音源，也保留现场、翻唱和混音各自的样子。</p><span class="small-label">综合搜索 / 手动选源 / 下一首预加载</span></div></div>
+    <div class="feature-row"><span class="feature-no">02</span><div class="feature-title"><svg><use href="#sliders"/></svg><h3>同一首歌，<br>也有不同的心情。</h3></div><div class="feature-detail"><p>想听更有力的低频，或是靠近一点的人声？九种实时音效，点选即切换。想回到音乐本来的样子，随时选择原声。</p><div class="preset-list"><span>智能音效</span><span>360 环绕</span><span>超重低音</span><span>清澈人声</span><span>3D 音效</span><span>HIFI 现场</span><span>动感电音</span><span>摇滚音效</span><span>复古唱片</span></div><small>NAS 独立实现与调音；360 / 3D 为立体声空间处理。</small></div></div>
+    <div class="feature-row"><span class="feature-no">03</span><div class="feature-title"><svg><use href="#monitor"/></svg><h3>在桌面上，<br>自然地陪着你。</h3></div><div class="feature-detail"><p>双击就打开独立窗口。托盘、迷你播放器和全局快捷键，让音乐不用抢走你的注意力。收藏、歌词、下载，也都在熟悉的位置。</p><span class="shortcut"><kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Space</kbd><span>播放 / 暂停</span></span></div></div>
+  </section>
+  <section class="download-section" id="download"><div class="wrap download-inner">
+    <div class="download-copy"><p class="eyebrow">03 / YOUR NEXT AUDIO STATION</p><h2>给桌面，<br>留一点音乐。</h2><p>NAS音乐器 <span data-version>1.7.0</span><br>Windows 10 / 11 · 64 位</p><a href="#updates" class="text-link">看看这次更新 <svg><use href="#arrow"/></svg></a></div>
+    <div class="download-card"><div class="download-card-heading"><svg><use href="#windows"/></svg><div><h3>Windows 版</h3><span id="release-status" role="status">正在读取版本信息…</span></div><span class="version-badge" data-version>1.7.0</span></div>
+      <a class="button download-button" id="installer-download" href="#download" aria-disabled="true"><svg><use href="#download"/></svg><span>安装版正在准备</span><svg><use href="#arrow"/></svg></a><p class="package-info" id="installer-info">适合日常使用 · 创建桌面和开始菜单快捷方式</p>
+      <a class="portable-link" id="portable-download" href="#download" aria-disabled="true"><span>下载便携版 ZIP</span><span id="portable-size">解压后运行</span><svg><use href="#arrow"/></svg></a>
+      <div class="download-notes"><span><svg><use href="#check"/></svg> 无需安装 Python / Node</span><span><svg><use href="#check"/></svg> 安装位置可以自行选择</span></div>
+      <p class="runtime-note">需要 Microsoft Edge WebView2。安装版会在缺少时联网补齐；便携版请先安装运行时。</p>
+      <details class="checksums"><summary>查看文件校验值 SHA-256</summary><p>安装版</p><code id="installer-hash">打包后提供</code><button class="copy-hash" data-copy="installer" disabled>复制安装版校验值</button><p>便携版</p><code id="portable-hash">打包后提供</code><button class="copy-hash" data-copy="portable" disabled>复制便携版校验值</button><span id="copy-status" role="status"></span></details>
+    </div>
+  </div></section>
+  <section class="updates wrap section" id="updates"><div><p class="eyebrow">RELEASE NOTES</p><h2>这次，新在哪里。</h2><p>v<span data-version>1.7.0</span> <span class="release-date">· 2026.10</span></p></div><div class="updates-list"><p><span>01</span> 音频先准备，封面随后更新，预加载实际的下一首。</p><p><span>02</span> 综合搜索与同版本曲目整合，提供音源选择。</p><p><span>03</span> 九种实时音效与原声选项，平滑切换。</p><p><span>04</span> 完整播放队列、随机与循环，恢复上次播放进度。</p><p><span>05</span> 桌面重复打开唤醒原窗口，附带播放运行组件。</p><a class="text-link" href="https://github.com/moneyperfect/NASMusicBox/releases" target="_blank" rel="noopener noreferrer">历史版本 <svg><use href="#arrow"/></svg></a></div></section>
+  <section class="faq wrap section" id="faq"><div><p class="eyebrow">A FEW THINGS TO KNOW</p><h2>开始之前。</h2><p>几个你可能关心的问题。</p></div><div class="faq-list">
+    <details><summary>安装之后，怎么打开？</summary><p>从桌面快捷方式或开始菜单打开 NAS音乐器，就是独立的软件窗口，无需浏览器和命令行。便携版请先完整解压，再双击 NASMusicBox.exe。</p></details>
+    <details><summary>会装到 C 盘吗？需要多少空间？</summary><p>新安装会优先选择 D/E 固定硬盘，也可以在向导里自行修改。建议预留至少 1.5 GB 安装与解压空间，下载的歌曲另计。收藏、设置等用户资料默认保存在系统用户目录；WebView2 为共享系统运行时。</p></details>
+    <details><summary>Windows 提示“未知发布者”怎么办？</summary><p>目前安装包尚未做代码签名，首次运行可能出现 Windows 提示。请核对下载来源，并用本页提供的 SHA-256 校验值确认文件；不确定来源时请勿运行。</p></details>
+    <details><summary>为什么有些在线歌曲仍然要等？</summary><p>预加载能减少准备下一首的等待，但首次解析、平台曲目权限和网络状况仍会影响播放；部分音源可能不可用。可以尝试切换同一首歌的其他来源，或播放本地文件。软件不承诺所有平台曲目都能播放。</p></details>
+    <details><summary>九种音效是汽水音乐原版吗？</summary><p>这些音效由 NAS 独立实现与调音，不是汽水音乐的原版算法或预设。清澈人声是均衡处理，不是人声分离；360 环绕和 3D 音效通过立体声处理营造空间感。</p></details>
+    <details><summary>更新会丢失收藏和队列吗？</summary><p>程序和用户资料分开保存，更新不覆盖收藏和历史。队列与进度会保存，重启后保持暂停；再次播放时会重新准备音源。重要资料仍建议定期备份。</p></details>
+    <details><summary>遇到问题，去哪里反馈？</summary><p>请在 <a href="https://github.com/moneyperfect/NASMusicBox/issues" target="_blank" rel="noopener noreferrer">GitHub Issues</a> 描述 Windows 版本、软件版本和复现步骤。启动日志位于用户资料目录 data/logs，提交前请检查是否包含个人路径或曲目信息。</p></details>
+  </div></section>
+</main>
+<footer class="footer wrap"><a class="brand" href="#">NAS<span class="brand-name">音乐器</span></a><span>给日常一点好声音。</span><div><a href="https://nasbuild.dev" target="_blank" rel="noopener noreferrer">由 Nas 制作 <svg><use href="#arrow"/></svg></a><a href="https://github.com/moneyperfect/NASMusicBox" target="_blank" rel="noopener noreferrer">GitHub <svg><use href="#arrow"/></svg></a></div></footer>
+</body>
+</html>
