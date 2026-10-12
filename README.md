@@ -2,27 +2,27 @@
 
 NAS音乐器是一个面向个人使用的本地音乐播放器与下载器，提供搜索、播放、歌词、收藏、下载中心、桌面壳、迷你播放器和本地资料库能力。
 
-当前源码工作区包含播放提速、QQ/YouTube 综合搜索与同曲音源整合、九种独立音效和完整播放队列。此本地升级尚未发布为下方的 GitHub 安装包；要体验当前代码，请按“源码运行”启动。实现和验证见 [播放升级报告](docs/playback-upgrade-2026-10-13.md)，汽水发布包调查见 [REA 报告](docs/REA-2026-10-12.md)。
+1.7.0 体验版包含播放提速、QQ/YouTube 综合搜索与同曲音源整合、九种独立音效和完整播放队列，提供 Windows 安装包与便携版。下载网站：[NAS音乐器](https://nas-music-box.social-bass-8514.chatgpt.site)；正式域名 music.nasbuild.dev 正在接入。实现和验证见 [播放升级报告](docs/playback-upgrade-2026-10-13.md)，汽水发布包调查见 [REA 报告](docs/REA-2026-10-12.md)。
 
-[![Windows 安装版下载](https://img.shields.io/badge/Windows-下载安装包-2ea043?style=for-the-badge&logo=windows11)](https://github.com/moneyperfect/NASMusicBox/releases/latest/download/NASMusicBox-Setup.exe)
-[![Windows 便携版下载](https://img.shields.io/badge/Windows-便携版ZIP-0a84ff?style=for-the-badge&logo=windows11)](https://github.com/moneyperfect/NASMusicBox/releases/latest/download/NASMusicBox-portable.zip)
+[![Windows 安装版下载](https://img.shields.io/badge/Windows-下载安装包-2ea043?style=for-the-badge&logo=windows11)](https://github.com/moneyperfect/NASMusicBox/releases/download/v1.7.0/NASMusicBox-Setup.exe)
+[![Windows 便携版下载](https://img.shields.io/badge/Windows-便携版ZIP-0a84ff?style=for-the-badge&logo=windows11)](https://github.com/moneyperfect/NASMusicBox/releases/download/v1.7.0/NASMusicBox-portable.zip)
 
 ## Windows 一键下载
 
-- 安装版 exe：[`NASMusicBox-Setup.exe`](https://github.com/moneyperfect/NASMusicBox/releases/latest/download/NASMusicBox-Setup.exe)
-- 便携版 zip：[`NASMusicBox-portable.zip`](https://github.com/moneyperfect/NASMusicBox/releases/latest/download/NASMusicBox-portable.zip)
+- 安装版 exe：[`NASMusicBox-Setup.exe`](https://github.com/moneyperfect/NASMusicBox/releases/download/v1.7.0/NASMusicBox-Setup.exe)
+- 便携版 zip：[`NASMusicBox-portable.zip`](https://github.com/moneyperfect/NASMusicBox/releases/download/v1.7.0/NASMusicBox-portable.zip)
 
 如果你只想直接使用，优先下载安装版。便携版适合不想安装、想临时体验或放在移动目录中运行的场景。
 
 ## 三步安装
 
-1. 下载 [`NASMusicBox-Setup.exe`](https://github.com/moneyperfect/NASMusicBox/releases/latest/download/NASMusicBox-Setup.exe)。
+1. 下载 [`NASMusicBox-Setup.exe`](https://github.com/moneyperfect/NASMusicBox/releases/download/v1.7.0/NASMusicBox-Setup.exe)。
 2. 双击安装，按向导完成安装；如有需要，可以勾选创建桌面图标。
 3. 安装完成后，从桌面或开始菜单打开 NAS音乐器。应用启动后会在系统托盘驻留，可从托盘执行显示、隐藏、沉浸式全屏、检查更新和退出等操作。
 
 如果你想免安装运行：
 
-1. 下载 [`NASMusicBox-portable.zip`](https://github.com/moneyperfect/NASMusicBox/releases/latest/download/NASMusicBox-portable.zip)。
+1. 下载 [`NASMusicBox-portable.zip`](https://github.com/moneyperfect/NASMusicBox/releases/download/v1.7.0/NASMusicBox-portable.zip)。
 2. 解压到任意目录。
 3. 双击 `NASMusicBox.exe` 启动。
 
@@ -35,7 +35,7 @@ NAS音乐器是一个面向个人使用的本地音乐播放器与下载器，�
 - 安装版和便携版有什么区别？
   安装版会创建开始菜单和可选桌面快捷方式，更适合长期使用。便携版无需安装，解压即可运行，适合快速体验。
 - 数据保存在哪里？
-  用户数据默认保存在 `%LOCALAPPDATA%\NASMusicBox\data`，包括收藏、历史、歌词偏移、下载记录和桌面缓存。安装版程序默认安装到 `%LOCALAPPDATA%\Programs\NASMusicBox`。
+  用户数据默认保存在 `%LOCALAPPDATA%\NASMusicBox\data`，包括收藏、历史、歌词偏移、下载记录和桌面缓存。安装向导支持自选位置，新安装优先 D/E 固定硬盘；没有时使用 `%LOCALAPPDATA%\Programs\NASMusicBox`。
 
 ## 功能亮点
 

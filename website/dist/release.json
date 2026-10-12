@@ -1,9 +1,19 @@
 {
   "version": "1.7.0",
-  "published": false,
+  "published": true,
   "releaseDate": "2026-10-13",
   "downloadMode": "auto",
   "localDownloadsReady": false,
-  "installer": {"path": "downloads/NASMusicBox-Setup.exe", "publicUrl": "", "sizeBytes": null, "sha256": ""},
-  "portable": {"path": "downloads/NASMusicBox-portable.zip", "publicUrl": "", "sizeBytes": null, "sha256": ""}
+  "installer": {
+    "path": "downloads/NASMusicBox-Setup.exe",
+    "publicUrl": "https://github.com/moneyperfect/NASMusicBox/releases/download/v1.7.0/NASMusicBox-Setup.exe",
+    "sizeBytes": 157480206,
+    "sha256": "9961fb149f2a4f895c929a8313d3ea829cff33802d37cd80e276569aad729dc7"
+  },
+  "portable": {
+    "path": "downloads/NASMusicBox-portable.zip",
+    "publicUrl": "https://github.com/moneyperfect/NASMusicBox/releases/download/v1.7.0/NASMusicBox-portable.zip",
+    "sizeBytes": 236982077,
+    "sha256": "bbe3808a5c71d0fcc0ee535830e2f078de6f1c6a7d63a5488a9628b2b4002b8e"
+  }
 }
