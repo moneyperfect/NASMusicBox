@@ -1,5 +1,5 @@
 ﻿import React, { useEffect, useState, useRef } from 'react';
-import { ChevronDown, Sparkles, CloudRain, Flame, Zap, Wind, Play, Pause, SkipBack, SkipForward, Repeat, Shuffle, Star, MoreHorizontal, Share2, Copy, UserRound } from 'lucide-react';
+import { ChevronDown, Sparkles, CloudRain, Flame, Zap, Wind, Play, Pause, SkipBack, SkipForward, Repeat, Shuffle, Star, MoreHorizontal, Share2, Copy, UserRound, SlidersHorizontal } from 'lucide-react';
 
 const VIBES = [
     { id: 'vibe-cyber', name: 'Cyberpunk', icon: Zap },
@@ -61,6 +61,9 @@ export default function VibeOverlay({
     onShareTrack = () => { },
     onCopyTrackInfo = () => { },
     onSearchArtist = () => { },
+    onNext = () => {}, onPrevious = () => {}, canNext = false, canPrevious = false,
+    isShuffle = false, repeatMode = 0, onToggleShuffle = () => {}, onCycleRepeat = () => {},
+    onOpenEffects = () => {}, effectName = '原声',
     onClose,
     apiUrl,
 }) {
@@ -72,8 +75,6 @@ export default function VibeOverlay({
     const [lyricsSource, setLyricsSource] = useState('');
     const [lyricsNotice, setLyricsNotice] = useState('');
     const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-    const [isShuffle, setIsShuffle] = useState(false);
-    const [repeatMode, setRepeatMode] = useState(0); // 0: none, 1: all, 2: one
 
     const lyricsViewportRef = useRef(null);
     const lyricsLineRefs = useRef([]);
@@ -419,27 +420,28 @@ export default function VibeOverlay({
                             <span>-{formatTime(audioDuration - currentTime)}</span>
                         </div>
 
+                        <button className="flex items-center gap-2 text-xs text-white/60 mb-4" onClick={onOpenEffects}><SlidersHorizontal size={15} />音效 · {effectName}</button>
                         {/* Controls */}
                         <div className="flex items-center justify-between w-full px-2">
                             <button
                                 className={`transition-colors ${isShuffle ? 'text-white' : 'text-white/40 hover:text-white'}`}
-                                onClick={(e) => { e.stopPropagation(); setIsShuffle(!isShuffle); }}
+                                onClick={(e) => { e.stopPropagation(); onToggleShuffle(); }}
                                 title="随机播放"
                             >
                                 <Shuffle size={20} />
                             </button>
-                            <button className="text-white hover:text-white/70 transition-colors" onClick={() => jumpQueue(queueIndex - 1)} disabled={queueIndex <= 0} title="上一首">
+                            <button className="text-white hover:text-white/70 transition-colors" onClick={onPrevious} disabled={!canPrevious} title="上一首">
                                 <SkipBack size={36} fill="currentColor" />
                             </button>
                             <button className="text-white hover:scale-105 transition-transform drop-shadow-lg" onClick={handleTogglePlay} title="播放/暂停">
                                 {isPlaying ? <Pause size={48} fill="currentColor" /> : <Play size={48} fill="currentColor" className="ml-1" />}
                             </button>
-                            <button className="text-white hover:text-white/70 transition-colors" onClick={() => jumpQueue(queueIndex + 1)} disabled={queueIndex < 0 || queueIndex >= playQueue.length - 1} title="下一首">
+                            <button className="text-white hover:text-white/70 transition-colors" onClick={onNext} disabled={!canNext} title="下一首">
                                 <SkipForward size={36} fill="currentColor" />
                             </button>
                             <button
                                 className={`transition-colors flex relative ${repeatMode > 0 ? 'text-white' : 'text-white/40 hover:text-white'}`}
-                                onClick={(e) => { e.stopPropagation(); setRepeatMode((prev) => (prev + 1) % 3); }}
+                                onClick={(e) => { e.stopPropagation(); onCycleRepeat(); }}
                                 title={repeatMode === 2 ? "单曲循环" : "列表循环"}
                             >
                                 <Repeat size={20} />

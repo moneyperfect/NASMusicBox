@@ -10,13 +10,19 @@ frontend/.env
 frontend/.env.local
 tools/ffmpeg/
 tools/ffmpeg.zip
+tools/node/
+tools/webview2/
 
 # Node.js
 node_modules/
 dist/
+!website/dist/
+!website/dist/**
 .DS_Store
 
 # User specific - Data & Temp
+/output/
+/.playwright-cli/
 downloads/
 mcs_server_manager/
 *.mp3

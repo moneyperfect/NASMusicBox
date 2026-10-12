@@ -2,6 +2,8 @@
 
 NAS音乐器是一个面向个人使用的本地音乐播放器与下载器，提供搜索、播放、歌词、收藏、下载中心、桌面壳、迷你播放器和本地资料库能力。
 
+当前源码工作区包含播放提速、QQ/YouTube 综合搜索与同曲音源整合、九种独立音效和完整播放队列。此本地升级尚未发布为下方的 GitHub 安装包；要体验当前代码，请按“源码运行”启动。实现和验证见 [播放升级报告](docs/playback-upgrade-2026-10-13.md)，汽水发布包调查见 [REA 报告](docs/REA-2026-10-12.md)。
+
 [![Windows 安装版下载](https://img.shields.io/badge/Windows-下载安装包-2ea043?style=for-the-badge&logo=windows11)](https://github.com/moneyperfect/NASMusicBox/releases/latest/download/NASMusicBox-Setup.exe)
 [![Windows 便携版下载](https://img.shields.io/badge/Windows-便携版ZIP-0a84ff?style=for-the-badge&logo=windows11)](https://github.com/moneyperfect/NASMusicBox/releases/latest/download/NASMusicBox-portable.zip)
 

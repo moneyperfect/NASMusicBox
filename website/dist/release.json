@@ -1,0 +1,9 @@
+{
+  "version": "1.7.0",
+  "published": false,
+  "releaseDate": "2026-10-13",
+  "downloadMode": "auto",
+  "localDownloadsReady": false,
+  "installer": {"path": "downloads/NASMusicBox-Setup.exe", "publicUrl": "", "sizeBytes": null, "sha256": ""},
+  "portable": {"path": "downloads/NASMusicBox-portable.zip", "publicUrl": "", "sizeBytes": null, "sha256": ""}
+}

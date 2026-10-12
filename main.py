@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from pathlib import Path
 from urllib.parse import quote
+from urllib.parse import parse_qs, urlparse
+import asyncio
 import base64
 import os
 import platform
@@ -29,8 +31,12 @@ import yt_dlp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse, Response
 from pydantic import BaseModel
+from playback_upgrade import (
+    SingleFlight, PrefixCache, merge_search_items, same_recording, same_named_recording,
+    sanitize_session, media_expiry, parse_content_range,
+)
 
 try:
     from ytmusicapi import YTMusic
@@ -46,6 +52,7 @@ from app_paths import (
     LEGACY_SOURCE_LIBRARY_DB,
     LIBRARY_DB,
     LOCAL_FFMPEG_BINARY,
+    LOCAL_NODE_BINARY,
     ensure_runtime_directories,
 )
 
@@ -101,6 +108,8 @@ class SearchItem(BaseModel):
     source: Optional[str] = None
     sourceId: Optional[str] = None
     trackKey: Optional[str] = None
+    groupKey: Optional[str] = None
+    variants: Optional[list[dict[str, Any]]] = None
 
 
 class SearchResponse(BaseModel):
@@ -115,6 +124,17 @@ class VisualizeRequest(BaseModel):
     sourceId: Optional[str] = None
     trackKey: Optional[str] = None
     sourceMode: Optional[str] = None
+    fast: bool = False
+    candidates: Optional[list[dict[str, Any]]] = None
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    duration: Optional[float] = None
+    refresh: bool = False
+
+
+class AppearanceRequest(BaseModel):
+    title: str = ""
+    cover: str = ""
 
 
 class VisualizeResponse(BaseModel):
@@ -135,6 +155,7 @@ class VisualizeResponse(BaseModel):
     trackKey: Optional[str] = None
     fallbackReason: Optional[str] = None
     fallbackTrace: Optional[list[dict[str, Any]]] = None
+    expiresAt: Optional[float] = None
 
 
 class LibraryTrack(BaseModel):
@@ -337,6 +358,10 @@ class TTLMemoryCache:
         with self._lock:
             self._items.clear()
 
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._items.pop(key, None)
+
 
 SEARCH_RESULTS_CACHE = TTLMemoryCache()
 PLAYBACK_INFO_CACHE = TTLMemoryCache()
@@ -344,6 +369,10 @@ VISUALIZE_CACHE = TTLMemoryCache()
 LYRICS_CACHE = TTLMemoryCache()
 COLOR_CACHE = TTLMemoryCache()
 RECOMMENDATIONS_CACHE = TTLMemoryCache()
+VISUALIZE_FLIGHT = SingleFlight()
+MEDIA_RESOLVE_FLIGHT = SingleFlight()
+PREFIX_CACHE = PrefixCache()
+PREFIX_PREPARE_LOCK = threading.Lock()
 COLOR_WARMUP_IN_FLIGHT: set[str] = set()
 COLOR_WARMUP_LOCK = threading.Lock()
 HTTP_SESSION_CACHE: dict[tuple[str, str, str], requests.Session] = {}
@@ -564,11 +593,14 @@ def request_media_response(url: str, *, headers: Optional[dict[str, str]] = None
     last_error: Exception | None = None
     for mode in media_attempt_modes():
         session = get_http_session("media", mode)
+        response = None
         try:
             response = session.get(url, stream=stream, headers=headers, timeout=timeout)
             response.raise_for_status()
             return response, mode
         except requests.RequestException as exc:
+            if response is not None:
+                response.close()
             last_error = exc
             log_timing("media_attempt_failed", mode=mode, error=exc.__class__.__name__)
             continue
@@ -2091,6 +2123,18 @@ def get_ydl_opts(*, prefer_audio_only: bool = True, relaxed_clients: bool = Fals
         "no_warnings": True,
         "extract_flat": False,
     }
+    # Resolve once with shutil, which skips inaccessible PATH entries. yt-dlp's
+    # implicit runtime scan can fail on a stale Windows junction before playback.
+    runtimes = {}
+    if LOCAL_NODE_BINARY.is_file():
+        runtimes["node"] = {"path": str(LOCAL_NODE_BINARY)}
+    else:
+        for runtime in ("deno", "node"):
+            runtime_path = shutil.which(runtime)
+            if runtime_path:
+                runtimes[runtime] = {"path": runtime_path}
+                break
+    opts["js_runtimes"] = runtimes
     if prefer_audio_only:
         opts["format"] = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
     if not relaxed_clients:
@@ -2190,7 +2234,10 @@ def extract_playback_info(video_id: str) -> dict:
     cache_key = build_playback_cache_key(video_id)
     cached = PLAYBACK_INFO_CACHE.get(cache_key)
     if cached is not CACHE_MISS:
-        return cached
+        cached_format = select_preferred_audio_format(cached or {})
+        cached_url = (cached_format or {}).get("url") or (cached or {}).get("url") or ""
+        if not cached_url or media_expiry(cached_url, PLAYBACK_INFO_CACHE_TTL_SECONDS) > time.time():
+            return cached
 
     started_ms = perf_counter_ms()
     info = None
@@ -2833,10 +2880,14 @@ def resolve_qqmusic_entry(source_id: str, candidate: dict | None = None) -> dict
                 list(cached.get("attempts") or []),
             )
         if cached:
-            return dict(cached)
-        raise QQMusicResolveError(QQMUSIC_FAILURE_EMPTY_PURL, "missing playable QQ Music stream URL")
+            if media_expiry(cached.get("audioUrl") or "", PLAYBACK_INFO_CACHE_TTL_SECONDS) > time.time():
+                return dict(cached)
+        else:
+            raise QQMusicResolveError(QQMUSIC_FAILURE_EMPTY_PURL, "missing playable QQ Music stream URL")
 
-    entry = candidate if candidate and candidate.get("sourceId") == source_id else None
+    # Public search/session candidates omit QQ's media MID and format sizes.
+    # A song MID is not necessarily its media MID; hydrate before requesting vkey.
+    entry = candidate if candidate and candidate.get("sourceId") == source_id and candidate.get("qqMediaMid") else None
     if not entry:
         entry = fetch_qqmusic_track_detail(source_id)
     if not entry:
@@ -3302,18 +3353,56 @@ def build_visualize_response_payload(
     source_id: str = "",
     track_key: str = "",
     source_mode: str = "",
+    fast: bool = False,
+    candidates: Optional[list[dict[str, Any]]] = None,
+    title: str = "",
+    artist: str = "",
+    duration: Optional[float] = None,
+    refresh: bool = False,
+) -> dict:
+    # Policy must be part of the result cache: an automatic fallback must not
+    # leak into a later request restricted to a single provider.
+    policy_key = json.dumps([source_mode or "auto", bool(fast), candidates, title, artist, duration],
+                            ensure_ascii=False, sort_keys=True, allow_nan=False)
+    cache_key = build_visualize_cache_key(query, video_id, source, source_id) + "::" + policy_key
+    if refresh:
+        cached = VISUALIZE_CACHE.get(cache_key)
+        identities = [(normalize_source(source, video_id=video_id, source_id=source_id), source_id or video_id)]
+        if isinstance(cached, dict):
+            identities.append((cached.get("source"), cached.get("sourceId") or cached.get("videoId")))
+        for provider, identity in identities:
+            if provider == SOURCE_YOUTUBE and identity:
+                PLAYBACK_INFO_CACHE.delete(build_playback_cache_key(identity))
+            elif provider == SOURCE_QQMUSIC and identity:
+                PLAYBACK_INFO_CACHE.delete(f"playback::{SOURCE_QQMUSIC}::{identity}")
+        VISUALIZE_CACHE.delete(cache_key)
+        PREFIX_CACHE.clear()
+    def work():
+        return _build_visualize_response_payload(query, video_id, source, source_id, track_key,
+                                                  source_mode, fast, candidates, title, artist, duration,
+                                                  cache_key)
+    return VISUALIZE_FLIGHT.run(cache_key, work)
+
+
+def _build_visualize_response_payload(
+    query, video_id, source, source_id, track_key, source_mode, fast,
+    candidates, title_hint, artist_hint, duration_hint, cache_key,
 ) -> dict:
     requested_source = normalize_source(source, video_id=video_id, source_id=source_id)
     forced_source = normalize_source(source_mode)
     requested_source_id = (source_id or "").strip()
     if not requested_source_id and requested_source == SOURCE_YOUTUBE and video_id:
         requested_source_id = video_id
-    cache_key = build_visualize_cache_key(query=query, video_id=video_id, source=requested_source, source_id=requested_source_id)
     cached = VISUALIZE_CACHE.get(cache_key)
     if cached is not CACHE_MISS:
         if isinstance(cached, dict) and cached.get("__error__"):
             raise HTTPException(status_code=int(cached.get("statusCode") or 502), detail=cached.get("detail") or "Visualize failed")
-        return dict(cached)
+        if cached.get("expiresAt", time.time() + 1) > time.time():
+            return dict(cached)
+
+    def save_payload(payload):
+        ttl = min(VISUALIZE_CACHE_TTL_SECONDS, max(1, int(payload.get("expiresAt", time.time() + VISUALIZE_CACHE_TTL_SECONDS) - time.time())))
+        VISUALIZE_CACHE.set(cache_key, payload, ttl)
 
     request_label = requested_source_id or video_id or query or ""
     started_ms = perf_counter_ms()
@@ -3321,14 +3410,15 @@ def build_visualize_response_payload(
     fallback_trace: list[dict[str, Any]] = []
 
     def resolve_candidate(candidate: dict) -> dict:
-        candidate_video_id = candidate.get("id")
+        candidate_video_id = candidate.get("id") or candidate.get("videoId")
         candidate_source = normalize_source(candidate.get("source"), video_id=candidate_video_id or "", source_id=candidate.get("sourceId") or "")
         candidate_source_id = candidate.get("sourceId") or (candidate_video_id if candidate_source == SOURCE_YOUTUBE else "")
         if not candidate_source_id and not candidate_video_id:
             raise RuntimeError("missing source id")
 
         if candidate_source == SOURCE_QQMUSIC:
-            media_data = resolve_qqmusic_entry(candidate_source_id, candidate)
+            media_data = MEDIA_RESOLVE_FLIGHT.run(
+                f"qqmusic::{candidate_source_id}", lambda: resolve_qqmusic_entry(candidate_source_id, candidate))
             audio_url = media_data.get("audioUrl")
             title = media_data.get("title") or candidate.get("title") or "Unknown Title"
             artist = media_data.get("uploader") or media_data.get("channel") or candidate.get("uploader") or "Unknown Artist"
@@ -3340,7 +3430,8 @@ def build_visualize_response_payload(
             resolved_video_id = candidate_video_id or candidate_source_id
             if not resolved_video_id:
                 raise RuntimeError("missing video id")
-            media_data = extract_playback_info(resolved_video_id)
+            media_data = MEDIA_RESOLVE_FLIGHT.run(
+                f"youtube::{resolved_video_id}", lambda: extract_playback_info(resolved_video_id))
             audio_format = select_preferred_audio_format(media_data)
             audio_url = audio_format.get("url") if audio_format else media_data.get("url")
             title = media_data.get("title") or candidate.get("title") or "Unknown Title"
@@ -3359,13 +3450,15 @@ def build_visualize_response_payload(
 
         if not audio_url:
             raise RuntimeError("missing playable stream URL")
+        if media_expiry(audio_url, VISUALIZE_CACHE_TTL_SECONDS) <= time.time():
+            raise RuntimeError("expired playable stream URL")
         query_text = query or f"{title} {artist}".strip()
-        extracted_colors = get_cached_cover_colors(cover_url) or warm_cover_colors(cover_url)
+        extracted_colors = get_cached_cover_colors(cover_url) or (DEFAULT_VISUAL_COLORS if fast else warm_cover_colors(cover_url))
         theme = analyze_theme(title, extracted_colors)
         proxy_endpoint = f"/proxy-stream?url={quote(audio_url, safe='')}"
-        stream_mode = "proxy" if NAS_MEDIA_TRANSPORT == "proxy" else "direct"
+        stream_mode = "proxy" if fast or NAS_MEDIA_TRANSPORT == "proxy" else "direct"
         primary_audio_src = proxy_endpoint if stream_mode == "proxy" else audio_url
-        resolved_track_key = candidate.get("trackKey") or track_key or make_track_key(candidate_source, candidate_source_id, title, artist, resolved_video_id)
+        resolved_track_key = make_track_key(candidate_source, candidate_source_id, title, artist, resolved_video_id)
 
         return {
             "title": title,
@@ -3385,11 +3478,30 @@ def build_visualize_response_payload(
             "trackKey": resolved_track_key,
             "fallbackReason": "auto_fallback" if fallback_trace else "none",
             "fallbackTrace": list(fallback_trace),
+            "expiresAt": media_expiry(audio_url, VISUALIZE_CACHE_TTL_SECONDS),
         }
 
     last_error: Exception | None = None
 
-    if requested_source_id or video_id:
+    supplied_candidates = candidates is not None
+    candidate_list = []
+    for raw in (candidates or [])[:20]:
+        if not isinstance(raw, dict):
+            continue
+        candidate = dict(raw)
+        candidate["id"] = raw.get("videoId") or raw.get("id") or ""
+        candidate["uploader"] = raw.get("artist") or raw.get("uploader") or ""
+        candidate["thumbnail"] = raw.get("cover") or raw.get("thumbnail") or ""
+        candidate_list.append(candidate)
+    base_candidate = next((item for item in candidate_list if
+                           normalize_source(item.get("source"), video_id=item.get("id") or "", source_id=item.get("sourceId") or "") == requested_source
+                           and (item.get("sourceId") or item.get("id")) == (requested_source_id or video_id)), None)
+    if base_candidate is None and title_hint and artist_hint:
+        base_candidate = {"title": title_hint, "artist": artist_hint, "duration": duration_hint}
+    if base_candidate is None and len(candidate_list) == 1:
+        base_candidate = candidate_list[0]
+
+    if (requested_source_id or video_id) and (not forced_source or requested_source == forced_source):
         try:
             direct_candidate = {
                     "id": video_id,
@@ -3397,8 +3509,10 @@ def build_visualize_response_payload(
                     "sourceId": requested_source_id,
                     "trackKey": track_key,
             }
+            if base_candidate:
+                direct_candidate = {**base_candidate, **direct_candidate}
             payload = resolve_candidate(direct_candidate)
-            cache_visualize_payload(query, payload.get("videoId") or "", payload, VISUALIZE_CACHE_TTL_SECONDS)
+            save_payload(payload)
             log_timing(
                 "visualize_resolved",
                 resolve_ms=int(perf_counter_ms() - started_ms),
@@ -3414,7 +3528,55 @@ def build_visualize_response_payload(
     seen_identities: set[str] = set()
     if requested_source_id or video_id:
         seen_identities.add(make_track_key(requested_source, requested_source_id, video_id=video_id))
-    if query:
+    # Supplied alternatives are the only permitted fallback for a selected
+    # recording. Never replace a failed live/cover recording with a search hit.
+    if supplied_candidates:
+        for match in candidate_list:
+            match_source = normalize_source(match.get("source"), video_id=match.get("id") or "", source_id=match.get("sourceId") or "")
+            match_source_id = match.get("sourceId") or match.get("id") or ""
+            identity = make_track_key(match_source, match_source_id)
+            if identity in seen_identities or (forced_source and match_source != forced_source):
+                continue
+            if not base_candidate or not same_recording(base_candidate, match):
+                continue
+            seen_identities.add(identity)
+            try:
+                payload = resolve_candidate(match)
+                save_payload(payload)
+                return payload
+            except Exception as exc:
+                last_error = exc
+                fallback_trace.extend(candidate_failure_payload(match, exc))
+        has_allowed_identity = any(
+            (item.get("sourceId") or item.get("id")) and
+            (not forced_source or normalize_source(item.get("source"), video_id=item.get("id") or "", source_id=item.get("sourceId") or "") == forced_source)
+            for item in candidate_list)
+        if query and last_error is None and not has_allowed_identity:
+            # Radio presets from older versions are metadata-only. Discover
+            # their first identity by exact title/artist/version, then stop on
+            # failure rather than silently choosing another recording.
+            provider_sources = [forced_source] if forced_source in {SOURCE_QQMUSIC, SOURCE_YOUTUBE} else search_provider_order()
+            selected = None
+            for provider_source in provider_sources:
+                for match in search_entries_with_source(query, 6, provider_source):
+                    if base_candidate and (base_candidate.get("title") or base_candidate.get("artist") or base_candidate.get("uploader")):
+                        if not same_named_recording(base_candidate, match):
+                            continue
+                        if base_candidate.get("duration") and not same_recording(base_candidate, match):
+                            continue
+                    selected = match
+                    break
+                if selected:
+                    break
+            if selected:
+                try:
+                    payload = resolve_candidate(selected)
+                    save_payload(payload)
+                    return payload
+                except Exception as exc:
+                    last_error = exc
+                    fallback_trace.extend(candidate_failure_payload(selected, exc))
+    elif query:
         provider_sources = [forced_source] if forced_source in {SOURCE_QQMUSIC, SOURCE_YOUTUBE} else search_provider_order()
         for provider_source in provider_sources:
             for match in search_entries_with_source(query, 6, provider_source):
@@ -3426,7 +3588,7 @@ def build_visualize_response_payload(
                 seen_identities.add(identity)
                 try:
                     payload = resolve_candidate(match)
-                    cache_visualize_payload(query, payload.get("videoId") or "", payload, VISUALIZE_CACHE_TTL_SECONDS)
+                    save_payload(payload)
                     log_timing(
                         "visualize_resolved",
                         resolve_ms=int(perf_counter_ms() - started_ms),
@@ -4214,6 +4376,49 @@ async def search_tracks(req: SearchRequest):
         raise HTTPException(status_code=500, detail="Search failed") from exc
 
 
+@app.post("/search/stream")
+async def search_tracks_stream(req: SearchRequest):
+    query = (req.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="Query is required")
+    limit = max(1, min(int(req.limit), 15))
+    source = normalize_source(req.source)
+    sources = [source] if source in {SOURCE_QQMUSIC, SOURCE_YOUTUBE} else [SOURCE_QQMUSIC, SOURCE_YOUTUBE]
+
+    async def events():
+        collected, completed, errors = {}, [], {}
+        async def lookup(provider):
+            try:
+                entries = await asyncio.wait_for(run_in_threadpool(search_entries_with_source, query, limit, provider), 22)
+                return provider, entries, None
+            except asyncio.TimeoutError:
+                return provider, [], "搜索超时"
+            except Exception:
+                return provider, [], "音源暂时不可用"
+        tasks = [asyncio.create_task(lookup(provider)) for provider in sources]
+        try:
+            for future in asyncio.as_completed(tasks):
+                provider, entries, error = await future
+                collected[provider] = [item.model_dump() for entry in entries
+                                       if (item := search_item_from_entry(entry))]
+                completed.append(provider)
+                if error:
+                    errors[provider] = error
+                # Stable provider precedence prevents timing from changing the
+                # primary identity of a merged recording after the final event.
+                results = merge_search_items([item for name in sources for item in collected.get(name, [])])
+                payload = {"results": results, "providers": list(completed),
+                           "pending": [name for name in sources if name not in completed], "errors": dict(errors)}
+                yield "event: results\ndata: " + json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n\n"
+            yield 'event: done\ndata: {"done":true}\n\n'
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 def has_japanese(text: str) -> bool:
     return any('\u3040' <= c <= '\u309f' or '\u30a0' <= c <= '\u30ff' or '\uff66' <= c <= '\uff9f' for c in text)
 
@@ -4607,12 +4812,119 @@ async def visualize(req: VisualizeRequest):
             req.sourceId or "",
             req.trackKey or "",
             req.sourceMode or "",
+            req.fast,
+            req.candidates,
+            req.title or "",
+            req.artist or "",
+            req.duration,
+            req.refresh,
         )
     except HTTPException:
         raise
     except Exception as exc:
         print(f"Visualize error: {exc}")
         raise HTTPException(status_code=500, detail="Visualize failed") from exc
+
+
+@app.post("/visualize/appearance")
+async def visualize_appearance(req: AppearanceRequest):
+    def appearance():
+        colors = get_cached_cover_colors(req.cover)
+        if not colors:
+            colors = get_dominant_colors(req.cover)
+            COLOR_CACHE.set(req.cover, colors, COLOR_CACHE_TTL_SECONDS)
+        return {"colors": colors, "theme": analyze_theme(req.title, colors)}
+    return await run_in_threadpool(appearance)
+
+
+def prepare_media_prefix(url: str, expires_at: float, generation: int) -> dict:
+    # Serialize only background byte preparation. Foreground resolution uses
+    # a separate path and never waits for this lock or the prefix download.
+    with PREFIX_PREPARE_LOCK:
+        if not PREFIX_CACHE.is_current(generation):
+            return {"prefetchedBytes": 0, "rangeSupported": False}
+        return _prepare_media_prefix(url, expires_at, generation)
+
+
+def _prepare_media_prefix(url: str, expires_at: float, generation: int) -> dict:
+    existing = PREFIX_CACHE.get(url)
+    if existing:
+        return {"prefetchedBytes": len(existing["data"]), "rangeSupported": True}
+    upstream = None
+    try:
+        headers = media_request_headers(url)
+        headers.update({"Range": f"bytes=0-{PREFIX_CACHE.prefix_limit - 1}", "Accept-Encoding": "identity"})
+        upstream, _mode = request_media_response(url, headers=headers, timeout=12, stream=True)
+        byte_range = parse_content_range(upstream.headers.get("content-range"))
+        # Check headers before reading: a server ignoring Range must never
+        # trigger a whole-track download during preloading.
+        if upstream.status_code != 206 or not byte_range or byte_range[0] != 0 or byte_range[1] >= PREFIX_CACHE.prefix_limit:
+            return {"prefetchedBytes": 0, "rangeSupported": False}
+        if byte_range[1] == byte_range[2] - 1:
+            # Short tracks may fit under 2 MiB. Request a smaller prefix rather
+            # than silently caching the complete recording.
+            upstream.close()
+            if byte_range[2] < 2:
+                return {"prefetchedBytes": 0, "rangeSupported": True}
+            prefix_end = min(256 * 1024, max(1, byte_range[2] // 4)) - 1
+            headers["Range"] = f"bytes=0-{prefix_end}"
+            upstream, _mode = request_media_response(url, headers=headers, timeout=12, stream=True)
+            byte_range = parse_content_range(upstream.headers.get("content-range"))
+            if upstream.status_code != 206 or not byte_range or byte_range[0] != 0 or byte_range[1] > prefix_end:
+                return {"prefetchedBytes": 0, "rangeSupported": False}
+        expected_length = byte_range[1] + 1
+        data = bytearray()
+        for chunk in upstream.iter_content(chunk_size=64 * 1024):
+            if not PREFIX_CACHE.is_current(generation):
+                return {"prefetchedBytes": 0, "rangeSupported": True}
+            if chunk:
+                if len(data) + len(chunk) > expected_length:
+                    return {"prefetchedBytes": 0, "rangeSupported": False}
+                data.extend(chunk)
+            if len(data) == expected_length:
+                break
+        if len(data) != expected_length:
+            return {"prefetchedBytes": 0, "rangeSupported": False}
+        stored = PREFIX_CACHE.store(generation, url, bytes(data), byte_range[2], upstream.headers, expires_at)
+        return {"prefetchedBytes": len(data) if stored else 0, "rangeSupported": True}
+    except requests.RequestException:
+        return {"prefetchedBytes": 0, "rangeSupported": False}
+    finally:
+        if upstream is not None:
+            upstream.close()
+
+
+@app.post("/playback/prepare")
+async def prepare_playback(req: VisualizeRequest):
+    generation = PREFIX_CACHE.reserve(clear=False)
+    req.fast = True
+    payload = await visualize(req)
+    proxy_url = payload.get("proxyAudioSrc") or ""
+    url = parse_qs(urlparse(proxy_url).query).get("url", [""])[0]
+    result = {"prefetchedBytes": 0, "rangeSupported": False}
+    if url:
+        result = await run_in_threadpool(prepare_media_prefix, url, payload.get("expiresAt") or media_expiry(url), generation)
+    return {**payload, **result}
+
+
+@app.get("/playback-session")
+async def get_playback_session():
+    def read_session():
+        try:
+            return sanitize_session(json.loads(get_app_setting("playback_session_v1", "{}")))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return sanitize_session({})
+    return await run_in_threadpool(read_session)
+
+
+@app.post("/playback-session")
+async def save_playback_session(item: dict[str, Any]):
+    try:
+        session = sanitize_session(item)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await run_in_threadpool(set_app_setting, "playback_session_v1", json.dumps(session, ensure_ascii=False, allow_nan=False))
+    return session
 
 
 @app.get("/proxy-stream")
@@ -4622,12 +4934,48 @@ async def proxy_stream(url: str, request: Request):
         print(f"Proxying stream: {url[:120]}")
 
         upstream_headers = media_request_headers(url)
+        upstream_headers["Accept-Encoding"] = "identity"
 
         range_header = request.headers.get("range")
         if range_header:
             upstream_headers["Range"] = range_header
+        if request.headers.get("if-range"):
+            upstream_headers["If-Range"] = request.headers["if-range"]
 
-        upstream, transport_mode = request_media_response(url, headers=upstream_headers, timeout=25, stream=True)
+        cached = None if request.headers.get("if-range") else PREFIX_CACHE.get(url)
+        prefix = b""
+        response_status = None
+        cached_range = None
+        if cached:
+            range_match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header or "")
+            if not range_header or range_match:
+                start = int(range_match.group(1)) if range_match else 0
+                end = min(int(range_match.group(2)), cached["total"] - 1) if range_match and range_match.group(2) else cached["total"] - 1
+                if 0 <= start <= end and start < len(cached["data"]):
+                    response_status = 206 if range_header else 200
+                    prefix = cached["data"][start:min(end + 1, len(cached["data"]))]
+                    cached_range = start, end, cached["total"]
+                    if end < len(cached["data"]):
+                        headers = {key: value for key, value in cached["headers"].items()
+                                   if key.lower() in {"cache-control", "expires"}}
+                        headers.update({"Content-Length": str(len(prefix)), "Accept-Ranges": "bytes"})
+                        if range_header:
+                            headers["Content-Range"] = f"bytes {start}-{end}/{cached['total']}"
+                        return Response(prefix, status_code=response_status, headers=headers,
+                                        media_type=cached["headers"].get("content-type", "audio/mp4"))
+                    tail_headers = {**upstream_headers, "Range": f"bytes={len(cached['data'])}-{end}"}
+                    upstream, transport_mode = await run_in_threadpool(
+                        request_media_response, url, headers=tail_headers, timeout=25, stream=True)
+                    actual_range = parse_content_range(upstream.headers.get("content-range"))
+                    if upstream.status_code != 206 or actual_range != (len(cached["data"]), end, cached["total"]):
+                        upstream.close()
+                        prefix = b""
+                        cached_range = None
+                        response_status = None
+        if not prefix:
+            upstream, transport_mode = await run_in_threadpool(
+                request_media_response, url, headers=upstream_headers, timeout=25, stream=True)
+
 
         media_type = upstream.headers.get("content-type", "audio/mp4")
         response_headers = {}
@@ -4636,8 +4984,14 @@ async def proxy_stream(url: str, request: Request):
             if value:
                 response_headers[header] = value
 
-        if "accept-ranges" not in response_headers:
+        if cached_range:
+            start, end, total = cached_range
+            response_headers["content-length"] = str(end - start + 1)
             response_headers["accept-ranges"] = "bytes"
+            if range_header:
+                response_headers["content-range"] = f"bytes {start}-{end}/{total}"
+            else:
+                response_headers.pop("content-range", None)
 
         log_timing(
             "proxy_stream_opened",
@@ -4648,6 +5002,8 @@ async def proxy_stream(url: str, request: Request):
 
         def iterfile():
             try:
+                if prefix:
+                    yield prefix
                 for chunk in upstream.iter_content(chunk_size=64 * 1024):
                     if chunk:
                         yield chunk
@@ -4656,10 +5012,20 @@ async def proxy_stream(url: str, request: Request):
 
         return StreamingResponse(
             iterfile(),
-            status_code=upstream.status_code,
+            status_code=response_status or upstream.status_code,
             media_type=media_type,
             headers=response_headers,
         )
+    except requests.HTTPError as exc:
+        upstream_error = exc.response
+        if upstream_error is not None:
+            status = upstream_error.status_code
+            error_headers = {}
+            if upstream_error.headers.get("content-range"):
+                error_headers["Content-Range"] = upstream_error.headers["content-range"]
+            upstream_error.close()
+            return Response(status_code=status, headers=error_headers)
+        raise HTTPException(status_code=502, detail="Upstream stream failed") from exc
     except requests.RequestException as exc:
         print(f"Proxy request error: {exc}")
         raise HTTPException(status_code=502, detail="Upstream stream failed") from exc
@@ -4683,7 +5049,8 @@ async def download_track(url: str, filename: str = "music.mp3"):
     try:
         started_ms = perf_counter_ms()
         print(f"Downloading stream: {url[:120]}")
-        upstream, transport_mode = request_media_response(
+        upstream, transport_mode = await run_in_threadpool(
+            request_media_response,
             url,
             headers={"User-Agent": DEFAULT_HTTP_USER_AGENT},
             timeout=60,

@@ -29,6 +29,9 @@ $Version = "$Version".Trim()
 if (-not $Version) {
   throw "Unable to resolve app version."
 }
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+  throw "Invalid release version: $Version"
+}
 
 $distRoot = Join-Path $repoRoot "dist"
 if ($BundlePath) {
@@ -50,7 +53,11 @@ $portableZip = Join-Path $releaseRoot "NASMusicBox-portable.zip"
 
 New-Item -ItemType Directory -Force -Path $versionsRoot | Out-Null
 if (Test-Path $versionedBundle) {
-  Remove-Item $versionedBundle -Recurse -Force
+  $archiveTarget = (Resolve-Path -LiteralPath $versionedBundle).Path
+  if ($archiveTarget -ne (Join-Path $repoRoot "dist\versions\NASMusicBox-v$Version")) {
+    throw "Unexpected version archive path: $archiveTarget"
+  }
+  Remove-Item -LiteralPath $archiveTarget -Recurse -Force
 }
 Copy-Item $desktopBundle $versionedBundle -Recurse
 
